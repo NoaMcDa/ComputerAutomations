@@ -58,18 +58,12 @@ _PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
 # ---- Hebrew keyword classifier ----
 
 _MEAT_KEYWORDS: tuple[str, ...] = (
-    # Fresh meat / cuts (dropped ambiguous short ones: לב, לחי, לשון)
+    # Fresh beef / cow parts only
     "בשר", "בקר", "עגל", "כבש", "טלה", "כבד",
     "אנטריקוט", "פילה", "סטייק", "צלעות", "צלי",
-    # Poultry
-    "עוף", "הודו", "פרגית", "שוקיים", "כנפיים",
-    "חזה עוף", "חזה הודו", "ירך עוף", "שוק עוף", "פרגיות",
-    # Processed / deli (מעדנייה / אטליז)
-    "נקניק", "נקניקיה", "נקניקיות", "נקניקים",
-    "פסטרמה", "סלמי", "קבנוס",
-    "קבב", "המבורגר", "קציצה", "קציצות",
-    "שווארמה", "צ'וריסו", "מרגז", "מרגז'",
-    "שניצל", "שניצלים", "שיפוד", "שיפודים",
+    # Fresh poultry parts
+    "עוף", "הודו", "פרגית", "פרגיות",
+    "שוקיים", "כנפיים", "חזה עוף", "חזה הודו", "ירך עוף", "שוק עוף",
     "אטליז",
 )
 
@@ -78,16 +72,39 @@ _EXCLUDE_KEYWORDS: tuple[str, ...] = (
     "דג", "סלמון", "טונה", "סרדין", "הרינג", "שרימפ", "קרפיון",
     "אמנון", "דניס", "לברק", "פורל", "בורי", "מושט", "נילוס",
     "סיבס", "מוסר", "פילה דג", "דג סלמון",
-    "גפילטע", "פיש",
+    "גפילטע", "פיש", "מולים",
     # Plant-based
-    "טבעוני", "צמחי", "VEGAN", "ווגן",
+    "טבעוני", "צמחוני", "צמחי", "VEGAN", "ווגן",
     "סויה", "טופו", "סייטן",
+    "טבעול", "ביונד", "beyond",
     "ללא בשר", "ללא עוף",
-    # Dairy / cheese (sometimes labeled with "בקר" for shape/brand)
+    # Dairy / cheese
     "חלבי", "גבינה", "גאודה", "גאודת", "אמנטל", "מוצרלה", "צ'דר",
     "קוטג", "לבנה",
-    # Confusing categories
-    "מדומה",  # mock steak / mock fillet (often fish-based or soy)
+    # Processed / deli (user wants fresh cuts only, not cured / smoked / cooked)
+    "נקניק", "נקניקיה", "פסטרמה", "סלמי", "קבנוס",
+    "קבב", "המבורגר", "קציצה", "קציצות",
+    "שווארמה", "צ'וריסו", "מרגז", "מרגז'",
+    "שניצל", "שיפוד",
+    "מעושן", "מעושנ", "מתובל", "בייקון", "פסטרמ",
+    "סלסול", "סלסולי",  # deli slices
+    "דק דק",
+    # Packaged soups / broths / spices / bouillon
+    "מרק", "אבקת", "בטעם", "קוביות", "בולון",
+    # Not food (sanitary / household that mentions meat keywords)
+    "תחבושות", "קוטקס", "אולווייז", "טמפון", "מגבונים", "חיתולים",
+    # Pet food
+    "חתולים", "כלבים", "חיות", "חיות מחמד",
+    "פריסקיז", "פרוסקיז", "רויאל", "פרוקל", "פרופלן", "ווסקוויק",
+    "ווסקס", "סמלט", "פדיגרי", "פרינה", "פטה",
+    # Breaded / coated / nuggets (processed kids products)
+    "בציפוי", "ציפוי", "נאגטס", "נתחונים",
+    # Instant / soluble soup
+    "נמס", "נמס בכוס", "בכוס",
+    # More cheeses
+    "בולגרית", "בולגרי", "פטה גבינה",
+    # Confusing
+    "מדומה",  # mock steak (often fish/soy)
 )
 
 
@@ -104,11 +121,19 @@ def _build_keyword_pattern() -> re.Pattern:
 _MEAT_PAT = _build_keyword_pattern()
 
 
-def _is_meat_product(name: str) -> bool:
+def _is_meat_product(name: str, context: str = "") -> bool:
+    """Decide if a promo item is a fresh meat/poultry cut.
+
+    `name` is the product name from PriceFull; `context` is the promotion
+    description — used as a secondary exclusion source because PromoFull
+    descriptions often reveal that a truncated product name is actually
+    something else (e.g. "פילה סל" → desc "מנות סלמון").
+    """
     if not name:
         return False
+    combined = f"{name} {context}"
     for kw in _EXCLUDE_KEYWORDS:
-        if kw in name:
+        if kw in combined:
             return False
     return bool(_MEAT_PAT.search(name))
 
@@ -389,7 +414,7 @@ def _extract_meat_promos(
             if not indexed:
                 continue
             name, regular_price = indexed
-            if not _is_meat_product(name):
+            if not _is_meat_product(name, context=desc):
                 continue
             key = (code, desc)
             if key in seen:
