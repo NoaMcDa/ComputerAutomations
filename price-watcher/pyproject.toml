@@ -5,6 +5,7 @@ description = "Hourly product price watcher that emails on change. Local-only, c
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
+    "brotli>=1.1",
     "beautifulsoup4>=4.12",
     "lxml>=5.1",
     "extruct>=0.17",
