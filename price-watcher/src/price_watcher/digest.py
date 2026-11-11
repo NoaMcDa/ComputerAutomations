@@ -60,7 +60,7 @@ class SiteDigest:
     host: str
     display_name: str
     homepage_url: str
-    status: str = "ok"  # "ok" / "no_promo" / "unreachable" / "blocked"
+    status: str = "ok"  # "ok" (fetched; empty promos = no promo) / "unreachable" / "blocked"
     promos: list[PromoInfo] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -115,7 +115,8 @@ _DISCOUNT_AFTER_CHARS = 15
 # English keywords need a word boundary ("postcode" is not "code"); Hebrew
 # ones may carry a prefix letter ("בקוד") but must end there ("קודם" is not).
 _CODE_PAT = re.compile(
-    r"(?:(?i:\b(?:promo\s*code|code|coupon|voucher))|קוד|קופון)(?!\w)"
+    r"(?:(?i:\b(?:promo\s*code|code|coupon|voucher))"
+    r"|קוד(?:\s+(?:הנחה|הטבה|מבצע|קופון|קידום))?|קופון)(?!\w)"
     r"[\s:：\-–—\"'״“”«»()\[\]]{0,6}"
     r"([A-Z][A-Z0-9]{2,19})(?![A-Za-z0-9])"
 )
@@ -418,7 +419,7 @@ def collect_digest() -> list[SiteDigest]:
 
             promos = extract_promos(html)
             site.promos = promos
-            site.status = "ok" if promos else "no_promo"
+            site.status = "ok"  # fetched fine; an empty `promos` list means "no promo"
         except Exception as exc:
             # One misbehaving homepage must not cancel the other sites.
             log.error("Digest scan failed for %s: %s: %s", host, type(exc).__name__, exc)
