@@ -364,7 +364,14 @@ def _send_via_smtp(payload: EmailPayload, cfg: "config.EmailConfig") -> None:  #
     msg.set_content(payload.text_body)
     msg.add_alternative(payload.html_body, subtype="html")
 
-    with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as smtp:
+    if cfg.smtp_port == 465:
+        # Implicit TLS (SMTPS)
+        with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=30) as smtp:
+            smtp.login(cfg.smtp_user, cfg.smtp_password)
+            smtp.send_message(msg)
+        return
+
+    with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30) as smtp:
         smtp.ehlo()
         smtp.starttls()
         smtp.ehlo()

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
+
 import typer
 from rich.console import Console
 
@@ -15,11 +18,34 @@ app = typer.Typer(
 console = Console()
 
 
+def _fail(message: str, code: int = 2) -> "typer.Exit":
+    typer.echo(f"Error: {message}", err=True)
+    return typer.Exit(code)
+
+
+@contextmanager
+def _friendly_errors():
+    """Turn configuration errors into a one-line message + non-zero exit."""
+    from price_watcher.config import ConfigError
+    try:
+        yield
+    except ConfigError as exc:
+        raise _fail(str(exc)) from None
+
+
 @app.callback()
 def _root(
-    log_level: str = typer.Option("INFO", "--log-level", help="DEBUG, INFO, WARNING, ERROR"),
+    log_level: str = typer.Option(
+        None, "--log-level",
+        help="DEBUG, INFO, WARNING, ERROR (default: $PW_LOG_LEVEL, else INFO)",
+    ),
 ) -> None:
-    configure_logging(log_level)
+    from price_watcher import config as _config  # loads .env
+    level = log_level or os.environ.get("PW_LOG_LEVEL") or "INFO"
+    try:
+        configure_logging(level)
+    except ValueError as exc:
+        raise _fail(str(exc)) from None
 
 
 @app.command()
@@ -59,14 +85,23 @@ def check(
 ) -> None:
     """Fetch, compare, notify and save state for every watched URL."""
     from price_watcher.scheduler import run_check
-    run_check(dry_run=dry_run)
+    with _friendly_errors():
+        rc = run_check(dry_run=dry_run)
+    raise typer.Exit(rc)
 
 
 @app.command(name="test-email")
 def test_email() -> None:
     """Send a sample email to verify the SMTP setup."""
     from price_watcher.email_sender import send_test_email
-    send_test_email()
+    with _friendly_errors():
+        try:
+            send_test_email()
+        except Exception as exc:
+            from price_watcher.config import ConfigError
+            if isinstance(exc, ConfigError):
+                raise
+            raise _fail(f"could not send test email: {exc}", 1) from None
 
 
 @app.command(name="install-schedule")
@@ -96,7 +131,9 @@ def digest(
 ) -> None:
     """Send the daily sales digest: for each watched site, current promo banner (if any)."""
     from price_watcher.digest import run_digest
-    run_digest(dry_run=dry_run)
+    with _friendly_errors():
+        rc = run_digest(dry_run=dry_run)
+    raise typer.Exit(rc)
 
 
 @app.command(name="install-digest-schedule")

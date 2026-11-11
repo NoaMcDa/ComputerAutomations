@@ -18,6 +18,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 from typing import Optional
 
 import filelock
@@ -66,7 +67,7 @@ def run_check(dry_run: bool = False) -> int:  # noqa: C901  (complexity OK here)
     Returns 0 if every fetch succeeded, 1 if at least one failed.
     """
     # 1. Load config
-    cfg = _config_mod.load()
+    cfg = _config_mod.load(require_email=not dry_run)
 
     # 2. Acquire process lock
     try:
@@ -279,22 +280,17 @@ def _install_launchd() -> None:
     _console.print(f"[green]Schedule installed (launchd, daily at {_CHECK_HOUR:02d}:00).[/green]")
 
 
-def _install_schtasks() -> None:
-    python_path = _venv_python()
-    # Prefer pythonw.exe to suppress console window
-    pythonw = Path(python_path).parent / "pythonw.exe"
-    if pythonw.exists():
-        python_path = str(pythonw)
-
-    # Build XML for StartWhenAvailable support
-    xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
+def _task_xml(description: str, hour: int, limit: str, python_path: str, subcommand: str) -> str:
+    """Task Scheduler XML. Values are XML-escaped; battery settings allow
+    running on battery (laptops) and not being killed when unplugged."""
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Price Watcher daily check</Description>
+    <Description>{_xml_escape(description)}</Description>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
-      <StartBoundary>2024-01-01T{_CHECK_HOUR:02d}:00:00</StartBoundary>
+      <StartBoundary>2024-01-01T{hour:02d}:00:00</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
@@ -302,18 +298,30 @@ def _install_schtasks() -> None:
     </CalendarTrigger>
   </Triggers>
   <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
   <Actions>
     <Exec>
-      <Command>{python_path}</Command>
-      <Arguments>-m price_watcher check</Arguments>
-      <WorkingDirectory>{_repo_dir()}</WorkingDirectory>
+      <Command>{_xml_escape(python_path)}</Command>
+      <Arguments>-m price_watcher {subcommand}</Arguments>
+      <WorkingDirectory>{_xml_escape(str(_repo_dir()))}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"""
+
+
+def _install_schtasks() -> None:
+    python_path = _venv_python()
+    # Prefer pythonw.exe to suppress console window
+    pythonw = Path(python_path).parent / "pythonw.exe"
+    if pythonw.exists():
+        python_path = str(pythonw)
+
+    xml_content = _task_xml("Price Watcher daily check", _CHECK_HOUR, "PT30M", python_path, "check")
 
     xml_path = data_dir() / "task-scheduler.xml"
     xml_path.write_text(xml_content, encoding="utf-16")
@@ -410,10 +418,13 @@ def status() -> None:
     # --- schedule installed? ---
     if sys.platform == "darwin":
         installed = _launchd_installed()
+        digest_installed = _launchd_installed(_DIGEST_PLIST_LABEL)
     elif sys.platform.startswith("win"):
         installed = _schtasks_installed()
+        digest_installed = _schtasks_installed(_DIGEST_WIN_TASK_NAME)
     else:
         installed = None  # unknown
+        digest_installed = None
 
     if installed is True:
         _console.print("[bold]Schedule:[/bold] [green]installed[/green]")
@@ -421,6 +432,13 @@ def status() -> None:
         _console.print("[bold]Schedule:[/bold] [yellow]not installed[/yellow]")
     else:
         _console.print("[bold]Schedule:[/bold] [dim]unknown (unsupported platform)[/dim]")
+
+    if digest_installed is True:
+        _console.print("[bold]Digest schedule:[/bold] [green]installed[/green]")
+    elif digest_installed is False:
+        _console.print("[bold]Digest schedule:[/bold] [yellow]not installed[/yellow]")
+    else:
+        _console.print("[bold]Digest schedule:[/bold] [dim]unknown (unsupported platform)[/dim]")
 
     # --- last run ---
     last_run_path = data_dir() / "last-run.json"
@@ -450,19 +468,22 @@ def status() -> None:
         _console.print(f"[red]Could not parse last-run.json:[/red] {exc}")
 
 
-def _launchd_installed() -> bool:
+def _launchd_installed(label: str = _PLIST_LABEL) -> bool:
     result = subprocess.run(
         ["launchctl", "list"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return _PLIST_LABEL in result.stdout
+    # Exact match on the label column (the digest label has the check label as a prefix).
+    return any(
+        line.split()[-1] == label for line in result.stdout.splitlines() if line.split()
+    )
 
 
-def _schtasks_installed() -> bool:
+def _schtasks_installed(task_name: str = _WIN_TASK_NAME) -> bool:
     result = subprocess.run(
-        ["schtasks", "/query", "/tn", _WIN_TASK_NAME, "/v", "/fo", "list"],
+        ["schtasks", "/query", "/tn", task_name, "/v", "/fo", "list"],
         capture_output=True,
         text=True,
         check=False,
@@ -550,33 +571,7 @@ def _install_digest_schtasks() -> None:
     if pythonw.exists():
         python_path = str(pythonw)
 
-    xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Price Watcher daily sales digest</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <CalendarTrigger>
-      <StartBoundary>2024-01-01T09:00:00</StartBoundary>
-      <Enabled>true</Enabled>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
-    </CalendarTrigger>
-  </Triggers>
-  <Settings>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
-    <Enabled>true</Enabled>
-  </Settings>
-  <Actions>
-    <Exec>
-      <Command>{python_path}</Command>
-      <Arguments>-m price_watcher digest</Arguments>
-      <WorkingDirectory>{_repo_dir()}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>"""
+    xml_content = _task_xml("Price Watcher daily sales digest", 9, "PT15M", python_path, "digest")
 
     xml_path = data_dir() / "task-scheduler-digest.xml"
     xml_path.write_text(xml_content, encoding="utf-16")
