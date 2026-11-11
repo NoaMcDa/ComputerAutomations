@@ -89,6 +89,10 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
     from price_watcher import fetcher as _fetcher
     from price_watcher import state as _state
     from price_watcher import email_sender as _email_sender
+    from price_watcher.contracts import FetchResult
+    from price_watcher.logging_setup import get as _get_logger
+
+    _log = _get_logger(__name__)
 
     # 3. Load & filter watches
     watches = [w for w in _watchlist.load_all() if not w.paused]
@@ -105,8 +109,31 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
             import time
             time.sleep(delay)
 
-        fetch_result = _fetcher.fetch(watch.url, watch.selector)
-        event = _state.evaluate(watch, fetch_result, cfg.check)
+        # One misbehaving watch must not abort the whole run: an exception is
+        # treated as a failed fetch for that watch only.
+        try:
+            fetch_result = _fetcher.fetch(watch.url, watch.selector)
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("fetch raised for %s", watch.url)
+            fetch_result = FetchResult(
+                status=FetchStatus.UNREACHABLE,
+                final_url=watch.url,
+                error_message=f"fetch crashed: {type(exc).__name__}: {exc}",
+            )
+        try:
+            event = _state.evaluate(watch, fetch_result, cfg.check)
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("evaluate raised for %s", watch.url)
+            event = ChangeEvent(
+                type=ChangeType.FAILED,
+                watch=watch,
+                fetch=FetchResult(
+                    status=FetchStatus.UNREACHABLE,
+                    final_url=watch.url,
+                    error_message=f"evaluate crashed: {type(exc).__name__}: {exc}",
+                ),
+                reason="evaluate crashed",
+            )
         events.append(event)
 
     # 5. Build results table
@@ -124,6 +151,7 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
         fetch = event.fetch
         ok = fetch.status == FetchStatus.OK
         failed = not ok or event.type == ChangeType.FAILED
+        send_word = "would send" if dry_run else "sending"
 
         def _price_cell() -> str:
             if fetch.price is not None:
@@ -131,7 +159,32 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
                 return f"{fetch.price}{(' ' + cur) if cur else ''}"
             return "—"
 
-        if failed:
+        def _change_cell() -> str:
+            parts = []
+            if event.old_price is not None or event.new_price is not None:
+                old_str = str(event.old_price) if event.old_price is not None else "—"
+                new_str = str(event.new_price) if event.new_price is not None else "—"
+                parts.append(f"{old_str} → {new_str}")
+            else:
+                parts.append(_price_cell())
+            if event.stock_changed:
+                parts.append("in stock" if fetch.in_stock else "out of stock")
+            if event.promo_changed:
+                parts.append("promo changed" if fetch.promo else "promo ended")
+            return " — ".join(parts)
+
+        if event.type == ChangeType.THRESHOLD_FAILURE:
+            any_failed = True
+            status_cell = "[red]FAIL[/red]"
+            info_cell = event.reason or fetch.error_message or fetch.status.value
+            action_cell = f"{send_word} failure alert"
+        elif event.type == ChangeType.RECOVERED:
+            if event.old_price is not None or event.stock_changed or event.promo_changed:
+                changed_count += 1
+            status_cell = "[green]OK[/green]"
+            info_cell = _change_cell()
+            action_cell = f"recovered ({send_word})"
+        elif failed:
             any_failed = True
             reason = fetch.error_message or fetch.status.value
             status_cell = "[red]FAIL[/red]"
@@ -152,10 +205,8 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
         else:
             changed_count += 1
             status_cell = "[green]OK[/green]"
-            old_str = str(event.old_price) if event.old_price is not None else "—"
-            new_str = str(event.new_price) if event.new_price is not None else "—"
-            info_cell = f"{old_str} → {new_str}"
-            action_cell = "would send" if dry_run else "sending"
+            info_cell = _change_cell()
+            action_cell = send_word
 
         table.add_row(status_cell, watch_name, info_cell, action_cell)
 
@@ -172,18 +223,27 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
         return 1 if any_failed else 0
 
     # Real run: send + persist
+    sent = True
     if payload is not None:
         sent = _email_sender.send_change_notification(events)
         if sent:
             _state.mark_notified(events)
+        else:
+            _console.print(
+                "[yellow]Email failed — changes not recorded; they will be "
+                "retried on the next run.[/yellow]"
+            )
 
-    _state.apply_many(events)
+    # If the email failed, notifiable changes are not written to state so the
+    # next run detects and sends them again.
+    _state.apply_many(events, notification_sent=sent)
 
     # Summary line
     checked = len(events)
     failed_count = sum(
         1 for e in events
-        if e.fetch.status != FetchStatus.OK or e.type == ChangeType.FAILED
+        if e.fetch.status != FetchStatus.OK
+        or e.type in (ChangeType.FAILED, ChangeType.THRESHOLD_FAILURE)
     )
     _console.print(
         f"\n[bold]{checked} checked, {changed_count} changed, {failed_count} failed[/bold]"
