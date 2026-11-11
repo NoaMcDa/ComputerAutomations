@@ -689,7 +689,7 @@ def _promo_category(p) -> str:
 
 
 def _group_meat_by_category(sm):
-    """category -> its deals, best first, categories in `_CATEGORIES` order."""
+    """category -> its deals (cheapest first as ranked), categories in `_CATEGORIES` order."""
     from price_watcher.supermarkets import _CATEGORIES
     groups: dict[str, list] = {}
     for p in sm.promos:
@@ -717,16 +717,26 @@ _FONT_STACK = ("-apple-system,BlinkMacSystemFont,'Segoe UI',"
 # (keywords in the Hebrew category name, icon) — first match wins.
 _CATEGORY_ICONS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("הודו",), "🦃"),
-    (("עוף", "כנפיים", "כרעיים", "ירכיים", "שוקיים", "פולקע", "פרגיות", "קורקבן", "אווז"), "🍗"),
+    (("אווז", "ברווז"), "🦆"),
+    (("עוף", "פולקע", "פרגיות"), "🍗"),
     (("כבש", "טלה"), "🐑"),
     (("עגל", "בייבי"), "🐄"),
     (("לשון",), "👅"),
     (("מוח",), "🧠"),
 )
 
-def _region_order() -> tuple[str, ...]:
-    from price_watcher.supermarkets import _REGION_ORDER
-    return _REGION_ORDER
+def _region_order(sm=None) -> tuple[str, ...]:
+    """Regions of the scan area, in `_REGION_ORDER` (only regions with an enabled city)."""
+    recorded = list(getattr(sm, "regions", None) or [])
+    if recorded:
+        return tuple(recorded)
+    from price_watcher.supermarkets import _active_regions
+    return _active_regions()
+
+
+def _show_regions(sm=None) -> bool:
+    """Region chips only help when the scan covers more than one region."""
+    return len(_region_order(sm)) > 1
 
 
 # Soft background / text colour per region, in `_REGION_ORDER` order.
@@ -742,7 +752,7 @@ _REGION_SHORT = {"ראשון לציון והסביבה": "ראשל״צ והסב�
 
 
 def _region_chip_html(region: str) -> str:
-    order = _region_order()
+    from price_watcher.supermarkets import _REGION_ORDER as order
     if region in order:
         bg, fg = _REGION_CHIP_COLORS[order.index(region) % len(_REGION_CHIP_COLORS)]
     else:
@@ -758,8 +768,15 @@ def _promo_regions(p) -> list[str]:
     return list(getattr(p, "regions", None) or [])
 
 
-def _where_label(p) -> str:
-    """Cities (and store count) a deal was seen in, e.g. 'נתניה, רעננה · 5 סניפים'."""
+def _where_label(p, limit: int = 3) -> str:
+    """Branches a deal was seen in, e.g. 'סוקולוב הרצליה · רמת השרון ועוד 2'.
+
+    Falls back to the cities (and store count) for rows without branch names.
+    """
+    stores = list(getattr(p, "stores", None) or [])
+    if stores:
+        more = len(stores) - limit
+        return " · ".join(stores[:limit]) + (f" ועוד {more}" if more > 0 else "")
     cities = list(getattr(p, "cities", None) or [])
     if not cities:
         return ""
@@ -785,51 +802,35 @@ def _usd(value: object) -> str:
     return f'<span dir="ltr">${value}</span>'
 
 
-def _price_cell_html(p) -> str:
-    """Render the before/after price cell: strike-through old, bold new.
-
-    Both prices are per unit (per kg for weighed items); a multi-buy deal
-    ("2 ב-₪90") is shown under them.
-    """
-    unit = (
-        f'<span style="font-size:10px;color:{_COLOR_MUTED}"> לק״ג</span>'
-        if getattr(p, "is_weighted", False) else ""
-    )
-    deal = getattr(p, "deal_text", "")
-    deal_html = (
-        f'<div style="font-size:10px;color:{_COLOR_MUTED};margin-top:2px">'
-        f'<span dir="rtl">{escape(deal)}</span></div>' if deal else ""
-    )
-    if p.regular_price and p.discounted_price:
-        return (
-            f'<span style="color:{_COLOR_MUTED};text-decoration:line-through">{_shekel(p.regular_price)}</span>'
-            f'<br><b style="color:{_COLOR_TEXT}">{_shekel(p.discounted_price)}</b>{unit}{deal_html}'
-        )
-    if p.discounted_price:
-        return f'<b>{_shekel(p.discounted_price)}</b>{unit}{deal_html}'
-    if p.regular_price:
-        return f'<span style="color:{_COLOR_MUTED}">{_shekel(p.regular_price)}</span>{unit}'
-    return "—"
-
-
 def _price_compact_html(p) -> str:
-    """'-30%' on top, then the promo price in bold and the regular price struck through (per unit)."""
+    """Promo price per kg in bold, then the regular price per kg struck
+    through with the discount, then the multi-buy deal / pack size."""
+    # Kept lean on purpose: this is repeated on every row of every table.
+    # The table header says the prices are per kg.
+    per_kg = getattr(p, "price_per_kg", None)
+    was_kg = getattr(p, "regular_per_kg", None)
+    unit = ""
+    if per_kg is None:  # no price per kg: show the unit price as it is
+        per_kg = p.discounted_price
+        was_kg = p.regular_price
+        unit = " לק״ג" if getattr(p, "is_weighted", False) else " ליח׳"
+    lines = []
+    if per_kg:
+        lines.append(f'<b dir="ltr" style="font-size:15px">₪{per_kg}</b>' + (f'<small>{unit}</small>' if unit else ''))
     # "-30%" when known; a bare dash (not "-—") when it is not.
     pct_txt = f"-{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
-    parts = [f'<b style="font-size:15px;color:{_COLOR_DANGER}"><span dir="ltr">{pct_txt}</span></b>']
-    unit = (
-        f'<small style="color:{_COLOR_MUTED}"> לק״ג</small>'
-        if getattr(p, "is_weighted", False) else ""
-    )
-    if p.discounted_price:
-        parts.append(f'<b>{_shekel(p.discounted_price)}</b>{unit}')
-    if p.regular_price:
-        was = f'<s style="color:{_COLOR_MUTED}">{_shekel(p.regular_price)}</s>'
-        parts.append(f'<small>{was}</small>' if p.discounted_price else was + unit)
-    deal = getattr(p, "deal_text", "")
-    if deal:
-        parts.append(f'<small style="color:{_COLOR_MUTED}">{escape(deal)}</small>')
-    return "<br>".join(parts)
+    pct = f'<b dir="ltr" style="color:{_COLOR_DANGER}">{pct_txt}</b>'
+    was = f'<s dir="ltr">₪{was_kg}</s> ' if was_kg else ""
+    lines.append(f'<small>{was}{pct}</small>')
+    # One short line each, so the (unwrapped) price column stays narrow on phones.
+    if getattr(p, "deal_text", ""):
+        # "2 ב-₪90" with the amount isolated, or the bidi order scrambles it.
+        lines.append(
+            f'<small dir="rtl">מבצע {p.min_qty.normalize():f} ב-<span dir="ltr">₪{p.bundle_price}</span></small>'
+        )
+    if getattr(p, "pack_text", ""):
+        lines.append(f'<small>{escape(p.pack_text)}</small>')
+    return "<br>".join(lines)
 
 
 def _section_heading_html(title: str, first: bool = False) -> str:
@@ -849,6 +850,42 @@ def _failure_box_html(title: str, status: str | None, error: str | None) -> str:
         + (f' — {escape(error)}' if error else '')
         + '</div>'
     )
+
+
+def _scope_parts(sm) -> list[tuple[str, int]]:
+    """(city, stores scanned there) for every city of the scan area."""
+    by_city = getattr(sm, "stores_by_city", None) or {}
+    cities = list(getattr(sm, "cities", None) or [])
+    if not cities:
+        from price_watcher.supermarkets import _enabled_cities
+        cities = list(_enabled_cities())
+    return [(c, by_city.get(c, 0)) for c in cities]
+
+
+def _stores_word(n: int) -> str:
+    return "סניף אחד" if n == 1 else f"{n} סניפים"
+
+
+def _ranking_note(sm) -> str:
+    """One sentence explaining how the tables are ranked (both text and HTML)."""
+    from price_watcher.supermarkets import _top_per_category
+    note = (
+        f"בכל קטגוריה {_top_per_category()} המבצעים הזולים ביותר לפי מחיר המבצע לק״ג, "
+        "מהזול ליקר (במוצרים ארוזים המחיר מחושב לפי משקל המארז)."
+    )
+    unpriced = sum((getattr(sm, "unpriced_by_category", None) or {}).values())
+    if unpriced:
+        note += (
+            f" {unpriced} מבצעים לא נכללו בדירוג כי לא ניתן לחשב להם מחיר לק״ג"
+            " (משקל המארז חסר או סותר בקובץ המחירים)."
+        )
+    unranked = sum((getattr(sm, "unranked_by_category", None) or {}).values())
+    if unranked:
+        note += (
+            f" {unranked} מבצעים בקבוצות כלליות (כמו ״בשר – אחר״ או ״עוף – אחר״)"
+            " לא מוצגים, כי הם מערבבים נתחים שונים."
+        )
+    return note
 
 
 def _supermarkets_section_text(sm) -> list[str]:
@@ -876,16 +913,12 @@ def _supermarkets_section_text(sm) -> list[str]:
     lines.append(f"  רשתות שנסרקו: {chains}")
     lines.extend(problem_lines)
     lines.append(f"  סניפים שנסרקו: {len(getattr(sm, 'stores_scanned', None) or [])}")
-    stores_by_region = getattr(sm, "stores_by_region", None) or {}
-    if stores_by_region:
-        lines.append(
-            "  אזורים: " + " · ".join(
-                f"{region} ({stores_by_region.get(region, 0)} סניפים)" for region in _region_order()
-            )
-        )
+    lines.append("  ערים: " + " · ".join(f"{c} ({_stores_word(n)})" for c, n in _scope_parts(sm)))
+    show_regions = _show_regions(sm)
     if not sm.promos:
         lines.append("  לא נמצאו היום מבצעי בשר.")
         return lines
+    lines.append("  " + _ranking_note(sm))
     promos_by_category = getattr(sm, "promos_by_category", None) or {}
     for category, items in _group_meat_by_category(sm).items():
         total = promos_by_category.get(category, len(items))
@@ -893,29 +926,37 @@ def _supermarkets_section_text(sm) -> list[str]:
         lines.append("")
         lines.append(f"  ▼ {category}  ({shown} מבצעים)")
         for i, p in enumerate(items, 1):
+            per_kg = getattr(p, "price_per_kg", None)
+            was_kg = getattr(p, "regular_per_kg", None)
+            if per_kg is not None:
+                now = f"₪{per_kg} לק״ג"
+                was = f"₪{was_kg} לק״ג" if was_kg is not None else "—"
+            else:
+                unit = " לק״ג" if getattr(p, "is_weighted", False) else ""
+                now = f"₪{p.discounted_price}{unit}" if p.discounted_price else "—"
+                was = f"₪{p.regular_price}{unit}" if p.regular_price else "—"
             pct = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "לא ידועה"
-            unit = " לק״ג" if getattr(p, "is_weighted", False) else ""
-            was = f"₪{p.regular_price}{unit}" if p.regular_price else "—"
-            now = f"₪{p.discounted_price}{unit}" if p.discounted_price else "—"
-            deal = getattr(p, "deal_text", "")
-            if deal:
-                now += f" ({deal})"
-            lines.append(f"    {i}. הנחה {pct} · {p.chain} · {p.item_name[:50]}")
-            lines.append(f"       מחיר רגיל {was} · מחיר מבצע {now}")
+            extra = " · ".join(
+                x for x in (getattr(p, "deal_text", ""), getattr(p, "pack_text", "")) if x
+            )
+            lines.append(f"    {i}. {now} · {p.chain} · {p.item_name[:50]}")
+            lines.append(
+                f"       מחיר רגיל {was} · הנחה {pct}" + (f" · {extra}" if extra else "")
+            )
             if p.promotion_description:
                 lines.append(f"       {p.promotion_description[:90]}")
-            regions = " · ".join(_promo_regions(p))
-            where = _where_label(p)
+            where = _where_label(p, limit=6)
+            regions = " · ".join(_promo_regions(p)) if show_regions else ""
             if regions or where:
                 lines.append("       " + " — ".join(x for x in (regions, where) if x))
     return lines
 
 
 def _supermarkets_section_html(sm) -> str:
-    """Meat section: one table per category, best deal first. RTL.
+    """Meat section: one table per category, cheapest promo price per kg first. RTL.
 
-    Each category shows up to PW_TOP_PER_CATEGORY supermarket deals, with at
-    least one from every region that has a deal in that category.
+    Each category shows up to PW_TOP_PER_CATEGORY deals. Region chips appear
+    only when the scan covers more than one region.
     """
     if sm is None:
         return '<div style="color:#888;font-style:italic;text-align:right">(לא נסרק)</div>'
@@ -940,15 +981,23 @@ def _supermarkets_section_html(sm) -> str:
     stores_scanned = list(getattr(sm, "stores_scanned", None) or [])
     stores_by_region = getattr(sm, "stores_by_region", None) or {}
     promos_by_category = getattr(sm, "promos_by_category", None) or {}
+    unpriced_by_category = getattr(sm, "unpriced_by_category", None) or {}
     grouped = _group_meat_by_category(sm)
-    total_deals = sum(promos_by_category.values()) or len(sm.promos)
+    total_deals = (
+        (sum(promos_by_category.values()) or len(sm.promos)) + sum(unpriced_by_category.values())
+        + sum((getattr(sm, "unranked_by_category", None) or {}).values())
+    )
+    show_regions = _show_regions(sm)
+    muted = f'color:{_COLOR_MUTED}'
 
+    scope_html = "ערים: " + " · ".join(
+        f'{escape(c)} <span style="{muted}">({_stores_word(n)})</span>' for c, n in _scope_parts(sm)
+    )
     regions_legend = "".join(
         f'{_region_chip_html(region)}'
-        f'<span style="color:{_COLOR_MUTED};margin-left:10px"> '
-        f'{stores_by_region.get(region, 0)} סניפים</span>'
-        for region in _region_order()
-    )
+        f'<span style="{muted};margin-left:10px"> {_stores_word(stores_by_region.get(region, 0))}</span>'
+        for region in _region_order(sm)
+    ) if show_regions else ""
 
     html = []
     # Summary card
@@ -956,21 +1005,21 @@ def _supermarkets_section_html(sm) -> str:
         f'<div style="padding:14px 16px;background:{_COLOR_BG_SOFT};'
         f'border:1px solid {_COLOR_BORDER};border-radius:10px;margin-bottom:14px;'
         f'font-family:{_FONT_STACK};color:{_COLOR_TEXT};text-align:right">'
-        f'<div style="font-size:13px;color:{_COLOR_MUTED}">הסריקה של היום</div>'
+        f'<div style="font-size:13px;{muted}">הסריקה של היום</div>'
         f'<div style="font-size:15px;margin-top:4px">'
         f'<b>{len(chains_scanned)}</b> רשתות · '
         f'<b>{len(stores_scanned)}</b> סניפים · '
         f'<b>{total_deals}</b> מבצעי בשר · '
         f'<b>{len(grouped)}</b> קטגוריות</div>'
-        f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
+        f'<div style="font-size:12px;margin-top:6px">{scope_html}</div>'
+        f'<div style="font-size:12px;{muted};margin-top:4px">'
         f'רשתות: ' + " · ".join(escape(c) for c in chains_scanned)
         + '</div>'
-        + f'<div style="margin-top:8px;font-size:11px">{regions_legend}</div>'
+        + (f'<div style="margin-top:8px;font-size:11px">{regions_legend}</div>' if regions_legend else '')
         + problems_html
-        + f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
-        f'טבלה לכל קטגוריה: המבצעים הטובים ביותר, מההנחה הגבוהה לנמוכה, '
-        f'עם לפחות מבצע אחד מכל אזור שיש בו מבצע בקטגוריה.'
-        f'</div></div>'
+        + (f'<div style="font-size:12px;{muted};margin-top:6px">{escape(_ranking_note(sm))}</div>'
+           if sm.promos else '')
+        + '</div>'
     )
 
     if not sm.promos:
@@ -980,87 +1029,67 @@ def _supermarkets_section_html(sm) -> str:
         )
         return "".join(html)
 
-    # Category index (plain chips: in-page links are unreliable in mail clients)
+    # Category index as plain text (in-page links are unreliable in mail
+    # clients, and one styled chip per category cost ~10 KB with 40 tables).
     html.append(
-        f'<div style="margin:0 0 18px;font-family:{_FONT_STACK};font-size:12px;'
-        f'color:{_COLOR_MUTED};text-align:right;line-height:1.9">'
-        + " ".join(
-            f'<span style="display:inline-block;background:#ffffff;border:1px solid {_COLOR_BORDER};'
-            f'border-radius:12px;padding:1px 9px;margin:0 0 4px 4px;color:{_COLOR_TEXT};'
-            f'white-space:nowrap">{_category_icon(cat)} {escape(cat)} '
-            f'<span style="color:{_COLOR_MUTED}">{len(items)}</span></span>'
-            for cat, items in grouped.items()
-        )
-        + '</div>'
+        f'<div style="margin:0 0 16px;font-size:12px;{muted};text-align:right;line-height:1.7">'
+        'קטגוריות: ' + " · ".join(escape(cat) for cat in grouped) + '</div>'
     )
 
-    small = f'font-size:11px;color:{_COLOR_MUTED}'
-    row_base = f'border-top:1px solid {_COLOR_BORDER};vertical-align:top'
-
-    # One table per category, best deal first. Styles that repeat on every
-    # cell live on the <table>/<tr> (inherited) to keep the email small.
+    # One table per category, cheapest first. Kept lean on purpose (Gmail
+    # clips mails above ~102 KB): no per-row badges or zebra shading, the
+    # muted colour and the cell alignment are the only styles repeated.
+    muted_small = f'<small style="{muted}">'
     for category, items in grouped.items():
         rows_html = []
         for i, p in enumerate(items):
-            is_best = i == 0
-            row_bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else _COLOR_BG_SOFT)
-            best_badge = (
-                f' <span style="background:{_COLOR_ACCENT};color:#fff;font-size:10px;'
-                f'padding:1px 5px;border-radius:4px;white-space:nowrap">הכי משתלם</span>'
-                if is_best else ""
-            )
             where = _where_label(p)
-            regions_html = " ".join(_region_chip_html(r) for r in _promo_regions(p)) or "—"
+            chips = " ".join(_region_chip_html(r) for r in _promo_regions(p)) if show_regions else ""
+            below = "<br>".join(x for x in (chips, escape(where)) if x)
+            desc = (p.promotion_description or "").strip()
             rows_html.append(
-                f'<tr style="background:{row_bg};{row_base}">'
-                # Supermarket, then its region(s) and cities. One column, so
-                # the table still fits a phone screen.
-                f'<td><b style="color:{_COLOR_LINK}">{escape(p.chain)}</b>{best_badge}'
-                f'<div style="{small};margin-top:2px">{regions_html}'
-                + (f'<br>{escape(where)}' if where else '')
-                + '</div></td>'
+                f'<tr valign="top" style="border-top:1px solid {_COLOR_BORDER}'
+                + (';background:#ecfdf5">' if i == 0 else '">')
+                # Supermarket, then its branch(es) with the city. One column,
+                # so the table still fits a phone screen.
+                + ('<td width="34%">' if i == 0 else '<td>')
+                + f'<b style="color:{_COLOR_LINK}">{escape(p.chain)}</b>'
+                + (f'<br>{muted_small}{below}</small>' if below else '')
+                + '</td>'
                 # Item
                 f'<td>{escape(p.item_name[:60])}'
-                + (f'<br><span style="{small}">{escape(p.promotion_description[:70])}</span>'
-                   if p.promotion_description else '')
+                + (f'<br>{muted_small}{escape(desc[:60])}</small>' if desc and desc != p.item_name else '')
                 + '</td>'
-                # Discount + price (was / now)
-                f'<td align="left" style="white-space:nowrap">{_price_compact_html(p)}</td>'
+                # Price per kg (now / was), discount, deal
+                f'<td align="left" nowrap>{_price_compact_html(p)}</td>'
                 '</tr>'
             )
 
         total = promos_by_category.get(category, len(items))
         if total > len(items):
-            shown_txt = f'{len(items)} המבצעים הטובים ביותר מתוך {total}'
+            shown_txt = f'{len(items)} הזולים מתוך {total}'
         elif len(items) == 1:
             shown_txt = 'מבצע אחד'
         else:
             shown_txt = f'{len(items)} מבצעים'
         chains_in_table = len({p.chain for p in items})
         chains_txt = 'רשת אחת' if chains_in_table == 1 else f'{chains_in_table} רשתות'
+        unpriced = unpriced_by_category.get(category, 0)
+        unpriced_txt = f' · עוד {unpriced} בלי מחיר לק״ג' if unpriced else ''
         html.append(
-            f'<div style="margin:0 0 20px;background:#ffffff;border:1px solid {_COLOR_BORDER};'
-            f'border-radius:10px;overflow:hidden;font-family:{_FONT_STACK}">'
-            # Header strip
-            f'<div style="padding:10px 14px;background:{_COLOR_TEXT};text-align:right">'
-            f'<div style="font-size:16px;font-weight:700;color:#ffffff">'
-            f'{_category_icon(category)} {escape(category)}</div>'
-            f'<div style="font-size:11px;color:#d1d5db;margin-top:2px">'
-            f'{shown_txt} · {chains_txt}'
-            f'</div></div>'
-            # Table header + body
-            f'<table dir="rtl" cellpadding="6" cellspacing="0" style="border-collapse:collapse;'
-            f'width:100%;font-size:13px;color:{_COLOR_TEXT};text-align:right">'
-            f'<tr style="{small}">'
-            '<th align="right" width="34%">סופרמרקט ואזור</th>'
-            '<th align="right">מוצר</th>'
-            '<th align="left">הנחה ומחיר</th>'
-            '</tr>'
+            f'<table dir="rtl" cellpadding="6" cellspacing="0" width="100%" style="border-collapse:collapse;'
+            f'margin:0 0 16px;border:1px solid {_COLOR_BORDER};font-size:13px;color:{_COLOR_TEXT};'
+            f'font-family:{_FONT_STACK}">'
+            # Header strip: category, counts, and the unit of the price column
+            f'<tr><td colspan="3" style="background:{_COLOR_TEXT};color:#fff;padding:8px 10px">'
+            f'<b style="font-size:15px">{_category_icon(category)} {escape(category)}</b> '
+            f'<small style="color:#d1d5db">{shown_txt} · {chains_txt}{unpriced_txt} · מחיר לק״ג</small>'
+            '</td></tr>'
             + "".join(rows_html)
             + '</table>'
-            '</div>'
         )
     return "".join(html)
+
 
 
 def _sims4_section_text(sims4) -> list[str]:

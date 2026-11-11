@@ -105,3 +105,50 @@ def test_not_a_promotion_descriptions():
     ):
         assert sm._NOT_A_PROMO_PAT.search(sm._norm(desc)), desc
     assert not sm._NOT_A_PROMO_PAT.search("ב2- ב 20 שח  כנפיים עוף טרי")
+
+
+# ---- price per kg (#50) ----
+
+def _item(name, price, uq, q, uom, uomp, weighted=False):
+    return sm._FeedItem(
+        name=name, price=Decimal(price), weighted=weighted, unit_qty=uq,
+        quantity=sm._dec(q), unit_of_measure=uom, unit_price=sm._dec(uomp),
+    )
+
+
+def test_pack_weight_from_real_pricefull_rows():
+    D = Decimal
+    cases = [
+        # (row, grams) — rows as published on 2026-11-11
+        (_item("רצועות ריב אנטריקוט 300", "39.90", "גרם", "300.00", "100 גרם", "13.30"), D("300")),  # Shufersal
+        (_item("בשר טחון מובחר 500 גרם", "34.90", "גרם", "500.00", "100 גרם", "6.98"), D("500")),
+        (_item("סטייק בקר חלק 800 ג", "59.90", "גרם", "800.00", "100 גרם", "7.49"), D("800")),     # Rami Levy
+        (_item("בקר טחון עטרה 1.2 ק\"", "44.90", "לא ידוע", "1.20", 'ק"ג', "37.42"), D("1200")),    # Osher Ad
+        (_item("בשר בקר טחון קפוא 1 ק\"ג", "45.90", "גרם", "1000.00", "100 גרם", "4.59"), D("1000")),  # Tiv Taam
+        (_item("פרגית 80 גרם", "6.90", "", "1", "", "6.9"), D("80")),                                # Bareket
+        # no weight anywhere / contradicting sources
+        (_item("חצי ראש כבש קפוא עטר", "39.90", "יחידות", "0.00", "יחידה", "0.00"), None),          # Osher Ad
+        (_item("כרעיים עוף", "24.90", "יחידות", "1.00", "יחידות", "24.90"), None),
+        (_item("סטייק בקר 500 גרם", "59.90", "גרם", "800.00", "100 גרם", "7.49"), None),             # name says 500
+        (_item("בשר טחון", "34.90", "גרם", "500.00", "100 גרם", "3.49"), None),                     # per-100 g price says 1 kg
+        (_item("שומן", "4.90", "גרם", "10.00", "100 גרם", "49.00"), None),                          # 10 g: implausible
+    ]
+    for item, grams in cases:
+        assert sm._pack_grams(item) == grams, item.name
+
+
+def test_unit_kg_for_weighed_items():
+    D = Decimal
+    # Osher Ad writes "יחידה" for weighed meat priced per kg: the flag wins
+    assert sm._unit_kg(_item("חזה עוף טרי קהילות", "47.90", "יחידות", "1.00", "יחידה", "47.90", True), True) == D(1)
+    assert sm._unit_kg(_item("כנפיים עוף טרי ארוז", "13.90", "קילוגרם", "1.00", "1קילוגרם", "13.90", True), True) == D(1)
+    # weighed but priced per 100 g: not comparable, left out
+    assert sm._unit_kg(_item("פסטרמה", "8.90", "גרם", "100", "100 גרם", "8.90", True), True) is None
+    assert sm._unit_kg(_item("לשון בקר 400 גר", "32.90", "גרם", "400.00", "100 גרם", "8.23"), False) == D("0.4")
+
+
+def test_scanned_promos_carry_their_price_per_kg():
+    promos = _scan()
+    assert promos["1001"].price_per_kg == Decimal("10.00")  # weighed
+    assert promos["1003"].unit_kg is None                   # packaged "יחידות", weight unknown
+    assert promos["1003"].price_per_kg is None

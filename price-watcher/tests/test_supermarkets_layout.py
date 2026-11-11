@@ -1,5 +1,6 @@
 """The meat report is organised by category: one table per category in the
-email, up to PW_TOP_PER_CATEGORY deals each, every region represented."""
+email, the PW_TOP_PER_CATEGORY (default 5) cheapest deals each, ranked by
+promo price per kg (#50)."""
 
 from __future__ import annotations
 
@@ -12,25 +13,29 @@ from price_watcher import supermarkets as sm
 SHARON, TLV, RISHON = sm._REGION_ORDER
 
 
-def _promo(chain, region, name, pct, *, desc=None, store="001", city="עיר"):
-    """A raw per-store row with a regular price of 100 and `pct` percent off."""
+def _promo(chain, name, now, *, was="100.00", region=SHARON, desc=None, store="001",
+           city="הרצליה", branch=None, weighted=True, unit_kg=None):
+    """A raw per-store row: regular price `was`, promo price `now` (per unit)."""
     return sm.MeatPromo(
         chain=chain,
         store_id=store,
         item_code="1",
         item_name=name,
-        regular_price=Decimal("100.00"),
-        discounted_price=Decimal(100 - pct),
+        regular_price=Decimal(was),
+        discounted_price=Decimal(str(now)),
         discount_rate=None,
-        promotion_description=desc if desc is not None else f"{name} {chain} {pct} {region}",
+        promotion_description=desc if desc is not None else f"{name} {chain} {now}",
         regions=[region],
         city=city,
-        is_weighted=True,
+        cities=[city],
+        stores=[branch or f"סניף {store} ({city})"],
+        is_weighted=weighted,
+        unit_kg=None if unit_kg is None else Decimal(unit_kg),
     )
 
 
-def _report(promos):
-    report = sm.SupermarketReport(status="ok", chains_scanned=sorted({p.chain for p in promos}))
+def _report(promos, **kw):
+    report = sm.SupermarketReport(status="ok", chains_scanned=sorted({p.chain for p in promos}), **kw)
     report.promos = list(promos)
     sm._finalize_report(report)
     return report
@@ -40,72 +45,99 @@ def _by_category(report):
     return email_sender._group_meat_by_category(report)
 
 
-def test_category_keeps_ten_best_by_default(monkeypatch):
+def test_category_keeps_five_cheapest_by_default(monkeypatch):
     monkeypatch.delenv("PW_TOP_PER_CATEGORY", raising=False)
-    promos = [_promo("רמי לוי", SHARON, "כנפיים עוף טרי", pct, store=f"{pct:03d}") for pct in range(10, 40)]
+    # Bigger discount does not matter: the price does.
+    promos = [
+        _promo("רמי לוי", "כנפיים עוף טרי", now, was=str(now + 40 - i), store=f"{i:03d}")
+        for i, now in enumerate(range(10, 40))
+    ]
     report = _report(promos)
-    wings = _by_category(report)["כנפיים"]
-    assert len(wings) == 10
-    assert [int(p.savings_pct) for p in wings] == sorted((int(p.savings_pct) for p in wings), reverse=True)
-    assert int(wings[0].savings_pct) == 39
-    assert report.promos_by_category["כנפיים"] == 30
+    wings = _by_category(report)["כנפיים עוף"]
+    assert [p.price_per_kg for p in wings] == [Decimal(n) for n in (10, 11, 12, 13, 14)]
+    assert report.promos_by_category["כנפיים עוף"] == 30
 
 
 def test_top_per_category_is_configurable(monkeypatch):
-    monkeypatch.setenv("PW_TOP_PER_CATEGORY", "4")
-    promos = [_promo("רמי לוי", SHARON, "כנפיים עוף טרי", pct, store=f"{pct:03d}") for pct in range(10, 40)]
-    assert len(_by_category(_report(promos))["כנפיים"]) == 4
+    monkeypatch.setenv("PW_TOP_PER_CATEGORY", "3")
+    promos = [_promo("רמי לוי", "כנפיים עוף טרי", now, store=f"{now:03d}") for now in range(10, 40)]
+    assert len(_by_category(_report(promos))["כנפיים עוף"]) == 3
 
 
-def test_every_region_with_a_deal_gets_a_row_even_if_its_deal_is_weaker(monkeypatch):
-    monkeypatch.delenv("PW_TOP_PER_CATEGORY", raising=False)
-    # 15 strong deals in the Sharon, one weak deal in Tel Aviv, one in Rishon.
-    promos = [_promo("רמי לוי", SHARON, "כנפיים עוף טרי", 30 + i, store=f"{i:03d}") for i in range(15)]
-    promos.append(_promo("שופרסל", TLV, "כנפיים עוף טרי", 6))
-    promos.append(_promo("יוחננוף", RISHON, "כנפיים עוף טרי", 5))
-    wings = _by_category(_report(promos))["כנפיים"]
-    assert len(wings) == 10
-    covered = {r for p in wings for r in p.regions}
-    assert covered == {SHARON, TLV, RISHON}
-    # still shown best first
-    assert [int(p.savings_pct) for p in wings][-2:] == [6, 5]
-
-
-def test_region_without_a_deal_in_the_category_is_simply_absent():
-    promos = [_promo("רמי לוי", SHARON, "כנפיים עוף טרי", 20), _promo("שופרסל", TLV, "כנפיים עוף טרי", 10)]
-    wings = _by_category(_report(promos))["כנפיים"]
-    assert {r for p in wings for r in p.regions} == {SHARON, TLV}
-
-
-def test_chains_are_spread_before_one_chain_fills_the_table(monkeypatch):
-    monkeypatch.delenv("PW_TOP_PER_CATEGORY", raising=False)
-    # One chain has 20 deals that all beat the other chains' single deals.
-    promos = [_promo("רמי לוי", SHARON, "כנפיים עוף טרי", 40 + i, store=f"{i:03d}") for i in range(20)]
-    others = ["שופרסל", "יוחננוף", "אושר עד", "טיב טעם", "פרש מרקט"]
-    promos += [_promo(chain, SHARON, "כנפיים עוף טרי", 10 + i) for i, chain in enumerate(others)]
-    wings = _by_category(_report(promos))["כנפיים"]
-    assert len(wings) == 10
-    assert {p.chain for p in wings} == {"רמי לוי", *others}
-
-
-def test_same_deal_in_several_regions_is_one_row_listing_all_of_them():
+def test_ranking_is_by_price_not_by_discount_percent():
     promos = [
-        _promo("שופרסל", region, "כנפיים עוף טרי", 25, desc="2 קג ב-30", store=store, city=city)
-        for region, store, city in ((RISHON, "003", "חולון"), (SHARON, "001", "נתניה"), (TLV, "002", "תל אביב"))
+        _promo("טיב טעם", "אנטריקוט בקר טרי", "99.90", was="199.90"),  # 50% off, expensive
+        _promo("שופרסל", "אנטריקוט בקר טרי", "79.90", was="89.90"),    # 11% off, cheaper
     ]
-    wings = _by_category(_report(promos))["כנפיים"]
-    assert len(wings) == 1
-    assert wings[0].regions == [SHARON, TLV, RISHON]  # region order, not scan order
+    rows = _by_category(_report(promos))["אנטריקוט"]
+    assert [p.chain for p in rows] == ["שופרסל", "טיב טעם"]
+
+
+def test_packaged_items_are_compared_per_kg():
+    promos = [
+        # 500 g pack at 22.90 = 45.80 per kg: dearer than the weighed 39.90 per kg
+        _promo("רמי לוי", "בשר בקר טחון 500 גרם", "22.90", was="28.90", weighted=False, unit_kg="0.5"),
+        _promo("שופרסל", "בשר בקר טחון טרי", "39.90", was="49.90"),
+    ]
+    rows = _by_category(_report(promos))["טחון בקר"]
+    assert [p.chain for p in rows] == ["שופרסל", "רמי לוי"]
+    assert rows[1].price_per_kg == Decimal("45.80")
+    assert rows[1].regular_per_kg == Decimal("57.80")
+    assert rows[1].pack_text == "מארז 500 גרם"
+
+
+def test_deals_without_a_price_per_kg_are_left_out_and_counted():
+    promos = [
+        _promo("שופרסל", "בשר בקר טחון טרי", "39.90"),
+        _promo("אושר עד", "בשר בקר טחון ארוז", "9.90", was="12.90", weighted=False),  # weight unknown
+        _promo("אושר עד", "כנפיים עוף ארוז", "5.90", was="7.90", weighted=False),
+    ]
+    report = _report(promos)
+    assert [p.chain for p in report.promos] == ["שופרסל"]
+    assert report.unpriced_by_category == {"טחון בקר": 1, "כנפיים עוף": 1}
+    assert report.unpriced_count == 2
+    assert report.promos_by_category == {"טחון בקר": 1}
+    html = email_sender._supermarkets_section_html(report)
+    assert "2 מבצעים לא נכללו בדירוג" in html
+    assert "עוד 1 בלי מחיר לק״ג" in html
+    assert "2 מבצעים לא נכללו בדירוג" in "\n".join(email_sender._supermarkets_section_text(report))
+
+
+def test_one_chain_may_fill_the_table_when_it_is_cheapest(monkeypatch):
+    # No region / chain quotas any more: strictly the five lowest prices.
+    monkeypatch.delenv("PW_TOP_PER_CATEGORY", raising=False)
+    promos = [_promo("רמי לוי", "כנפיים עוף טרי", 10 + i, store=f"{i:03d}") for i in range(8)]
+    promos += [_promo(chain, "כנפיים עוף טרי", 30 + i, region=TLV)
+               for i, chain in enumerate(["שופרסל", "יוחננוף"])]
+    wings = _by_category(_report(promos))["כנפיים עוף"]
+    assert {p.chain for p in wings} == {"רמי לוי"}
+    assert len(wings) == 5
+
+
+def test_same_deal_in_several_stores_is_one_row_listing_the_stores():
+    promos = [
+        _promo("שופרסל", "כנפיים עוף טרי", "11.90", desc="2 קג ב-23.80", store=store, city=city, branch=branch)
+        for store, city, branch in (
+            ("374", "הרצליה", "שלי הרצליה- הבנים"),
+            ("057", "רמת השרון", "שלי רמת השרון- אוסישקין"),
+            ("034", "רמת השרון", "שלי רמת השרון- סוקולוב"),
+        )
+    ]
+    promos.append(_promo("שופרסל", "כנפיים עוף טרי", "12.90", store="051", branch="אקספרס הרצליה"))
+    wings = _by_category(_report(promos))["כנפיים עוף"]
+    assert len(wings) == 2  # two different deals
     assert wings[0].store_count == 3
-    assert set(wings[0].cities) == {"נתניה", "תל אביב", "חולון"}
+    assert wings[0].stores == ["שלי הרצליה- הבנים", "שלי רמת השרון- אוסישקין", "שלי רמת השרון- סוקולוב"]
+    html = email_sender._supermarkets_section_html(_report(promos))
+    assert "שלי הרצליה- הבנים · שלי רמת השרון- אוסישקין" in html
 
 
 def test_report_is_grouped_by_category_in_the_fixed_category_order():
     promos = [
-        _promo("רמי לוי", SHARON, "אנטריקוט בקר טרי", 30),
-        _promo("רמי לוי", SHARON, "כנפיים עוף טרי", 50),
-        _promo("שופרסל", TLV, "אנטריקוט בקר טרי", 10),
-        _promo("שופרסל", TLV, "כנפיים עוף טרי", 20),
+        _promo("רמי לוי", "אנטריקוט בקר טרי", 70),
+        _promo("רמי לוי", "כנפיים עוף טרי", 10),
+        _promo("שופרסל", "אנטריקוט בקר טרי", 90),
+        _promo("שופרסל", "כנפיים עוף טרי", 12),
     ]
     report = _report(promos)
     seen = [p.category for p in report.promos]
@@ -117,32 +149,80 @@ def test_report_is_grouped_by_category_in_the_fixed_category_order():
     assert all(p.category == sm._categorize(p) for p in report.promos)
 
 
-def test_email_has_one_table_per_category_with_region_labels():
+def test_email_has_one_table_per_category_cheapest_first_with_branch(monkeypatch):
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
     promos = [
-        _promo("רמי לוי", SHARON, "אנטריקוט בקר טרי", 30, city="נתניה"),
-        _promo("שופרסל", TLV, "אנטריקוט בקר טרי", 10, city="תל אביב"),
-        _promo("יוחננוף", RISHON, "כנפיים עוף טרי", 20, city="חולון"),
+        _promo("רמי לוי", "אנטריקוט בקר טרי", "89.90", was="129.90", branch="סוקולוב הרצליה"),
+        _promo("סופר ברקת", "אנטריקוט בקר טרי", "79.90", was="99.90", city="רמת השרון",
+               branch="רמת השרון"),
+        _promo("יוחננוף", "כנפיים עוף טרי", "12.90", was="16.90", city="רמת השרון"),
     ]
     report = _report(promos)
     html = email_sender._supermarkets_section_html(report)
     assert html.count("<table") == 2
     tables = re.findall(r"<table.*?</table>", html, flags=re.S)
     entrecote = next(t for t in tables if "אנטריקוט בקר טרי" in t)
-    assert "רמי לוי" in entrecote and "שופרסל" in entrecote and "יוחננוף" not in entrecote
-    assert entrecote.index("רמי לוי") < entrecote.index("שופרסל")  # best deal first
-    assert SHARON in entrecote and TLV in entrecote
-    assert '<span dir="ltr">-30%</span>' in entrecote
-    # headings name the categories
+    assert "רמי לוי" in entrecote and "סופר ברקת" in entrecote and "יוחננוף" not in entrecote
+    assert entrecote.index("סופר ברקת") < entrecote.index("רמי לוי")  # cheapest first
+    assert "סוקולוב הרצליה" in entrecote
+    # price column leads with the promo price per kg, then the regular one struck through
+    cell = entrecote[entrecote.index("₪79.90"):]
+    assert cell.index("₪79.90") < cell.index("₪99.90") < cell.index("-20%")
+    assert "<s" in cell[:cell.index("₪99.90")]
+    # one region only: no region chips
+    assert email_sender._region_chip_html(SHARON) not in html
     assert "אנטריקוט" in html and "כנפיים" in html
+    assert "הזולים ביותר לפי מחיר המבצע לק״ג" in html
 
     text = "\n".join(email_sender._supermarkets_section_text(report))
-    assert "▼ אנטריקוט" in text and "▼ כנפיים" in text
-    assert text.index("▼ כנפיים") < text.rindex("יוחננוף")  # listed under its category
-    assert RISHON in text
+    assert "▼ אנטריקוט" in text and "▼ כנפיים עוף" in text
+    assert text.index("▼ כנפיים עוף") < text.rindex("יוחננוף")  # listed under its category
+    assert "₪79.90 לק״ג" in text
+    assert "ערים: הרצליה" in text and f"{SHARON} — " not in text
 
 
-def test_long_region_name_is_shortened_in_the_table_only():
-    report = _report([_promo("יוחננוף", RISHON, "כנפיים עוף טרי", 20)])
+def test_region_chips_return_when_several_regions_are_enabled(monkeypatch):
+    monkeypatch.setenv("PW_MEAT_CITIES", "הרצליה,ראשון לציון")
+    report = _report([
+        _promo("יוחננוף", "כנפיים עוף טרי", "11.90", region=RISHON, city="ראשון לציון"),
+        _promo("שופרסל", "כנפיים עוף טרי", "12.90"),
+    ])
     html = email_sender._supermarkets_section_html(report)
-    assert email_sender._REGION_SHORT[RISHON] in html
+    assert email_sender._REGION_SHORT[RISHON] in html  # shortened in the table
+    assert email_sender._region_chip_html(SHARON) in html
     assert RISHON in "\n".join(email_sender._supermarkets_section_text(report))
+
+
+def test_recorded_scan_area_wins_over_current_settings(monkeypatch):
+    monkeypatch.setenv("PW_MEAT_CITIES", "הכל")
+    report = _report([_promo("שופרסל", "כנפיים עוף טרי", "12.90")],
+                     cities=["הרצליה"], regions=[SHARON], stores_by_city={"הרצליה": 4})
+    html = email_sender._supermarkets_section_html(report)
+    assert email_sender._region_chip_html(SHARON) not in html
+    assert "הרצליה" in html and "4 סניפים" in html
+
+
+def test_catch_all_groups_are_counted_but_not_shown():
+    # #51: "בשר – אחר" / "עוף – אחר" mix unrelated cuts, so they get no table.
+    promos = [
+        _promo("רמי לוי", "בשר ראש חלק", "89.90", was="99.90"),     # a real cut: ranked
+        _promo("רמי לוי", "בקר טרי מובחר", "39.90", was="59.90"),   # בקר – כללי
+        _promo("יוחננוף", "כנפית עוף טרי", "12.50", was="16.90"),  # עוף – אחר
+    ]
+    report = _report(promos)
+    assert [p.category for p in report.promos] == ["בשר ראש"]
+    assert report.unranked_by_category == {"עוף – אחר": 1, "בקר – כללי": 1}
+    html = email_sender._supermarkets_section_html(report)
+    assert html.count("<table") == 1 and "כנפית עוף טרי" not in html
+    assert "2 מבצעים בקבוצות כלליות" in html
+    assert "<b>3</b> מבצעי בשר" in html
+
+
+def test_fresh_and_frozen_cuts_get_separate_tables():
+    promos = [
+        _promo("שופרסל", "לשון בקר קפוא חלק", "39.90", was="59.90"),
+        _promo("טיב טעם", "לשון בקר איטלקי", "139.00", was="159.00"),
+    ]
+    groups = _by_category(_report(promos))
+    assert [p.chain for p in groups["לשון בקר"]] == ["טיב טעם"]
+    assert [p.chain for p in groups["לשון בקר – קפוא"]] == ["שופרסל"]
