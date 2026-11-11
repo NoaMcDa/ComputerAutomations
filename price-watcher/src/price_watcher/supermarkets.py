@@ -52,7 +52,48 @@ _PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
     ("osherad", "Osher Ad"),
     ("TivTaam", "Tiv Taam"),
     ("Keshet", "Keshet (King Store)"),
+    ("Freshmarket", "Fresh Market"),
+    ("Doralon", "Dor Alon"),
+    ("SalachD", "Salah Dabah"),
+    ("Stop_Market", "Stop Market"),
 )
+
+
+# Categories for grouping meat promos side-by-side across chains.
+# Order matters: more specific categories must come before generic ones so
+# "חזה עוף" is matched before plain "עוף".
+_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Entrecote (אנטריקוט)",       ("אנטריקוט",)),
+    ("Steak (סטייק)",               ("סטייק",)),
+    ("Ribs (צלעות)",                ("צלעות",)),
+    ("Fillet (פילה בקר)",           ("פילה",)),
+    ("Veal (עגל)",                  ("עגל",)),
+    ("Lamb (כבש / טלה)",            ("כבש", "טלה")),
+    ("Beef liver (כבד בקר)",        ("כבד בקר",)),
+    ("Chicken liver (כבד עוף)",    ("כבד עוף", "כבד")),
+    ("Beef roast / brisket (צלי)",  ("צלי", "כתף בקר")),
+    ("Beef tongue (לשון בקר)",     ("לשון",)),
+    ("Ground beef (בשר טחון)",      ("בשר טחון",)),
+    ("Ground beef — generic",       ("בקר",)),
+    ("Chicken breast (חזה עוף)",   ("חזה עוף",)),
+    ("Chicken wings (כנפיים)",     ("כנפיים",)),
+    ("Chicken thighs (ירכיים / שוק)", ("ירכיים", "שוק עוף", "ירך עוף")),
+    ("Chicken drumsticks (שוקיים)", ("שוקיים",)),
+    ("Cornish hen (פרגית)",         ("פרגית", "פרגיות")),
+    ("Turkey (הודו)",               ("חזה הודו", "הודו")),
+    ("Chicken — other",             ("עוף",)),
+    ("Beef — other",                ("בשר",)),
+)
+
+
+def _categorize(promo: "MeatPromo") -> str:
+    """Return the category key for a promo (first matching category wins)."""
+    text = f"{promo.item_name} {promo.promotion_description}"
+    for cat_name, keywords in _CATEGORIES:
+        for kw in keywords:
+            if kw in text:
+                return cat_name
+    return "Other"
 
 
 # ---- Hebrew keyword classifier ----
@@ -498,7 +539,9 @@ def scan_and_report() -> SupermarketReport:
         amt = p.savings_amount or Decimal("0")
         return (-float(pct), -float(amt))
     report.promos.sort(key=_rank_key)
-    report.promos = report.promos[:30]
+    # Keep up to 150 — the email now groups by category, so we want coverage
+    # across every category rather than only top-30 overall.
+    report.promos = report.promos[:150]
     if not report.chains_scanned:
         report.status = "fetch_failed"
         report.error = "all chains failed to scan"

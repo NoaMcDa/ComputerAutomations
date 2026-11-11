@@ -496,6 +496,23 @@ def build_digest_payload(digests) -> EmailPayload | None:
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
 
+def _group_meat_by_category(sm):
+    """Returns: dict[category_name -> list[MeatPromo]], ordered by _CATEGORIES."""
+    from price_watcher.supermarkets import _categorize, _CATEGORIES
+    groups: dict[str, list] = {}
+    for p in sm.promos:
+        cat = _categorize(p)
+        groups.setdefault(cat, []).append(p)
+    # Order: follow _CATEGORIES declaration order, then any extras at the end.
+    ordered = {}
+    for cat_name, _ in _CATEGORIES:
+        if cat_name in groups:
+            ordered[cat_name] = groups.pop(cat_name)
+    for cat_name, items in groups.items():
+        ordered[cat_name] = items
+    return ordered
+
+
 def _supermarkets_section_text(sm) -> list[str]:
     lines = ["Supermarket meat discounts", "-" * 50, ""]
     if sm is None:
@@ -509,15 +526,19 @@ def _supermarkets_section_text(sm) -> list[str]:
     if not sm.promos:
         lines.append("  No meat promos found today.")
         return lines
-    lines.append(f"  Top {len(sm.promos)} by discount %:")
-    lines.append("")
-    for i, p in enumerate(sm.promos, 1):
-        pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
-        was = f"₪{p.regular_price}" if p.regular_price else "—"
-        now = f"₪{p.discounted_price}" if p.discounted_price else "—"
-        lines.append(f"  {i:>2}. [{p.chain}] -{pct}  {was} → {now}  {p.item_name[:60]}")
-        if p.promotion_description:
-            lines.append(f"      {p.promotion_description[:100]}")
+    grouped = _group_meat_by_category(sm)
+    for category, items in grouped.items():
+        lines.append("")
+        lines.append(f"  ▼ {category}")
+        # Sort within category: best discount first per chain
+        items_sorted = sorted(items, key=lambda p: -(float(p.savings_pct) if p.savings_pct is not None else 0))
+        for p in items_sorted:
+            pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
+            was = f"₪{p.regular_price}" if p.regular_price else "—"
+            now = f"₪{p.discounted_price}" if p.discounted_price else "—"
+            lines.append(f"    [{p.chain:15s}] -{pct:>6}  {was:>8} → {now:>8}  {p.item_name[:50]}")
+            if p.promotion_description:
+                lines.append(f"       {p.promotion_description[:90]}")
     return lines
 
 
@@ -534,38 +555,41 @@ def _supermarkets_section_html(sm) -> str:
         )
     chains = ", ".join(sm.chains_scanned) if sm.chains_scanned else "none"
     html = [
-        f'<div style="color:#6b7280;font-size:13px;margin-bottom:10px">Chains scanned: {escape(chains)}</div>'
+        f'<div style="color:#6b7280;font-size:13px;margin-bottom:10px">'
+        f'Chains scanned: {escape(chains)}  '
+        f'<span style="color:#9ca3af">· {len(sm.promos)} total promos</span></div>'
     ]
     if not sm.promos:
         html.append('<div style="color:#888;font-style:italic">No meat promos found today.</div>')
         return "".join(html)
 
-    rows = []
-    for p in sm.promos:
-        pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
-        was = f"₪{p.regular_price}" if p.regular_price else "—"
-        now = f"₪{p.discounted_price}" if p.discounted_price else "—"
-        rows.append(
-            f'<tr style="border-bottom:1px solid #eee">'
-            f'<td style="padding:6px 8px;font-size:12px;color:#666">{escape(p.chain)}</td>'
-            f'<td style="padding:6px 8px;font-weight:500">{escape(p.item_name[:55])}</td>'
-            f'<td style="padding:6px 8px;color:#dc2626;font-weight:600">-{pct}</td>'
-            f'<td style="padding:6px 8px;font-size:12px"><s style="color:#999">{was}</s> → <b>{now}</b></td>'
-            f'<td style="padding:6px 8px;font-size:11px;color:#666">{escape(p.promotion_description[:60])}</td>'
-            f'</tr>'
+    grouped = _group_meat_by_category(sm)
+    for category, items in grouped.items():
+        items_sorted = sorted(items, key=lambda p: -(float(p.savings_pct) if p.savings_pct is not None else 0))
+        rows = []
+        for p in items_sorted:
+            pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
+            was = f"₪{p.regular_price}" if p.regular_price else "—"
+            now = f"₪{p.discounted_price}" if p.discounted_price else "—"
+            rows.append(
+                f'<tr style="border-bottom:1px solid #f3f4f6">'
+                f'<td style="padding:4px 8px;font-size:11px;color:#1e40af;white-space:nowrap">'
+                f'<b>{escape(p.chain)}</b></td>'
+                f'<td style="padding:4px 8px">{escape(p.item_name[:55])}</td>'
+                f'<td style="padding:4px 8px;color:#dc2626;font-weight:600;white-space:nowrap">-{pct}</td>'
+                f'<td style="padding:4px 8px;font-size:12px;white-space:nowrap">'
+                f'<s style="color:#999">{was}</s> → <b>{now}</b></td>'
+                f'<td style="padding:4px 8px;font-size:11px;color:#6b7280">'
+                f'{escape(p.promotion_description[:55])}</td>'
+                f'</tr>'
+            )
+        html.append(
+            f'<div style="margin:0 0 18px"><div style="font-size:15px;font-weight:600;'
+            f'margin:8px 0 4px;color:#111;background:#f9fafb;padding:6px 10px;'
+            f'border-left:3px solid #10b981">{escape(category)}  '
+            f'<span style="color:#6b7280;font-weight:400;font-size:12px">· {len(items)} promo{"s" if len(items) != 1 else ""}</span></div>'
+            f'<table style="border-collapse:collapse;width:100%;font-size:12px">{"".join(rows)}</table></div>'
         )
-    html.append(
-        '<table style="border-collapse:collapse;width:100%;font-size:13px">'
-        '<thead><tr style="background:#fafafa;text-align:left">'
-        '<th style="padding:6px 8px">Chain</th>'
-        '<th style="padding:6px 8px">Item</th>'
-        '<th style="padding:6px 8px">Off</th>'
-        '<th style="padding:6px 8px">Price</th>'
-        '<th style="padding:6px 8px">Promo</th>'
-        '</tr></thead><tbody>'
-        + "".join(rows)
-        + '</tbody></table>'
-    )
     return "".join(html)
 
 
