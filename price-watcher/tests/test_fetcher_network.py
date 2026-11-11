@@ -268,3 +268,75 @@ def test_shopify_collection_path_uses_json(monkeypatch):
     assert result.status == FetchStatus.OK
     assert result.price == Decimal("149")
     assert "https://shop.example/products/shirt.js" in router.calls
+
+
+# ---------------------------------------------------------------- blocked Shopify currency (#49)
+
+def test_blocked_shopify_gets_currency_from_cart_js(monkeypatch, _no_sleep_no_browser):
+    router = _route(monkeypatch, {
+        "https://shop.example/products/shirt": [(429, "Too Many Requests", {"Retry-After": "60"})],
+        "https://shop.example/products/shirt.js": [(200, SHIRT, {})],
+        "https://shop.example/cart.js": [(200, {"currency": "ILS", "items": []}, {})],
+    })
+    result = fetcher.fetch("https://shop.example/products/shirt?variant=222")
+    assert result.status == FetchStatus.OK
+    assert result.price == Decimal("149")
+    assert result.currency == "ILS"
+    assert router.calls.count("https://shop.example/cart.js") == 1
+    assert _no_sleep_no_browser["sleeps"] == []
+
+
+def test_blocked_shopify_locale_prefix_uses_same_market_cart(monkeypatch):
+    router = _route(monkeypatch, {
+        "https://shop.example/en-us/products/shirt": [(403, "Forbidden", {})],
+        "https://shop.example/en-us/products/shirt.js": [(200, SHIRT, {})],
+        "https://shop.example/en-us/cart.js": [(200, {"currency": "usd"}, {})],
+    })
+    result = fetcher.fetch("https://shop.example/en-us/products/shirt")
+    assert result.currency == "USD"
+    assert "https://shop.example/en-us/cart.js" in router.calls
+
+
+@pytest.mark.parametrize(
+    "cart",
+    [
+        (500, "error", {}),
+        (429, "Too Many Requests", {"Retry-After": "1"}),
+        (200, "not json", {}),
+        (200, {"currency": None}, {}),
+        (200, ["unexpected"], {}),
+        httpx.ConnectError("boom"),
+    ],
+)
+def test_blocked_shopify_without_cart_currency_still_ok(monkeypatch, cart, _no_sleep_no_browser):
+    router = _route(monkeypatch, {
+        "https://shop.example/products/shirt": [(403, "Forbidden", {})],
+        "https://shop.example/products/shirt.js": [(200, SHIRT, {})],
+        "https://shop.example/cart.js": [cart],
+    })
+    result = fetcher.fetch("https://shop.example/products/shirt?variant=222")
+    assert result.status == FetchStatus.OK
+    assert result.price == Decimal("149")
+    assert result.currency is None
+    assert router.calls.count("https://shop.example/cart.js") == 1
+    assert _no_sleep_no_browser["sleeps"] == []
+
+
+def test_blocked_shopify_missing_variant_makes_no_cart_request(monkeypatch):
+    router = _route(monkeypatch, {
+        "https://shop.example/products/shirt": [(403, "Forbidden", {})],
+        "https://shop.example/products/shirt.js": [(200, SHIRT, {})],
+    })
+    result = fetcher.fetch("https://shop.example/products/shirt?variant=999")
+    assert result.status == FetchStatus.NOT_FOUND
+    assert "https://shop.example/cart.js" not in router.calls
+
+
+def test_unblocked_shopify_makes_no_cart_request(monkeypatch):
+    router = _route(monkeypatch, {
+        "https://shop.example/products/shirt": [(200, PRICED_HTML, {})],
+        "https://shop.example/products/shirt.js": [(200, SHIRT, {})],
+    })
+    result = fetcher.fetch("https://shop.example/products/shirt")
+    assert result.currency == "ILS"
+    assert "https://shop.example/cart.js" not in router.calls
