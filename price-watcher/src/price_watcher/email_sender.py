@@ -496,6 +496,115 @@ def build_digest_payload(digests) -> EmailPayload | None:
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
 
+def _sims4_section_text(sims4) -> list[str]:
+    lines = ["The Sims 4 (EA)", "-" * 50, ""]
+    if sims4 is None:
+        lines.append("  (not scanned)")
+        return lines
+    if sims4.status != "ok":
+        lines.append(f"  scan failed: {sims4.status}  {sims4.error or ''}")
+        return lines
+    lines.append(f"  Scanned {len(sims4.packs)} packs from EA.")
+    if sims4.newly_on_sale:
+        lines.append("")
+        lines.append(f"  NEWLY ON SALE ({len(sims4.newly_on_sale)}):")
+        for p in sims4.newly_on_sale:
+            lines.append(f"    • {p.discount_percent}% off  ${p.price} (was ${p.original_price})  {p.name}")
+    if sims4.discount_ended:
+        lines.append("")
+        lines.append(f"  DISCOUNT ENDED ({len(sims4.discount_ended)}):")
+        for p in sims4.discount_ended:
+            lines.append(f"    • back to ${p.price}  {p.name}")
+    if sims4.discount_changed:
+        lines.append("")
+        lines.append(f"  DISCOUNT % CHANGED:")
+        for p, old in sims4.discount_changed:
+            lines.append(f"    • {old}% → {p.discount_percent}%  ${p.price}  {p.name}")
+    if sims4.on_sale_now:
+        lines.append("")
+        lines.append(f"  All current sales ({len(sims4.on_sale_now)}):")
+        for p in sorted(sims4.on_sale_now, key=lambda x: -x.discount_percent):
+            lines.append(f"    • {p.discount_percent}% off  ${p.price} (was ${p.original_price})  {p.name}")
+    elif not sims4.newly_on_sale and not sims4.discount_ended:
+        lines.append("")
+        lines.append("  No packs currently on sale.")
+    return lines
+
+
+def _sims4_section_html(sims4) -> str:
+    if sims4 is None:
+        return '<div style="color:#888;font-style:italic">(not scanned)</div>'
+    if sims4.status != "ok":
+        return (
+            '<div style="padding:12px;border:1px solid #fecaca;border-radius:8px;'
+            'background:#fef2f2;color:#991b1b">'
+            f'<b>Sims 4 scan failed:</b> {escape(sims4.status)}'
+            + (f' — {escape(sims4.error)}' if sims4.error else '')
+            + '</div>'
+        )
+    html = ['<div style="margin:0 0 20px">']
+    if sims4.newly_on_sale:
+        html.append(
+            '<div style="margin:0 0 12px;padding:12px 16px;background:#ecfdf5;'
+            'border:1px solid #10b981;border-radius:8px">'
+            f'<div style="font-weight:600;color:#065f46">🆕 Newly on sale ({len(sims4.newly_on_sale)})</div>'
+        )
+        for p in sims4.newly_on_sale:
+            html.append(
+                f'<div style="margin-top:6px"><a href="{escape(p.url)}" '
+                f'style="color:#2563eb;text-decoration:none">{escape(p.name)}</a>  '
+                f'<b style="color:#065f46">{p.discount_percent}% off</b>  '
+                f'<span style="color:#666">${p.price} (was ${p.original_price})</span></div>'
+            )
+        html.append('</div>')
+    if sims4.discount_ended:
+        html.append(
+            '<div style="margin:0 0 12px;padding:12px 16px;background:#fef2f2;'
+            'border:1px solid #fca5a5;border-radius:8px">'
+            f'<div style="font-weight:600;color:#991b1b">⚠ Discount ended ({len(sims4.discount_ended)})</div>'
+        )
+        for p in sims4.discount_ended:
+            html.append(
+                f'<div style="margin-top:6px"><a href="{escape(p.url)}" '
+                f'style="color:#2563eb;text-decoration:none">{escape(p.name)}</a>  '
+                f'<span style="color:#991b1b">back to ${p.price}</span></div>'
+            )
+        html.append('</div>')
+    if sims4.discount_changed:
+        html.append(
+            '<div style="margin:0 0 12px;padding:12px 16px;background:#eff6ff;'
+            'border:1px solid #93c5fd;border-radius:8px">'
+            f'<div style="font-weight:600;color:#1e40af">🔁 Discount % changed</div>'
+        )
+        for p, old in sims4.discount_changed:
+            html.append(
+                f'<div style="margin-top:6px"><a href="{escape(p.url)}" '
+                f'style="color:#2563eb;text-decoration:none">{escape(p.name)}</a>  '
+                f'<span>{old}% → <b>{p.discount_percent}%</b></span>  '
+                f'<span style="color:#666">${p.price}</span></div>'
+            )
+        html.append('</div>')
+    if sims4.on_sale_now:
+        rows = "".join(
+            f'<tr><td style="padding:4px 10px"><a href="{escape(p.url)}" '
+            f'style="color:#2563eb;text-decoration:none">{escape(p.name)}</a></td>'
+            f'<td style="padding:4px 10px"><b>{p.discount_percent}% off</b></td>'
+            f'<td style="padding:4px 10px">${p.price} <s style="color:#888">${p.original_price}</s></td></tr>'
+            for p in sorted(sims4.on_sale_now, key=lambda x: -x.discount_percent)
+        )
+        html.append(
+            f'<div style="margin:0;padding:12px 16px;background:#fafafa;'
+            f'border:1px solid #e5e7eb;border-radius:8px">'
+            f'<div style="font-weight:600;margin-bottom:6px">All current sales ({len(sims4.on_sale_now)})</div>'
+            f'<table style="border-collapse:collapse;font-size:13px;width:100%">{rows}</table>'
+            f'</div>'
+        )
+    elif not sims4.newly_on_sale and not sims4.discount_ended:
+        html.append('<div style="color:#888;font-style:italic">No packs currently on sale.</div>')
+    html.append('</div>')
+    return "".join(html)
+
+
 def _creatine_section_text(creatine) -> list[str]:
     """Plain-text lines for the creatine section of the daily report."""
     lines = ["Creatine (iHerb)", "-" * 50, ""]
@@ -691,6 +800,15 @@ def build_daily_payload(report) -> EmailPayload | None:
         '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Creatine</h3>'
     )
     html_parts.append(_creatine_section_html(report.creatine))
+
+    html_parts.append(
+        '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">The Sims 4</h3>'
+    )
+    html_parts.append(_sims4_section_html(getattr(report, "sims4", None)))
+
+    # Also append sims4 text lines
+    text_body_addendum = "\n".join(_sims4_section_text(getattr(report, "sims4", None)))
+    text_body = text_body + "\n" + text_body_addendum
 
     html_parts.append(
         '<p style="color:#999;font-size:12px;margin-top:24px">— Price Watcher</p>'

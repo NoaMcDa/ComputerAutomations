@@ -378,8 +378,8 @@ def _print_digests(digests: list[SiteDigest]) -> None:
 class DailyReport:
     """Everything the daily email contains. One section per 'daily feature'."""
     site_digests: list[SiteDigest] = field(default_factory=list)
-    creatine: Optional["object"] = None  # CreatineReport — lazy import to avoid cycle
-    # Future: sims4, other daily features plug in here
+    creatine: Optional["object"] = None  # CreatineReport
+    sims4: Optional["object"] = None     # Sims4Report
 
 
 def collect_daily_report() -> DailyReport:
@@ -391,6 +391,11 @@ def collect_daily_report() -> DailyReport:
         report.creatine = _creatine.scan_and_report()
     except Exception as exc:
         log.error("Creatine stage failed: %s: %s", type(exc).__name__, exc)
+    try:
+        from price_watcher import sims4 as _sims4
+        report.sims4 = _sims4.scan_and_report()
+    except Exception as exc:
+        log.error("Sims 4 stage failed: %s: %s", type(exc).__name__, exc)
     return report
 
 
@@ -401,10 +406,14 @@ def _print_daily_report(report: DailyReport) -> None:
         console.print("\n[bold underline]Creatine (iHerb)[/bold underline]")
         from price_watcher import creatine as _creatine
         _creatine.print_report(report.creatine)
+    if report.sims4 is not None:
+        console.print("\n[bold underline]The Sims 4 (EA)[/bold underline]")
+        from price_watcher import sims4 as _sims4
+        _sims4.print_report(report.sims4)
 
 
 def run_digest(dry_run: bool = False) -> int:
-    """Run the combined daily report: sales digest + creatine (+ future sections)."""
+    """Run the combined daily report: sales digest + creatine + sims4."""
     log.info("Running daily report")
     report = collect_daily_report()
     _print_daily_report(report)
@@ -418,7 +427,11 @@ def run_digest(dry_run: bool = False) -> int:
 
     from price_watcher.email_sender import send_daily_email
     sent = send_daily_email(report)
-    if sent and report.creatine is not None:
-        from price_watcher import creatine as _creatine
-        _creatine.persist(report.creatine)
+    if sent:
+        if report.creatine is not None:
+            from price_watcher import creatine as _creatine
+            _creatine.persist(report.creatine)
+        if report.sims4 is not None:
+            from price_watcher import sims4 as _sims4
+            _sims4.persist(report.sims4)
     return 0 if sent else 1
