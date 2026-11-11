@@ -842,8 +842,9 @@ def _playwright_fallback(
     try:
         from playwright.sync_api import sync_playwright, Error as PlaywrightError
     except ImportError:
-        print(
-            "price-watcher: Playwright is not installed. "
+        # Logged (not printed): scheduled runs use pythonw.exe, which has no console.
+        log.warning(
+            "Playwright is not installed. "
             "Install it with: pip install playwright && playwright install chromium"
         )
         return prior_result
@@ -853,9 +854,11 @@ def _playwright_fallback(
             try:
                 browser = pw.chromium.launch(headless=True)
             except Exception as exc:
-                print(
-                    f"price-watcher: Playwright Chromium browser not available ({exc}). "
-                    "Run: playwright install chromium"
+                first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+                log.warning(
+                    "Playwright Chromium browser not available (%s). "
+                    "Run: python -m playwright install chromium",
+                    first_line,
                 )
                 return prior_result
 
