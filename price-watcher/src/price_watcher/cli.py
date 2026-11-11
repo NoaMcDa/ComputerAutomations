@@ -71,7 +71,7 @@ def test_email() -> None:
 
 @app.command(name="install-schedule")
 def install_schedule() -> None:
-    """Install the OS-level hourly schedule (launchd on macOS, Task Scheduler on Windows)."""
+    """Install the OS-level daily (09:00) schedule (launchd on macOS, Task Scheduler on Windows)."""
     from price_watcher.scheduler import install_schedule as _install
     _install()
 

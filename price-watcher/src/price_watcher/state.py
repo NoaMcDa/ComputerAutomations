@@ -149,8 +149,8 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
                 watch=watch,
                 fetch=fetch,
                 reason=(
-                    f"fetch failed {consecutive} consecutive times "
-                    f"(threshold={threshold})"
+                    f"האחזור נכשל {consecutive} פעמים ברצף "
+                    f"(הסף: {threshold})"
                 ),
                 timestamp=now,
             )

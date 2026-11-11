@@ -36,7 +36,11 @@ _console = Console()
 
 _PLIST_LABEL = "com.noada.price-watcher"
 _PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_PLIST_LABEL}.plist"
-_WIN_TASK_NAME = "PriceWatcherHourly"
+_WIN_TASK_NAME = "PriceWatcherDailyCheck"
+# Name used while the check ran hourly; removed on install/uninstall.
+_LEGACY_WIN_TASK_NAME = "PriceWatcherHourly"
+# Local time of the daily price check (same as the daily digest).
+_CHECK_HOUR = 9
 
 _DIGEST_PLIST_LABEL = "com.noada.price-watcher.digest"
 _DIGEST_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_DIGEST_PLIST_LABEL}.plist"
@@ -214,7 +218,7 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
 # ---------------------------------------------------------------------------
 
 def install_schedule() -> None:
-    """Install the hourly scheduler job for the current OS."""
+    """Install the daily (09:00) price-check job for the current OS."""
     if sys.platform == "darwin":
         _install_launchd()
     elif sys.platform.startswith("win"):
@@ -223,7 +227,7 @@ def install_schedule() -> None:
         _console.print(
             "[yellow]Unsupported platform for automatic scheduling. "
             "Add a cron entry manually:[/yellow]\n"
-            f"  0 * * * * {_venv_python()} -m price_watcher check"
+            f"  0 {_CHECK_HOUR} * * * {_venv_python()} -m price_watcher check"
         )
 
 
@@ -234,8 +238,8 @@ def _install_launchd() -> None:
         "Label": _PLIST_LABEL,
         "ProgramArguments": [_venv_python(), "-m", "price_watcher", "check"],
         "WorkingDirectory": str(_repo_dir()),
-        "StartInterval": 3600,
-        "RunAtLoad": True,
+        "StartCalendarInterval": {"Hour": _CHECK_HOUR, "Minute": 0},
+        "RunAtLoad": False,
         "StandardOutPath": str(log_dir() / "launchd.out.log"),
         "StandardErrorPath": str(log_dir() / "launchd.err.log"),
     }
@@ -272,7 +276,7 @@ def _install_launchd() -> None:
             )
             return
 
-    _console.print("[green]Schedule installed (launchd, hourly).[/green]")
+    _console.print(f"[green]Schedule installed (launchd, daily at {_CHECK_HOUR:02d}:00).[/green]")
 
 
 def _install_schtasks() -> None:
@@ -286,17 +290,16 @@ def _install_schtasks() -> None:
     xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Price Watcher hourly check</Description>
+    <Description>Price Watcher daily check</Description>
   </RegistrationInfo>
   <Triggers>
-    <TimeTrigger>
-      <Repetition>
-        <Interval>PT1H</Interval>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-      <StartBoundary>2024-01-01T00:00:00</StartBoundary>
+    <CalendarTrigger>
+      <StartBoundary>2024-01-01T{_CHECK_HOUR:02d}:00:00</StartBoundary>
       <Enabled>true</Enabled>
-    </TimeTrigger>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
   </Triggers>
   <Settings>
     <StartWhenAvailable>true</StartWhenAvailable>
@@ -315,6 +318,8 @@ def _install_schtasks() -> None:
     xml_path = data_dir() / "task-scheduler.xml"
     xml_path.write_text(xml_content, encoding="utf-16")
 
+    _delete_legacy_schtask()
+
     result = subprocess.run(
         ["schtasks", "/create", "/xml", str(xml_path),
          "/tn", _WIN_TASK_NAME, "/f"],
@@ -326,7 +331,7 @@ def _install_schtasks() -> None:
         _console.print(f"[red]schtasks /create failed:[/red] {result.stderr.strip()}")
         return
 
-    _console.print("[green]Schedule installed (Task Scheduler, hourly).[/green]")
+    _console.print(f"[green]Schedule installed (Task Scheduler, daily at {_CHECK_HOUR:02d}:00).[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +339,7 @@ def _install_schtasks() -> None:
 # ---------------------------------------------------------------------------
 
 def uninstall_schedule() -> None:
-    """Remove the hourly scheduler job."""
+    """Remove the daily price-check job."""
     if sys.platform == "darwin":
         _uninstall_launchd()
     elif sys.platform.startswith("win"):
@@ -372,7 +377,18 @@ def _uninstall_launchd() -> None:
     _console.print("[green]Schedule removed.[/green]")
 
 
+def _delete_legacy_schtask() -> None:
+    """Remove the old hourly task if a previous version installed it."""
+    subprocess.run(
+        ["schtasks", "/delete", "/tn", _LEGACY_WIN_TASK_NAME, "/f"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _uninstall_schtasks() -> None:
+    _delete_legacy_schtask()
     result = subprocess.run(
         ["schtasks", "/delete", "/tn", _WIN_TASK_NAME, "/f"],
         capture_output=True,

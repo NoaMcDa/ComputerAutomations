@@ -1,6 +1,6 @@
 # Price Watcher
 
-A local CLI that watches product URLs, extracts the current price once an hour, and emails you when it changes. Runs on macOS and Windows. No cloud, no CI.
+A local CLI that watches product URLs, extracts the current price once a day (09:00), and emails you when it changes. Runs on macOS and Windows. No cloud, no CI.
 
 ## Install
 
@@ -44,7 +44,7 @@ python -m price_watcher add <url> [--name NAME] [--selector CSS]
 python -m price_watcher list
 python -m price_watcher remove <url-or-id>
 python -m price_watcher check [--dry-run]
-python -m price_watcher install-schedule     # install hourly OS schedule
+python -m price_watcher install-schedule     # install daily (09:00) OS schedule
 python -m price_watcher uninstall-schedule
 python -m price_watcher status               # when was the last run, is the schedule on
 ```
@@ -74,4 +74,4 @@ Some shops reject bot-like requests. The extractor will automatically fall back 
 - Check spam. Gmail sometimes files unknown-sender mail as spam initially; mark the first one "not spam" to fix.
 
 ### "Watch stopped working" email
-After 6 consecutive failures the watcher sends one email and stops retrying every hour until the site recovers. If a site has permanently changed, `remove` and `add` it again — or add a `--selector`.
+After 6 consecutive failures the watcher sends one email and stops emailing about it until the site recovers. If a site has permanently changed, `remove` and `add` it again — or add a `--selector`.

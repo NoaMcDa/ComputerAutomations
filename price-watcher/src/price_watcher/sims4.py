@@ -180,7 +180,7 @@ def scan_and_report() -> Sims4Report:
     log.info("Scanning EA Sims 4 packs")
     packs = scan_ea()
     if not packs:
-        return Sims4Report(status="fetch_failed", error="no packs parsed from EA page")
+        return Sims4Report(status="fetch_failed", error="לא זוהו חבילות בעמוד של EA")
 
     state = _load_state()
     stored = state.get("packs", {})

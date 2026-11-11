@@ -1,7 +1,8 @@
 """Creatine price watcher.
 
-Scrapes iHerb's creatine search page (which works from a plain httpx client —
-confirmed 2026-11-11). iHerb helpfully pre-computes price-per-100g in each
+Scrapes iHerb's creatine search page. A plain httpx request is tried first;
+when Cloudflare answers it with a 403 challenge the page is loaded in headless
+Chromium (Playwright) instead. iHerb helpfully pre-computes price-per-100g in each
 product cell, so we don't need to parse pack sizes ourselves.
 
 Tracks the cheapest price-per-100g across powder products and emails when it
@@ -81,7 +82,13 @@ def _parse_price(text: str) -> Optional[tuple[Decimal, str, Optional[Decimal], s
         return None
     text = text.strip()
 
-    m = re.match(r"₪\s*([\d,]+\.?\d*)\s*(?:\(\s*₪\s*([\d,]+\.?\d*)\s*/\s*(100g|count|g)\s*\))?", text)
+    # The page comes back in English or Hebrew depending on how it was fetched:
+    # '(₪9.49/100g)' / '(₪0.26/count)'  vs  '(₪9.49/100 גרם)' / '(₪0.26/ליחידה)'.
+    m = re.match(
+        r"₪\s*([\d,]+\.?\d*)\s*"
+        r"(?:\(\s*₪\s*([\d,]+\.?\d*)\s*/\s*(100\s*g|100\s*גרם|count|ליחידה|יחידה|g)\s*\))?",
+        text,
+    )
     if not m:
         return None
     try:
@@ -93,22 +100,89 @@ def _parse_price(text: str) -> Optional[tuple[Decimal, str, Optional[Decimal], s
     if m.group(2) and m.group(3):
         try:
             per_unit_price = Decimal(m.group(2).replace(",", ""))
-            unit = m.group(3)
+            raw_unit = m.group(3)
+            if raw_unit.startswith("100"):
+                unit = "100g"
+            elif raw_unit in ("count", "ליחידה", "יחידה"):
+                unit = "count"
+            else:
+                unit = raw_unit
         except InvalidOperation:
             pass
-    on_sale = "% off" in text.lower()
+    on_sale = "% off" in text.lower() or "הנחה" in text
     return price, "ILS", per_unit_price, unit, on_sale
+
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_html_httpx() -> Optional[str]:
+    try:
+        with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
+            resp = client.get(_IHERB_SEARCH)
+    except httpx.HTTPError as exc:
+        log.warning("iHerb creatine scan: %s", type(exc).__name__)
+        return None
+    if resp.status_code != 200:
+        log.warning("iHerb creatine scan: HTTP %s", resp.status_code)
+        return None
+    return resp.text
+
+
+def _fetch_html_browser() -> Optional[str]:
+    """Load the search page in headless Chromium.
+
+    iHerb's Cloudflare front answers plain HTTP clients with a 403 challenge
+    page; a real browser engine with an ordinary desktop identity gets the
+    normal page.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.warning("iHerb creatine scan: Playwright not installed, no browser fallback")
+        return None
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = browser.new_context(
+                    user_agent=_BROWSER_UA,
+                    locale="he-IL",
+                    viewport={"width": 1366, "height": 900},
+                ).new_page()
+                resp = page.goto(_IHERB_SEARCH, wait_until="domcontentloaded", timeout=45_000)
+                try:
+                    page.wait_for_selector(".product-cell", timeout=25_000)
+                except Exception:
+                    log.warning(
+                        "iHerb creatine scan (browser): no products, HTTP %s",
+                        resp.status if resp else "?",
+                    )
+                    return None
+                return page.content()
+            finally:
+                browser.close()
+    except Exception as exc:
+        log.warning("iHerb creatine scan (browser) failed: %s: %s", type(exc).__name__, exc)
+        return None
 
 
 def scan_iherb() -> list[CreatineProduct]:
     """Fetch and parse iHerb's creatine search page."""
-    with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
-        resp = client.get(_IHERB_SEARCH)
-    if resp.status_code != 200:
-        log.warning("iHerb creatine scan: HTTP %s", resp.status_code)
+    html = _fetch_html_httpx()
+    if html is None:
+        log.info("iHerb creatine scan: retrying with headless browser")
+        html = _fetch_html_browser()
+    if html is None:
         return []
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(html, "lxml")
     products: list[CreatineProduct] = []
     for cell in soup.select(".product-cell"):
         title_el = cell.select_one(".product-title")
@@ -251,7 +325,7 @@ def scan_and_report() -> CreatineReport:
     log.info("Scanning iHerb creatine")
     products = scan_iherb()
     if not products:
-        return CreatineReport(status="fetch_failed", error="no products scraped (iHerb may be blocking)")
+        return CreatineReport(status="fetch_failed", error="לא נמצאו מוצרים (ייתכן ש-iHerb חוסם את הבקשה)")
 
     cheapest = pick_cheapest(products)
     if cheapest is None:
