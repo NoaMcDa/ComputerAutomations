@@ -15,6 +15,7 @@ Extraction ladder (stops at first price found):
 Blocked responses (403 / 429 / challenge page) skip the ladder: the Shopify
 JSON (step 1) and then the Playwright fallback are tried, and the result is
 used only if it is a definite answer; otherwise the status is BLOCKED.
+A Shopify JSON answer gets its currency from ``/cart.js`` (one request).
 """
 
 from __future__ import annotations
@@ -163,6 +164,9 @@ def _fetch(
         # served when the HTML page is not.
         shopify = _try_shopify(url, final_url, None, None, None)
         if shopify is not None:
+            if shopify.status == FetchStatus.OK and shopify.currency is None:
+                # No HTML to read the currency from; the .js has none either.
+                shopify = dataclasses.replace(shopify, currency=_shopify_cart_currency(url))
             return shopify
         # A real browser often gets past bot checks; only accept it if it
         # actually yields a price, otherwise report the original block.
@@ -442,6 +446,37 @@ def _shopify_js_url(url: str) -> Optional[str]:
     return f"{parsed.scheme}://{parsed.netloc}/{base}.js"
 
 
+def _shopify_cart_currency(url: str) -> Optional[str]:
+    """The shop's currency from ``/cart.js`` (same locale prefix as the product).
+
+    The product ``.js`` carries no currency. ``/cart.js`` reports the
+    currency of the visitor's cart, i.e. the one the ``.js`` prices are in
+    (``/meta.json`` only has the shop's base currency). One request, never
+    raises: None when it cannot be had.
+    """
+    js_url = _shopify_js_url(url)
+    if js_url is None:
+        return None
+    cart_url = js_url[: js_url.rindex("/products/")] + "/cart.js"
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=20,
+            headers=_DEFAULT_HEADERS,
+        ) as client:
+            resp = client.get(cart_url)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception as exc:
+        log.debug("Shopify cart.js fetch failed for %s: %s", cart_url, exc)
+        return None
+    currency = data.get("currency") if isinstance(data, dict) else None
+    if isinstance(currency, str) and re.fullmatch(r"[A-Za-z]{3}", currency.strip()):
+        return currency.strip().upper()
+    return None
+
+
 def _try_shopify(
     url: str,
     final_url: str,
@@ -561,6 +596,18 @@ def _try_jsonld(
     # the lowest price across all offers (previous behaviour).
     wanted = _jsonld_wanted_ids(url)
     matching = [c for c in candidates if wanted and _jsonld_matches(c, wanted)]
+    if wanted and not matching and _jsonld_exposes_variant_ids(candidates):
+        # Never silently track a different variant than the one in the URL.
+        group = next((c[4] for c in candidates if c[4] is not None), None)
+        name = (group or candidates[0][3]).get("name")
+        return FetchResult(
+            status=FetchStatus.NOT_FOUND,
+            final_url=final_url,
+            title=(name if isinstance(name, str) and name else None) or title,
+            http_status=http_status,
+            error_message=f"Variant {', '.join(sorted(wanted))} not found in JSON-LD",
+            raw_html_path=raw_path,
+        )
     pool = matching or candidates
     best = min(pool, key=lambda c: c[0])  # min() keeps the first of equal prices
     price, currency, availability, product, group = best
@@ -673,6 +720,31 @@ def _jsonld_wanted_ids(url: str) -> set[str]:
         for v in qs.get(key, [])
         if v.strip()
     }
+
+
+def _jsonld_exposes_variant_ids(candidates: list[_JsonLdCandidate]) -> bool:
+    """True when the JSON-LD carries ids a pinned variant can be matched against.
+
+    That is: an offer / product ``url`` naming a variant (``?variation=`` /
+    ``?variant=`` / ``?sku=``), or ``sku`` / ``productID`` values on a page
+    that lists variants (a ProductGroup, or more than one product). A lone
+    product's own SKU is not enough: the URL's id may be a different kind of
+    identifier, and refusing such pages would break them.
+    """
+    products = {id(c[3]): c[3] for c in candidates}
+    has_variants = len(products) > 1 or any(c[4] is not None for c in candidates)
+    for product in products.values():
+        for node in (product, *[o for o in _as_list(product.get("offers")) if isinstance(o, dict)]):
+            node_url = node.get("url")
+            if isinstance(node_url, str) and _jsonld_wanted_ids(node_url):
+                return True
+            if has_variants and any(
+                isinstance(node.get(key), (str, int)) and not isinstance(node.get(key), bool)
+                and str(node.get(key)).strip()
+                for key in ("sku", "productID")
+            ):
+                return True
+    return False
 
 
 def _jsonld_matches(candidate: _JsonLdCandidate, wanted: set[str]) -> bool:
@@ -810,7 +882,7 @@ def _try_selector(
     el = soup.select_one(selector)
     if el is None:
         return None
-    text = el.get_text(strip=True)
+    text = _price_text_from_element(el)
     if not text:
         return None
     try:
@@ -828,8 +900,35 @@ def _try_selector(
         return None
 
 
-# ---------------------------------------------------------------------------
-# Step 6: Playwright fallback
+_STRUCK_TAGS = ("del", "s", "strike")
+
+
+def _price_text_from_element(el) -> str:
+    """Text of the current price inside a selected element.
+
+    A sale element often holds the old price too
+    (``<del>₪129.90</del> <ins>₪99.90</ins>``): the text inside ``<ins>`` is
+    used when present, otherwise the text outside ``<del>`` / ``<s>`` /
+    ``<strike>``; the whole text only if that leaves nothing. Whatever is
+    left still goes through _parse_price's several-prices rules.
+    """
+    def _struck(node) -> bool:  # inside a struck-through tag below *el*?
+        for parent in node.parents:
+            if parent is el:
+                return False
+            if parent.name in _STRUCK_TAGS:
+                return True
+        return False
+
+    whole = el.get_text(strip=True)
+    if el.name in _STRUCK_TAGS:
+        return whole
+    ins = [t for t in el.find_all("ins") if not _struck(t)]
+    ins_text = "".join(t.get_text(strip=True) for t in ins)
+    if ins_text:
+        return ins_text
+    kept = "".join(s.strip() for s in el.strings if not _struck(s))
+    return kept or whole
 # ---------------------------------------------------------------------------
 
 def _playwright_fallback(
@@ -940,6 +1039,17 @@ _CURRENCY_MAP: dict[str, str] = {
 _CURRENCY_TOKENS = sorted(_CURRENCY_MAP.keys(), key=len, reverse=True)
 
 
+_CURRENCY_MARK = "\x00"  # stands in for a currency token while tokenising
+
+# One number: digits joined by "." / "," / apostrophe separators, or by a
+# space-like character that is followed by exactly three digits ("1 299,90").
+_NUMBER_RE = re.compile(
+    r"\d+(?:(?:[.,'’]|[    ](?=\d{3}(?!\d)))\d+)*"
+)
+# Text that, alone between two numbers, makes them a range ("100 - 200").
+_RANGE_GAPS = {"-", "–", "—", "~", "to", "עד"}
+
+
 def _parse_price(text: str, *, machine_readable: bool = False) -> tuple[Decimal, Optional[str]]:
     """Parse a price string into (Decimal, currency_code | None).
 
@@ -949,39 +1059,77 @@ def _parse_price(text: str, *, machine_readable: bool = False) -> tuple[Decimal,
     a thousands group -- except for a ``0`` integer part, and except for a dot
     when *machine_readable* is set (JSON-LD / meta values such as ``19.990``
     use a dot as decimal point by definition).
+
+    The text is first split into separate numbers, so "₪129.90 ₪99.90" is two
+    numbers, never 129909990. When there is more than one:
+      * two numbers joined only by a dash / "to" / "עד" are a price range ->
+        ValueError (a range is not one price);
+      * otherwise only the numbers written next to a currency symbol/code
+        count, when there are any ("₪49.90 for 2" -> 49.90);
+      * if those still hold different values ("Was ₪129.90 Now ₪99.90") the
+        text is ambiguous -> ValueError. Callers that know the markup choose
+        first (see _price_text_from_element).
     Raises ValueError if no valid number can be extracted.
     """
     text = text.strip()
 
-    # Detect and remove currency symbols / codes
+    # Detect the currency (first symbol/code found, longest first)
     detected_currency: Optional[str] = None
     for token in _CURRENCY_TOKENS:
         if token in text:
             detected_currency = _CURRENCY_MAP[token]
-            text = text.replace(token, "")
             break
+    for token in _CURRENCY_TOKENS:
+        text = text.replace(token, _CURRENCY_MARK)
 
     # Scientific notation ("1e3") is not a price; stripping the "e" would
     # silently turn it into 13.
     if re.search(r"\d[eE][+\-]?\d", text):
         raise ValueError(f"Not a plain price: {text!r}")
 
-    # Remove leftover whitespace and miscellaneous non-numeric chars except . , -
-    text = re.sub(r"[^\d.,\-]", "", text).strip()
-
-    if not text:
+    numbers = list(_NUMBER_RE.finditer(text))
+    if not numbers:
         raise ValueError("No numeric content after stripping currency")
+
+    if len(numbers) > 1:
+        for a, b in zip(numbers, numbers[1:]):
+            gap = re.sub(r"[\s" + _CURRENCY_MARK + r"]", "", text[a.end():b.start()]).lower()
+            if gap in _RANGE_GAPS:
+                raise ValueError(f"Price range, not one price: {text!r}")
+
+        def _next_to_currency(m: re.Match) -> bool:
+            return (
+                text[:m.start()].rstrip().endswith(_CURRENCY_MARK)
+                or text[m.end():].lstrip().startswith(_CURRENCY_MARK)
+            )
+
+        priced = [m for m in numbers if _next_to_currency(m)] or numbers
+        values = {_parse_number(m.group(), machine_readable) for m in priced}
+        if len(values) > 1:
+            raise ValueError(f"Several different prices in {text!r}")
+        return values.pop(), detected_currency
+
+    return _parse_number(numbers[0].group(), machine_readable), detected_currency
+
+
+def _parse_number(text: str, machine_readable: bool) -> Decimal:
+    """Apply the separator rules to one number token (see _parse_price)."""
+    # Apostrophes and spaces only ever group thousands ("1'299.90", "1 299,90")
+    text = re.sub(r"['’\s]", "", text)
 
     dot_pos = text.rfind(".")
     comma_pos = text.rfind(",")
 
+    thousands: Optional[str] = None
     if dot_pos != -1 and comma_pos != -1:
         # Both present — the one that appears LAST is the decimal separator
         if dot_pos > comma_pos:
             # dot is decimal, comma is thousands
+            thousands, int_part = ",", text[:dot_pos]
             normalised = text.replace(",", "")
         else:
             # comma is decimal, dot is thousands
+            thousands, int_part = ".", text[:comma_pos]
             normalised = text.replace(".", "").replace(",", ".")
     elif dot_pos != -1 or comma_pos != -1:
         sep, pos = (".", dot_pos) if dot_pos != -1 else (",", comma_pos)
@@ -993,11 +1141,22 @@ def _parse_price(text: str, *, machine_readable: bool = False) -> tuple[Decimal,
             is_decimal = True  # "89.9", "89.90", "89.9000"
         else:  # exactly 3 digits: thousands group or 3-decimal price?
             is_decimal = int_part in ("", "0") or (sep == "." and machine_readable)
-        normalised = text.replace(sep, ".") if is_decimal else text.replace(sep, "")
+        if is_decimal:
+            normalised = text.replace(sep, ".")
+        else:
+            thousands, int_part = sep, text
+            normalised = text.replace(sep, "")
     else:
         normalised = text
 
+    # Thousands separators must form real groups of three ("1.299.000"), so
+    # glued-together prices such as "129.9099.90" are refused, not multiplied.
+    if thousands is not None:
+        groups = int_part.split(thousands)
+        if not (1 <= len(groups[0]) <= 3 and all(len(g) == 3 for g in groups[1:])):
+            raise ValueError(f"Not a valid number: {text!r}")
+
     try:
-        return Decimal(normalised), detected_currency
+        return Decimal(normalised)
     except InvalidOperation as exc:
         raise ValueError(f"Cannot convert '{normalised}' to Decimal") from exc
