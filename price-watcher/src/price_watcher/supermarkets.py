@@ -60,29 +60,50 @@ _PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
 
 
 # Categories for grouping meat promos side-by-side across chains.
-# Order matters: more specific categories must come before generic ones so
-# "חזה עוף" is matched before plain "עוף".
+# Order matters: more specific categories must come before generic ones.
 _CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Entrecote (אנטריקוט)",       ("אנטריקוט",)),
-    ("Steak (סטייק)",               ("סטייק",)),
-    ("Ribs (צלעות)",                ("צלעות",)),
-    ("Fillet (פילה בקר)",           ("פילה",)),
-    ("Veal (עגל)",                  ("עגל",)),
-    ("Lamb (כבש / טלה)",            ("כבש", "טלה")),
-    ("Beef liver (כבד בקר)",        ("כבד בקר",)),
-    ("Chicken liver (כבד עוף)",    ("כבד עוף", "כבד")),
-    ("Beef roast / brisket (צלי)",  ("צלי", "כתף בקר")),
-    ("Beef tongue (לשון בקר)",     ("לשון",)),
-    ("Ground beef (בשר טחון)",      ("בשר טחון",)),
-    ("Ground beef — generic",       ("בקר",)),
-    ("Chicken breast (חזה עוף)",   ("חזה עוף",)),
-    ("Chicken wings (כנפיים)",     ("כנפיים",)),
-    ("Chicken thighs (ירכיים / שוק)", ("ירכיים", "שוק עוף", "ירך עוף")),
-    ("Chicken drumsticks (שוקיים)", ("שוקיים",)),
-    ("Cornish hen (פרגית)",         ("פרגית", "פרגיות")),
-    ("Turkey (הודו)",               ("חזה הודו", "הודו")),
-    ("Chicken — other",             ("עוף",)),
-    ("Beef — other",                ("בשר",)),
+    # --- Specific premium cuts (match before generic cut names) ---
+    ("Filet mignon (פילה מיניון)",  ("פילה מיניון", "פילה-מיניון")),
+    ("Picanha (פיקניה)",             ("פיקניה",)),
+    ("Entrecote (אנטריקוט)",         ("אנטריקוט",)),
+    ("Sirloin (סינטה)",              ("סינטה",)),
+    ("T-bone (ט-בון)",               ("ט-בון", "טיבון")),
+    ("Chuck (צ'אק)",                 ("צ'אק", "צ'ק")),
+    ("Flank / rump (פלאנק / ראמפ)",  ("פלאנק", "ראמפ")),
+    ("Asado (אסאדו)",                ("אסאדו",)),
+    ("Brisket (בריסקט)",             ("בריסקט", "בריסקיט")),
+    ("Osso buco (אוסובוקו)",         ("אוסובוקו", "אוסו בוקו")),
+    ("Goulash (גולש)",               ("גולש", "גולאש")),
+    ("Shoulder (כתף)",               ("כתף",)),
+    ("Shank / muscle (שריר / חגורה)", ("שריר", "חגורה")),
+    ("Ribs (צלעות)",                 ("צלעות",)),
+    ("Steak (סטייק)",                ("סטייק",)),
+    ("Fillet (פילה בקר)",            ("פילה",)),
+    # --- Organ cuts ---
+    ("Beef tongue (לשון בקר)",      ("לשון",)),
+    ("Brain (מוח)",                  ("מוח",)),
+    ("Neck (גרון)",                  ("גרון",)),
+    ("Giblets / gizzards (קרביים)", ("קרביים", "קורקבן", "כרעיים")),
+    # --- Veal / lamb / baby ---
+    ("Baby beef (בייבי בקר)",       ("בבי בקר", "בייבי בקר", "בייבי-בקר")),
+    ("Veal (עגל)",                   ("עגל",)),
+    ("Lamb (כבש / טלה)",             ("כבש", "טלה")),
+    # --- Liver / ground ---
+    ("Beef liver (כבד בקר)",         ("כבד בקר",)),
+    ("Chicken liver (כבד עוף)",     ("כבד עוף", "כבד")),
+    ("Beef roast (צלי)",             ("צלי",)),
+    ("Ground beef (בשר טחון)",       ("בשר טחון",)),
+    ("Ground beef — generic",        ("בקר",)),
+    # --- Chicken parts (specific first) ---
+    ("Chicken breast (חזה עוף)",    ("חזה עוף",)),
+    ("Chicken wings (כנפיים)",      ("כנפיים",)),
+    ("Chicken thighs (ירכיים / ירך)", ("ירכיים", "ירך עוף")),
+    ("Chicken drumsticks (שוקיים / שוק עוף)", ("שוקיים", "שוק עוף")),
+    ("Drumsticks slang (פולקע)",    ("פולקע", "פולקות")),
+    ("Cornish hen (פרגית)",          ("פרגית", "פרגיות")),
+    ("Turkey (הודו)",                ("חזה הודו", "הודו")),
+    ("Chicken — other",              ("עוף",)),
+    ("Beef — other",                 ("בשר",)),
 )
 
 
@@ -99,9 +120,19 @@ def _categorize(promo: "MeatPromo") -> str:
 # ---- Hebrew keyword classifier ----
 
 _MEAT_KEYWORDS: tuple[str, ...] = (
-    # Fresh beef / cow parts only
+    # Fresh beef / cow parts
     "בשר", "בקר", "עגל", "כבש", "טלה", "כבד",
     "אנטריקוט", "פילה", "סטייק", "צלעות", "צלי",
+    # Specific cuts (Hebrew / Argentinian / international)
+    "אסאדו", "בריסקט", "בריסקיט", "פיקניה", "סינטה",
+    "אוסובוקו", "אוסו בוקו", "פלאנק", "ראמפ",
+    "ט-בון", "טיבון", "צ'אק", "צ'ק",
+    "כתף", "שריר", "חגורה", "גולש", "גולאש",
+    "פילה מיניון", "פילה-מיניון",
+    "בבי בקר", "בייבי בקר", "בייבי-בקר",
+    # Organ / utility cuts
+    "מוח", "גרון", "קורקבן", "קרביים", "כרעיים",
+    "פולקע", "פולקות", "לשון",
     # Fresh poultry parts
     "עוף", "הודו", "פרגית", "פרגיות",
     "שוקיים", "כנפיים", "חזה עוף", "חזה הודו", "ירך עוף", "שוק עוף",
