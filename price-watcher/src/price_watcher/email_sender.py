@@ -650,13 +650,20 @@ def build_digest_payload(digests) -> EmailPayload | None:
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
 
+def _promo_category(p) -> str:
+    category = getattr(p, "category", "")
+    if category:
+        return category
+    from price_watcher.supermarkets import _categorize
+    return _categorize(p)
+
+
 def _group_meat_by_category(sm):
-    """Returns: dict[category_name -> list[MeatPromo]], ordered by _CATEGORIES."""
-    from price_watcher.supermarkets import _categorize, _CATEGORIES
+    """category -> its deals, best first, categories in `_CATEGORIES` order."""
+    from price_watcher.supermarkets import _CATEGORIES
     groups: dict[str, list] = {}
     for p in sm.promos:
-        cat = _categorize(p)
-        groups.setdefault(cat, []).append(p)
+        groups.setdefault(_promo_category(p), []).append(p)
     ordered = {}
     for cat_name, _ in _CATEGORIES:
         if cat_name in groups:
@@ -692,12 +699,33 @@ def _region_order() -> tuple[str, ...]:
     return _REGION_ORDER
 
 
-def _group_meat_by_region(sm) -> dict[str, list]:
-    """region -> its deals, already sorted best-first by the scanner."""
-    groups: dict[str, list] = {region: [] for region in _region_order()}
-    for p in sm.promos:
-        groups.setdefault(getattr(p, "region", "") or "אחר", []).append(p)
-    return {region: items for region, items in groups.items() if items}
+# Soft background / text colour per region, in `_REGION_ORDER` order.
+_REGION_CHIP_COLORS: tuple[tuple[str, str], ...] = (
+    ("#dbeafe", "#1e40af"),
+    ("#fef3c7", "#92400e"),
+    ("#ede9fe", "#5b21b6"),
+)
+
+
+# Shorter labels for the narrow region column (full name otherwise).
+_REGION_SHORT = {"ראשון לציון והסביבה": "ראשל״צ והסביבה"}
+
+
+def _region_chip_html(region: str) -> str:
+    order = _region_order()
+    if region in order:
+        bg, fg = _REGION_CHIP_COLORS[order.index(region) % len(_REGION_CHIP_COLORS)]
+    else:
+        bg, fg = "#f3f4f6", "#374151"
+    # Kept short on purpose: this is repeated on every row of every table.
+    return (
+        f'<span style="background:{bg};color:{fg};padding:1px 5px;border-radius:4px;'
+        f'line-height:1.9;white-space:nowrap">{escape(_REGION_SHORT.get(region, region))}</span>'
+    )
+
+
+def _promo_regions(p) -> list[str]:
+    return list(getattr(p, "regions", None) or [])
 
 
 def _where_label(p) -> str:
@@ -754,6 +782,26 @@ def _price_cell_html(p) -> str:
     return "—"
 
 
+def _price_compact_html(p) -> str:
+    """'-30%' on top, then the promo price in bold and the regular price struck through (per unit)."""
+    # "-30%" when known; a bare dash (not "-—") when it is not.
+    pct_txt = f"-{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
+    parts = [f'<b style="font-size:15px;color:{_COLOR_DANGER}"><span dir="ltr">{pct_txt}</span></b>']
+    unit = (
+        f'<small style="color:{_COLOR_MUTED}"> לק״ג</small>'
+        if getattr(p, "is_weighted", False) else ""
+    )
+    if p.discounted_price:
+        parts.append(f'<b>{_shekel(p.discounted_price)}</b>{unit}')
+    if p.regular_price:
+        was = f'<s style="color:{_COLOR_MUTED}">{_shekel(p.regular_price)}</s>'
+        parts.append(f'<small>{was}</small>' if p.discounted_price else was + unit)
+    deal = getattr(p, "deal_text", "")
+    if deal:
+        parts.append(f'<small style="color:{_COLOR_MUTED}">{escape(deal)}</small>')
+    return "<br>".join(parts)
+
+
 def _section_heading_html(title: str, first: bool = False) -> str:
     margin = "0 0 12px" if first else "28px 0 12px"
     return (
@@ -774,7 +822,6 @@ def _failure_box_html(title: str, status: str | None, error: str | None) -> str:
 
 
 def _supermarkets_section_text(sm) -> list[str]:
-    from price_watcher.supermarkets import _categorize
     lines = ["מבצעי בשר בסופרמרקטים", "-" * 50, ""]
     if sm is None:
         lines.append("  (לא נסרק)")
@@ -799,18 +846,22 @@ def _supermarkets_section_text(sm) -> list[str]:
     lines.append(f"  רשתות שנסרקו: {chains}")
     lines.extend(problem_lines)
     lines.append(f"  סניפים שנסרקו: {len(getattr(sm, 'stores_scanned', None) or [])}")
+    stores_by_region = getattr(sm, "stores_by_region", None) or {}
+    if stores_by_region:
+        lines.append(
+            "  אזורים: " + " · ".join(
+                f"{region} ({stores_by_region.get(region, 0)} סניפים)" for region in _region_order()
+            )
+        )
     if not sm.promos:
         lines.append("  לא נמצאו היום מבצעי בשר.")
         return lines
-    stores_by_region = getattr(sm, "stores_by_region", None) or {}
-    promos_by_region = getattr(sm, "promos_by_region", None) or {}
-    for region, items in _group_meat_by_region(sm).items():
+    promos_by_category = getattr(sm, "promos_by_category", None) or {}
+    for category, items in _group_meat_by_category(sm).items():
+        total = promos_by_category.get(category, len(items))
+        shown = f"{len(items)} מתוך {total}" if total > len(items) else f"{len(items)}"
         lines.append("")
-        lines.append(f"  ▼ {region}")
-        lines.append(
-            f"    {stores_by_region.get(region, 0)} סניפים · "
-            f"{len(items)} המבצעים הטובים ביותר מתוך {promos_by_region.get(region, len(items))}"
-        )
+        lines.append(f"  ▼ {category}  ({shown} מבצעים)")
         for i, p in enumerate(items, 1):
             pct = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "לא ידועה"
             unit = " לק״ג" if getattr(p, "is_weighted", False) else ""
@@ -820,18 +871,22 @@ def _supermarkets_section_text(sm) -> list[str]:
             if deal:
                 now += f" ({deal})"
             lines.append(f"    {i}. הנחה {pct} · {p.chain} · {p.item_name[:50]}")
-            lines.append(f"       מחיר רגיל {was} · מחיר מבצע {now} · {_categorize(p)}")
+            lines.append(f"       מחיר רגיל {was} · מחיר מבצע {now}")
             if p.promotion_description:
                 lines.append(f"       {p.promotion_description[:90]}")
+            regions = " · ".join(_promo_regions(p))
             where = _where_label(p)
-            if where:
-                lines.append(f"       {where}")
+            if regions or where:
+                lines.append("       " + " — ".join(x for x in (regions, where) if x))
     return lines
 
 
 def _supermarkets_section_html(sm) -> str:
-    """Meat section: one card per region, deals ranked best to worst. RTL."""
-    from price_watcher.supermarkets import _categorize
+    """Meat section: one table per category, best deal first. RTL.
+
+    Each category shows up to PW_TOP_PER_CATEGORY supermarket deals, with at
+    least one from every region that has a deal in that category.
+    """
     if sm is None:
         return '<div style="color:#888;font-style:italic;text-align:right">(לא נסרק)</div>'
     problems_html = "".join(
@@ -851,29 +906,40 @@ def _supermarkets_section_html(sm) -> str:
                if problems_html else '')
         )
 
-    # Summary card
     chains_scanned = sm.chains_scanned or []
     stores_scanned = list(getattr(sm, "stores_scanned", None) or [])
     stores_by_region = getattr(sm, "stores_by_region", None) or {}
-    promos_by_region = getattr(sm, "promos_by_region", None) or {}
-    grouped = _group_meat_by_region(sm)
+    promos_by_category = getattr(sm, "promos_by_category", None) or {}
+    grouped = _group_meat_by_category(sm)
+    total_deals = sum(promos_by_category.values()) or len(sm.promos)
+
+    regions_legend = "".join(
+        f'{_region_chip_html(region)}'
+        f'<span style="color:{_COLOR_MUTED};margin-left:10px"> '
+        f'{stores_by_region.get(region, 0)} סניפים</span>'
+        for region in _region_order()
+    )
 
     html = []
+    # Summary card
     html.append(
         f'<div style="padding:14px 16px;background:{_COLOR_BG_SOFT};'
-        f'border:1px solid {_COLOR_BORDER};border-radius:10px;margin-bottom:18px;'
+        f'border:1px solid {_COLOR_BORDER};border-radius:10px;margin-bottom:14px;'
         f'font-family:{_FONT_STACK};color:{_COLOR_TEXT};text-align:right">'
         f'<div style="font-size:13px;color:{_COLOR_MUTED}">הסריקה של היום</div>'
         f'<div style="font-size:15px;margin-top:4px">'
         f'<b>{len(chains_scanned)}</b> רשתות · '
         f'<b>{len(stores_scanned)}</b> סניפים · '
-        f'<b>{sum(promos_by_region.values()) or len(sm.promos)}</b> מבצעי בשר</div>'
+        f'<b>{total_deals}</b> מבצעי בשר · '
+        f'<b>{len(grouped)}</b> קטגוריות</div>'
         f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
         f'רשתות: ' + " · ".join(escape(c) for c in chains_scanned)
         + '</div>'
+        + f'<div style="margin-top:8px;font-size:11px">{regions_legend}</div>'
         + problems_html
-        + f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
-        f'בכל אזור מוצגים המבצעים הטובים ביותר, מההנחה הגבוהה לנמוכה.'
+        + f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
+        f'טבלה לכל קטגוריה: המבצעים הטובים ביותר, מההנחה הגבוהה לנמוכה, '
+        f'עם לפחות מבצע אחד מכל אזור שיש בו מבצע בקטגוריה.'
         f'</div></div>'
     )
 
@@ -884,87 +950,84 @@ def _supermarkets_section_html(sm) -> str:
         )
         return "".join(html)
 
-    th_style = (
-        f'padding:6px 10px;font-size:11px;font-weight:600;color:{_COLOR_MUTED};'
-        f'letter-spacing:0.5px'
+    # Category index (plain chips: in-page links are unreliable in mail clients)
+    html.append(
+        f'<div style="margin:0 0 18px;font-family:{_FONT_STACK};font-size:12px;'
+        f'color:{_COLOR_MUTED};text-align:right;line-height:1.9">'
+        + " ".join(
+            f'<span style="display:inline-block;background:#ffffff;border:1px solid {_COLOR_BORDER};'
+            f'border-radius:12px;padding:1px 9px;margin:0 0 4px 4px;color:{_COLOR_TEXT};'
+            f'white-space:nowrap">{_category_icon(cat)} {escape(cat)} '
+            f'<span style="color:{_COLOR_MUTED}">{len(items)}</span></span>'
+            for cat, items in grouped.items()
+        )
+        + '</div>'
     )
-    cell = f'border-top:1px solid {_COLOR_BORDER};vertical-align:top'
 
-    # One card per region, best deal first.
-    for region, items in grouped.items():
+    small = f'font-size:11px;color:{_COLOR_MUTED}'
+    row_base = f'border-top:1px solid {_COLOR_BORDER};vertical-align:top'
+
+    # One table per category, best deal first. Styles that repeat on every
+    # cell live on the <table>/<tr> (inherited) to keep the email small.
+    for category, items in grouped.items():
         rows_html = []
         for i, p in enumerate(items):
             is_best = i == 0
             row_bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else _COLOR_BG_SOFT)
-            # "-30%" when known; a bare dash (not "-—") when it is not.
-            pct_txt = f"-{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
             best_badge = (
-                f'<div><span style="display:inline-block;background:{_COLOR_ACCENT};'
-                f'color:#fff;font-size:10px;font-weight:700;padding:2px 6px;'
-                f'border-radius:4px;margin-top:3px">הכי משתלם</span></div>'
+                f' <span style="background:{_COLOR_ACCENT};color:#fff;font-size:10px;'
+                f'padding:1px 5px;border-radius:4px;white-space:nowrap">הכי משתלם</span>'
                 if is_best else ""
             )
-            category = _categorize(p)
             where = _where_label(p)
+            regions_html = " ".join(_region_chip_html(r) for r in _promo_regions(p)) or "—"
             rows_html.append(
-                f'<tr style="background:{row_bg}">'
-                # Rank
-                f'<td style="padding:8px 6px 8px 0;font-size:12px;color:{_COLOR_MUTED};'
-                f'text-align:center;{cell}">{i + 1}</td>'
-                # Chain column
-                f'<td style="padding:8px 10px;font-size:12px;color:{_COLOR_LINK};'
-                f'font-weight:600;{cell};text-align:right">{escape(p.chain)}'
-                + (f'<div style="font-size:11px;font-weight:400;color:{_COLOR_MUTED};'
-                   f'margin-top:2px">{escape(where)}</div>' if where else '')
-                + best_badge
-                + '</td>'
-                # Item name
-                f'<td style="padding:8px 10px;font-size:13px;color:{_COLOR_TEXT};'
-                f'{cell};text-align:right">'
-                f'{escape(p.item_name[:60])}'
-                + (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-                   f'{escape(p.promotion_description[:70])}</div>'
+                f'<tr style="background:{row_bg};{row_base}">'
+                # Supermarket, then its region(s) and cities. One column, so
+                # the table still fits a phone screen.
+                f'<td><b style="color:{_COLOR_LINK}">{escape(p.chain)}</b>{best_badge}'
+                f'<div style="{small};margin-top:2px">{regions_html}'
+                + (f'<br>{escape(where)}' if where else '')
+                + '</div></td>'
+                # Item
+                f'<td>{escape(p.item_name[:60])}'
+                + (f'<br><span style="{small}">{escape(p.promotion_description[:70])}</span>'
                    if p.promotion_description else '')
-                + f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-                  f'{_category_icon(category)} {escape(category)}</div>'
                 + '</td>'
-                # Price (was / now)
-                f'<td style="padding:8px 10px;font-size:12px;text-align:left;'
-                f'white-space:nowrap;{cell}">{_price_cell_html(p)}</td>'
-                # Discount %
-                f'<td style="padding:8px 10px;font-size:14px;font-weight:700;'
-                f'color:{_COLOR_DANGER};text-align:left;white-space:nowrap;{cell}">'
-                f'<span dir="ltr">{pct_txt}</span></td>'
-                f'</tr>'
+                # Discount + price (was / now)
+                f'<td align="left" style="white-space:nowrap">{_price_compact_html(p)}</td>'
+                '</tr>'
             )
 
-        total_in_region = promos_by_region.get(region, len(items))
-        shown_txt = (
-            f'{len(items)} המבצעים הטובים ביותר מתוך {total_in_region}'
-            if total_in_region > len(items) else f'{len(items)} מבצעים'
-        )
+        total = promos_by_category.get(category, len(items))
+        if total > len(items):
+            shown_txt = f'{len(items)} המבצעים הטובים ביותר מתוך {total}'
+        elif len(items) == 1:
+            shown_txt = 'מבצע אחד'
+        else:
+            shown_txt = f'{len(items)} מבצעים'
+        chains_in_table = len({p.chain for p in items})
+        chains_txt = 'רשת אחת' if chains_in_table == 1 else f'{chains_in_table} רשתות'
         html.append(
             f'<div style="margin:0 0 20px;background:#ffffff;border:1px solid {_COLOR_BORDER};'
             f'border-radius:10px;overflow:hidden;font-family:{_FONT_STACK}">'
             # Header strip
-            f'<div style="padding:10px 14px;background:{_COLOR_BG_SOFT};'
-            f'border-bottom:1px solid {_COLOR_BORDER};text-align:right">'
-            f'<div style="font-size:15px;font-weight:700;color:{_COLOR_TEXT}">'
-            f'📍 {escape(region)}</div>'
-            f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-            f'{stores_by_region.get(region, 0)} סניפים נסרקו · {shown_txt}'
+            f'<div style="padding:10px 14px;background:{_COLOR_TEXT};text-align:right">'
+            f'<div style="font-size:16px;font-weight:700;color:#ffffff">'
+            f'{_category_icon(category)} {escape(category)}</div>'
+            f'<div style="font-size:11px;color:#d1d5db;margin-top:2px">'
+            f'{shown_txt} · {chains_txt}'
             f'</div></div>'
             # Table header + body
-            '<table dir="rtl" style="border-collapse:collapse;width:100%">'
-            '<thead><tr>'
-            f'<th style="{th_style};text-align:center">#</th>'
-            f'<th style="{th_style};text-align:right">רשת</th>'
-            f'<th style="{th_style};text-align:right">מוצר</th>'
-            f'<th style="{th_style};text-align:left">מחיר</th>'
-            f'<th style="{th_style};text-align:left">הנחה</th>'
-            '</tr></thead>'
-            '<tbody>' + "".join(rows_html) + '</tbody>'
-            '</table>'
+            f'<table dir="rtl" cellpadding="6" cellspacing="0" style="border-collapse:collapse;'
+            f'width:100%;font-size:13px;color:{_COLOR_TEXT};text-align:right">'
+            f'<tr style="{small}">'
+            '<th align="right" width="34%">סופרמרקט ואזור</th>'
+            '<th align="right">מוצר</th>'
+            '<th align="left">הנחה ומחיר</th>'
+            '</tr>'
+            + "".join(rows_html)
+            + '</table>'
             '</div>'
         )
     return "".join(html)
