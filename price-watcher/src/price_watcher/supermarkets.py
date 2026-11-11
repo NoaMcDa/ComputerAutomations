@@ -632,11 +632,29 @@ def _frozen_label(label: str) -> str:
     return label + _FROZEN_SUFFIX
 
 
+# Display order of the tables: red meat first (beef, then lamb), poultry
+# after it. `_CATEGORY_RULES` is in MATCHING order (poultry rules must be
+# tried first), so the display order is derived separately; inside one
+# animal the rule order is kept.
+_SPECIES_DISPLAY_ORDER: tuple[str, ...] = (
+    "beef", "lamb", "pork", "chicken", "turkey", "goose", "duck",
+)
+
+
+def _display_labels() -> list[str]:
+    species_of: dict[str, str] = {}
+    for label, species, _kws in _CATEGORY_RULES:
+        species_of.setdefault(label, species)
+    rank = {species: i for i, species in enumerate(_SPECIES_DISPLAY_ORDER)}
+    # sorted() is stable: labels of one animal stay in rule order.
+    return sorted(species_of, key=lambda label: rank.get(species_of[label], len(rank)))
+
+
 # (label, keywords) in display order, labels de-duplicated, each followed by
 # its frozen twin (email_sender orders its groups by this).
 _CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
     entry
-    for label in dict.fromkeys(lb for lb, _sp, _kws in _CATEGORY_RULES)
+    for label in _display_labels()
     for entry in (
         (label, tuple(kw for lb, _sp, kws in _CATEGORY_RULES if lb == label for kw in kws)),
         (_frozen_label(label), ()),

@@ -226,3 +226,20 @@ def test_fresh_and_frozen_cuts_get_separate_tables():
     groups = _by_category(_report(promos))
     assert [p.chain for p in groups["לשון בקר"]] == ["טיב טעם"]
     assert [p.chain for p in groups["לשון בקר – קפוא"]] == ["שופרסל"]
+
+
+def test_red_meat_tables_come_before_poultry():
+    """Display order: beef, then lamb, then chicken / turkey / goose / duck."""
+    labels = [label for label, _ in sm._CATEGORIES]
+    species_of = {}
+    for label, species, _kws in sm._CATEGORY_RULES:
+        species_of.setdefault(label, species)
+    order = [species_of[lb] for lb in labels if lb in species_of]
+    first = {species: order.index(species) for species in dict.fromkeys(order)}
+    last = {species: len(order) - 1 - order[::-1].index(species) for species in first}
+    assert last["beef"] < first["lamb"] < first["chicken"]
+    assert last["lamb"] < first["chicken"] < first["turkey"] < first["goose"]
+    # a frozen table directly follows its fresh twin
+    assert labels.index("לשון בקר" + sm._FROZEN_SUFFIX) == labels.index("לשון בקר") + 1
+    # and a real report follows the same order
+    assert labels.index("אנטריקוט") < labels.index("כנפיים עוף") < labels.index("חזה הודו")
