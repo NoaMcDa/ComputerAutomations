@@ -40,6 +40,20 @@ console = Console()
 _HEADERS = {"User-Agent": "Mozilla/5.0 (price-watcher)"}
 _SHUFERSAL_CATEGORY_URL = "https://prices.shufersal.co.il/FileObject/UpdateCategory?catID={cat}"
 
+_PP_BASE = "https://url.publishedprices.co.il"
+
+# Chains hosted on the shared Cerberus host at url.publishedprices.co.il.
+# Login credentials are publicly documented (law mandates free access).
+# (cerberus_username, chain_display_name)
+_PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
+    ("RamiLevi", "Rami Levy"),
+    ("yohananof", "Yochananof"),
+    ("HaziHinam", "Hazi Hinam"),
+    ("osherad", "Osher Ad"),
+    ("TivTaam", "Tiv Taam"),
+    ("Keshet", "Keshet (King Store)"),
+)
+
 
 # ---- Hebrew keyword classifier ----
 
@@ -222,26 +236,139 @@ def scan_shufersal(store_id: str | None = None) -> list[MeatPromo]:
 
     item_index = _build_item_index(price_root)
     log.info("Shufersal: indexed %d items", len(item_index))
+    return _extract_meat_promos("Shufersal", store_id or "?", promo_root, item_index)
 
+
+# ---- Published prices (Cerberus host) ----
+
+def _pp_csrf(client: httpx.Client, path: str = "/login") -> Optional[str]:
+    r = client.get(f"{_PP_BASE}{path}")
+    m = re.search(r'name="csrftoken"\s+content="([^"]+)"', r.text)
+    return m.group(1) if m else None
+
+
+def _pp_login(client: httpx.Client, username: str) -> bool:
+    token = _pp_csrf(client, "/login")
+    if not token:
+        return False
+    r = client.post(
+        f"{_PP_BASE}/login/user",
+        data={"username": username, "password": "", "r": "", "csrftoken": token},
+    )
+    if r.status_code != 200:
+        return False
+    # Confirm login: /file page should contain "logout"
+    check = client.get(f"{_PP_BASE}/file")
+    return "logout" in check.text.lower()
+
+
+def _pp_list_files(client: httpx.Client, prefix: str, limit: int = 50) -> list[dict]:
+    """List files whose name starts with `prefix` (e.g. 'PromoFull')."""
+    token = _pp_csrf(client, "/file")
+    if not token:
+        return []
+    r = client.post(
+        f"{_PP_BASE}/file/json/dir",
+        data={"csrftoken": token, "iDisplayLength": limit, "iDisplayStart": 0, "sSearch": prefix},
+    )
+    try:
+        return r.json().get("aaData", [])
+    except Exception:
+        return []
+
+
+def _pp_download(client: httpx.Client, filename: str) -> Optional[bytes]:
+    r = client.get(f"{_PP_BASE}/file/d/{filename}", timeout=120)
+    if r.status_code != 200:
+        return None
+    return r.content
+
+
+def scan_publishedprices_chain(
+    username: str,
+    chain_name: str,
+    store_preference: str | None = None,
+) -> list[MeatPromo]:
+    """Scan one chain hosted on url.publishedprices.co.il."""
+    log.info("%s: logging in to publishedprices", chain_name)
+    with httpx.Client(follow_redirects=True, timeout=60, headers=_HEADERS) as client:
+        if not _pp_login(client, username):
+            log.warning("%s: login failed", chain_name)
+            return []
+
+        # Find the newest PromoFull + PriceFull. Prefer specific store if given,
+        # else take the first in the listing.
+        promo_files = _pp_list_files(client, "PromoFull", limit=50)
+        price_files = _pp_list_files(client, "PriceFull", limit=50)
+        if not promo_files or not price_files:
+            log.warning("%s: no files listed", chain_name)
+            return []
+
+        def _pick(files: list[dict]) -> Optional[str]:
+            if store_preference:
+                for f in files:
+                    if f"-{store_preference}-" in f.get("fname", ""):
+                        return f["fname"]
+            return files[0].get("fname")
+
+        promo_fname = _pick(promo_files)
+        price_fname = _pick(price_files)
+        if not promo_fname or not price_fname:
+            return []
+
+        # Infer store id from filename
+        m = re.search(r"-(\d{3})-(\d{3})-", promo_fname)
+        store_id = m.group(2) if m else "?"
+
+        log.info("%s: downloading %s + %s", chain_name, price_fname, promo_fname)
+        price_bytes = _pp_download(client, price_fname)
+        promo_bytes = _pp_download(client, promo_fname)
+        if not price_bytes or not promo_bytes:
+            log.warning("%s: download failed", chain_name)
+            return []
+
+    try:
+        price_xml = gzip.decompress(price_bytes) if price_fname.endswith(".gz") else price_bytes
+        promo_xml = gzip.decompress(promo_bytes) if promo_fname.endswith(".gz") else promo_bytes
+    except (OSError, EOFError):
+        price_xml = price_bytes
+        promo_xml = promo_bytes
+
+    try:
+        price_root = ET.fromstring(price_xml)
+        promo_root = ET.fromstring(promo_xml)
+    except ET.ParseError as exc:
+        log.warning("%s: parse failed: %s", chain_name, exc)
+        return []
+
+    item_index = _build_item_index(price_root)
+    log.info("%s: indexed %d items", chain_name, len(item_index))
+    return _extract_meat_promos(chain_name, store_id, promo_root, item_index)
+
+
+def _extract_meat_promos(
+    chain_name: str,
+    store_id: str,
+    promo_root: ET.Element,
+    item_index: dict[str, tuple[str, Optional[Decimal]]],
+) -> list[MeatPromo]:
+    """Shared promo-filtering logic used by every chain."""
     results: list[MeatPromo] = []
     promos_container = promo_root.find("Promotions") or promo_root.find(".//Promotions")
     if promos_container is None:
         return []
-
-    seen: set[tuple[str, str]] = set()  # (item_code, promo_description)
+    seen: set[tuple[str, str]] = set()
     for promo in promos_container.findall("Promotion"):
         desc_el = promo.find("PromotionDescription")
         desc = (desc_el.text or "").strip() if desc_el is not None else ""
         end_el = promo.find("PromotionEndDateTime")
         end = (end_el.text or "").strip() if end_el is not None else ""
 
-        # Skip customer-service compensation coupons (restricted to specific users)
         is_coupon_el = promo.find("AdditionalIsCoupon")
         if is_coupon_el is not None and (is_coupon_el.text or "").strip() == "1":
             continue
-        if "פיצוי" in desc:  # explicit compensation coupons
+        if "פיצוי" in desc:
             continue
-        # Skip club-restricted promos (only "0 - כלל הלקוחות" / general public counts)
         club_el = promo.find("ClubID")
         if club_el is not None and club_el.text:
             club_text = club_el.text.strip()
@@ -251,7 +378,6 @@ def scan_shufersal(store_id: str | None = None) -> list[MeatPromo]:
         items_container = promo.find(".//PromotionItems")
         if items_container is None:
             continue
-
         for pi in items_container.findall("PromotionItem"):
             code_el = pi.find("ItemCode")
             if code_el is None:
@@ -280,14 +406,12 @@ def scan_shufersal(store_id: str | None = None) -> list[MeatPromo]:
                 discounted_price = Decimal((dp_el.text or "").strip()) if dp_el is not None and dp_el.text else None
             except (ArithmeticError, ValueError):
                 discounted_price = None
-
-            # Skip entries with no discount signal at all
             if discount_rate is None and discounted_price is None:
                 continue
 
             results.append(MeatPromo(
-                chain="Shufersal",
-                store_id=store_id or "?",
+                chain=chain_name,
+                store_id=store_id,
                 item_code=code,
                 item_name=name,
                 regular_price=regular_price,
@@ -296,23 +420,40 @@ def scan_shufersal(store_id: str | None = None) -> list[MeatPromo]:
                 promotion_description=desc,
                 end_date=end[:10] if end else None,
             ))
-
     return results
 
 
 # ---- Orchestrator ----
 
 def scan_and_report() -> SupermarketReport:
-    """Scan all configured chains and return a combined report."""
-    log.info("Running supermarket meat scan")
+    """Scan every configured chain in parallel and return a combined report."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    log.info("Running supermarket meat scan across %d chains", 1 + len(_PUBLISHEDPRICES_CHAINS))
     report = SupermarketReport(status="ok")
-    try:
-        # Store 001 is a flagship Tel Aviv branch with a representative promo list.
-        promos = scan_shufersal(store_id="001")
-        report.promos.extend(promos)
-        report.chains_scanned.append("Shufersal")
-    except Exception as exc:
-        log.error("Shufersal scan failed: %s: %s", type(exc).__name__, exc)
+
+    def _shufersal_task() -> tuple[str, list[MeatPromo]]:
+        return ("Shufersal", scan_shufersal(store_id="001"))
+
+    def _pp_task(user: str, name: str) -> tuple[str, list[MeatPromo]]:
+        return (name, scan_publishedprices_chain(user, name))
+
+    tasks = [_shufersal_task] + [
+        (lambda u=u, n=n: _pp_task(u, n)) for u, n in _PUBLISHEDPRICES_CHAINS
+    ]
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = [pool.submit(task) for task in tasks]
+        for fut in as_completed(futures):
+            try:
+                name, promos = fut.result()
+                if promos:
+                    report.promos.extend(promos)
+                    report.chains_scanned.append(name)
+                else:
+                    log.warning("%s: no promos returned", name)
+            except Exception as exc:
+                log.error("chain scan failed: %s: %s", type(exc).__name__, exc)
     # Dedupe: the same promotion description often covers multiple item
     # variants (different brands of the same cut). Keep one representative
     # per (chain, promotion_description, rounded savings_pct) tuple.
