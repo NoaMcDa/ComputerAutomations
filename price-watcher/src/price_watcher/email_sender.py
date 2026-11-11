@@ -560,7 +560,7 @@ _FONT_STACK = ("-apple-system,BlinkMacSystemFont,'Segoe UI',"
 # (keywords in the Hebrew category name, icon) — first match wins.
 _CATEGORY_ICONS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("הודו",), "🦃"),
-    (("עוף", "כנפיים", "ירכיים", "שוקיים", "פולקע", "פרגיות", "קורקבן"), "🍗"),
+    (("עוף", "כנפיים", "כרעיים", "ירכיים", "שוקיים", "פולקע", "פרגיות", "קורקבן", "אווז"), "🍗"),
     (("כבש", "טלה"), "🐑"),
     (("עגל", "בייבי"), "🐄"),
     (("לשון",), "👅"),
@@ -608,16 +608,29 @@ def _usd(value: object) -> str:
 
 
 def _price_cell_html(p) -> str:
-    """Render the before/after price cell: strike-through old, bold new."""
+    """Render the before/after price cell: strike-through old, bold new.
+
+    Both prices are per unit (per kg for weighed items); a multi-buy deal
+    ("2 ב-₪90") is shown under them.
+    """
+    unit = (
+        f'<span style="font-size:10px;color:{_COLOR_MUTED}"> לק״ג</span>'
+        if getattr(p, "is_weighted", False) else ""
+    )
+    deal = getattr(p, "deal_text", "")
+    deal_html = (
+        f'<div style="font-size:10px;color:{_COLOR_MUTED};margin-top:2px">'
+        f'<span dir="rtl">{escape(deal)}</span></div>' if deal else ""
+    )
     if p.regular_price and p.discounted_price:
         return (
             f'<span style="color:{_COLOR_MUTED};text-decoration:line-through">{_shekel(p.regular_price)}</span>'
-            f'<br><b style="color:{_COLOR_TEXT}">{_shekel(p.discounted_price)}</b>'
+            f'<br><b style="color:{_COLOR_TEXT}">{_shekel(p.discounted_price)}</b>{unit}{deal_html}'
         )
     if p.discounted_price:
-        return f'<b>{_shekel(p.discounted_price)}</b>'
+        return f'<b>{_shekel(p.discounted_price)}</b>{unit}{deal_html}'
     if p.regular_price:
-        return f'<span style="color:{_COLOR_MUTED}">{_shekel(p.regular_price)}</span>'
+        return f'<span style="color:{_COLOR_MUTED}">{_shekel(p.regular_price)}</span>{unit}'
     return "—"
 
 
@@ -646,11 +659,25 @@ def _supermarkets_section_text(sm) -> list[str]:
     if sm is None:
         lines.append("  (לא נסרק)")
         return lines
+    problems = [
+        (title, chains)
+        for title, chains in (
+            ("רשתות שנכשלו", getattr(sm, "chains_failed", None) or {}),
+            ("רשתות ללא מבצעים", getattr(sm, "chains_empty", None) or {}),
+        )
+        if chains
+    ]
+    problem_lines = [
+        f"  {title}: " + ", ".join(f"{c} ({r})" for c, r in chains.items())
+        for title, chains in problems
+    ]
     if sm.status != "ok":
         lines.append(f"  הסריקה נכשלה: {_status_he(sm.status)}  {sm.error or ''}")
+        lines.extend(problem_lines)
         return lines
     chains = ", ".join(sm.chains_scanned) if sm.chains_scanned else "אין"
     lines.append(f"  רשתות שנסרקו: {chains}")
+    lines.extend(problem_lines)
     lines.append(f"  סניפים שנסרקו: {len(getattr(sm, 'stores_scanned', None) or [])}")
     if not sm.promos:
         lines.append("  לא נמצאו היום מבצעי בשר.")
@@ -665,9 +692,13 @@ def _supermarkets_section_text(sm) -> list[str]:
             f"{len(items)} המבצעים הטובים ביותר מתוך {promos_by_region.get(region, len(items))}"
         )
         for i, p in enumerate(items, 1):
-            pct = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
-            was = f"₪{p.regular_price}" if p.regular_price else "—"
-            now = f"₪{p.discounted_price}" if p.discounted_price else "—"
+            pct = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "לא ידועה"
+            unit = " לק״ג" if getattr(p, "is_weighted", False) else ""
+            was = f"₪{p.regular_price}{unit}" if p.regular_price else "—"
+            now = f"₪{p.discounted_price}{unit}" if p.discounted_price else "—"
+            deal = getattr(p, "deal_text", "")
+            if deal:
+                now += f" ({deal})"
             lines.append(f"    {i}. הנחה {pct} · {p.chain} · {p.item_name[:50]}")
             lines.append(f"       מחיר רגיל {was} · מחיר מבצע {now} · {_categorize(p)}")
             if p.promotion_description:
@@ -683,8 +714,22 @@ def _supermarkets_section_html(sm) -> str:
     from price_watcher.supermarkets import _categorize
     if sm is None:
         return '<div style="color:#888;font-style:italic;text-align:right">(לא נסרק)</div>'
+    problems_html = "".join(
+        f'<div style="font-size:12px;color:#991b1b;margin-top:4px;text-align:right">'
+        f'{title}: ' + " · ".join(f'{escape(c)} ({escape(r)})' for c, r in chains.items())
+        + '</div>'
+        for title, chains in (
+            ("רשתות שנכשלו", getattr(sm, "chains_failed", None) or {}),
+            ("רשתות ללא מבצעים", getattr(sm, "chains_empty", None) or {}),
+        )
+        if chains
+    )
     if sm.status != "ok":
-        return _failure_box_html("סריקת הסופרמרקטים נכשלה", sm.status, sm.error)
+        return (
+            _failure_box_html("סריקת הסופרמרקטים נכשלה", sm.status, sm.error)
+            + (f'<div style="margin:-16px 0 24px;font-family:{_FONT_STACK}">{problems_html}</div>'
+               if problems_html else '')
+        )
 
     # Summary card
     chains_scanned = sm.chains_scanned or []
@@ -706,7 +751,8 @@ def _supermarkets_section_html(sm) -> str:
         f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
         f'רשתות: ' + " · ".join(escape(c) for c in chains_scanned)
         + '</div>'
-        f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
+        + problems_html
+        + f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
         f'בכל אזור מוצגים המבצעים הטובים ביותר, מההנחה הגבוהה לנמוכה.'
         f'</div></div>'
     )
@@ -730,7 +776,8 @@ def _supermarkets_section_html(sm) -> str:
         for i, p in enumerate(items):
             is_best = i == 0
             row_bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else _COLOR_BG_SOFT)
-            pct_txt = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
+            # "-30%" when known; a bare dash (not "-—") when it is not.
+            pct_txt = f"-{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
             best_badge = (
                 f'<div><span style="display:inline-block;background:{_COLOR_ACCENT};'
                 f'color:#fff;font-size:10px;font-weight:700;padding:2px 6px;'
@@ -767,7 +814,7 @@ def _supermarkets_section_html(sm) -> str:
                 # Discount %
                 f'<td style="padding:8px 10px;font-size:14px;font-weight:700;'
                 f'color:{_COLOR_DANGER};text-align:left;white-space:nowrap;{cell}">'
-                f'<span dir="ltr">-{pct_txt}</span></td>'
+                f'<span dir="ltr">{pct_txt}</span></td>'
                 f'</tr>'
             )
 
