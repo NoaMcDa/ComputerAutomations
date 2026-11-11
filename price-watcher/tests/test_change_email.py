@@ -145,3 +145,26 @@ def test_currency_change_email_shows_both_currencies():
     assert "100 ₪" in p.subject and "30 $" in p.subject
     assert "100.00 ₪" in p.text_body and "30.00 $" in p.text_body
     assert "המטבע השתנה" in p.text_body
+
+
+def _threshold(fetch_result):
+    return ChangeEvent(type=ChangeType.THRESHOLD_FAILURE, watch=W, fetch=fetch_result,
+                       reason="האחזור נכשל 3 פעמים ברצף (הסף: 3)")
+
+
+def test_threshold_alert_detail_per_failure_kind():  # #48
+    cases = [
+        (FetchResult(status=FetchStatus.BLOCKED, final_url=W.url, http_status=403), "חסם", "HTTP 403"),
+        (FetchResult(status=FetchStatus.NOT_FOUND, final_url=W.url, http_status=404), "הדף לא נמצא", "HTTP 404"),
+        (FetchResult(status=FetchStatus.NOT_FOUND, final_url=W.url,
+                     error_message="Shopify variant 1 not found in product"), "להוסיף אותו מחדש", "variant 1"),
+        (FetchResult(status=FetchStatus.OK, final_url=W.url, price=Decimal("0")), "כ-0", "כ-0"),
+        (FetchResult(status=FetchStatus.UNREACHABLE, final_url=W.url, error_message="timed <out>"),
+         "האתר לא זמין", "timed"),
+    ]
+    for fr, a, b in cases:
+        p = payload(_threshold(fr))
+        assert "פירוט:" in p.text_body and a in p.text_body and b in p.text_body
+        assert ">פירוט<" in p.html_body and a in p.html_body
+    p = payload(_threshold(cases[-1][0]))
+    assert "timed &lt;out&gt;" in p.html_body and "<out>" not in p.html_body

@@ -68,7 +68,7 @@ python -m price_watcher version
 
 `check --dry-run` runs the full pipeline but does not send email or change stored prices; it prints what *would* have happened per link. It still saves the fetched pages under `raw-responses/` in the data folder and writes the log, and it does not need the SMTP settings. `digest --dry-run` collects and prints every section without emailing.
 
-`check` exits with 1 when at least one watch failed and `digest` exits with 1 when the email could not be sent, so the OS scheduler shows a failed run.
+`check` exits with 1 when at least one watch failed, with 3 when a change email could not be sent (the changes are held back and retried on the next run; `status` shows it), and `digest` exits with 1 when the email could not be sent, so the OS scheduler shows a failed run.
 
 When you `add` a URL, tracking parameters (`utm_*`, `gclid`, `fbclid`, `ref`, …) are removed and the host is lower-cased; every other query parameter is kept because it may identify the product or variant.
 

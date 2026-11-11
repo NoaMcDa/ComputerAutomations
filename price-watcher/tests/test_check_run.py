@@ -113,3 +113,34 @@ def test_last_notified_at_only_on_changed_watch(run):  # #31
     watches = state.load_state()["watches"]
     assert "last_notified_at" in watches["w0"]
     assert "last_notified_at" not in watches["w1"]
+
+
+def test_email_failure_exits_nonzero_and_is_recorded(run, capsys):  # #44
+    import json
+    from price_watcher.paths import data_dir
+    _watches(A)
+    run({A: "100"})
+    code, _, _ = run({A: "80"}, smtp_ok=False)
+    assert code == scheduler.EXIT_EMAIL_FAILED == 3
+    last = json.loads((data_dir() / "last-run.json").read_text())
+    assert last["email_failed"] is True
+    out = io.StringIO()
+    scheduler._console = Console(file=out, width=200)
+    scheduler.status()
+    assert "Email failed" in out.getvalue()
+    code, sent, _ = run({A: "80"})
+    assert code == 0 and len(sent) == 1
+    assert json.loads((data_dir() / "last-run.json").read_text())["email_failed"] is False
+
+
+def test_threshold_alert_has_failure_detail(run):  # #48
+    import json
+    from price_watcher.paths import data_dir
+    _watches(A)
+    run({A: "100"})
+    run({A: None})
+    _, sent, _ = run({A: None})
+    assert len(sent) == 1
+    ev = json.loads((data_dir() / "last-run.json").read_text())["events"][0]
+    assert ev["type"] == "threshold_failure"
+    assert "האתר לא זמין" in ev["detail"] and "down" in ev["detail"]

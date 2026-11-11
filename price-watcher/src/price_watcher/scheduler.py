@@ -61,10 +61,15 @@ def _venv_python() -> str:
 # run_check
 # ---------------------------------------------------------------------------
 
+EXIT_EMAIL_FAILED = 3
+
+
 def run_check(dry_run: bool = False) -> int:  # noqa: C901  (complexity OK here)
     """Fetch all active watches, detect changes, optionally send email.
 
-    Returns 0 if every fetch succeeded, 1 if at least one failed.
+    Returns 0 if every fetch succeeded, 1 if at least one failed, and 3 if
+    there was a change email to send and sending it failed (takes precedence,
+    so a broken SMTP setup is visible to the OS scheduler).
     """
     # 1. Load config
     cfg = _config_mod.load(require_email=not dry_run)
@@ -224,8 +229,10 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
 
     # Real run: send + persist
     sent = True
+    email_failed = False
     if payload is not None:
         sent = _email_sender.send_change_notification(events)
+        email_failed = not sent
         if sent:
             _state.mark_notified(events)
         else:
@@ -259,6 +266,10 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
             "old_price": str(e.old_price) if e.old_price is not None else None,
             "new_price": str(e.new_price) if e.new_price is not None else None,
             "reason": e.reason,
+            "fetch_status": e.fetch.status.value,
+            "http_status": e.fetch.http_status,
+            "error_message": e.fetch.error_message,
+            "detail": _email_sender.failure_detail_he(e.fetch) or None,
         })
 
     last_run = {
@@ -266,11 +277,15 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
         "checked": checked,
         "changed": changed_count,
         "failed": failed_count,
+        "email_failed": email_failed,
         "events": brief_events,
     }
     last_run_path = data_dir() / "last-run.json"
     last_run_path.write_text(json.dumps(last_run, indent=2))
 
+    if email_failed:
+        _log.error("change email could not be sent; changes will be retried next run")
+        return EXIT_EMAIL_FAILED
     return 1 if any_failed else 0
 
 
@@ -512,6 +527,7 @@ def status() -> None:
         checked = data.get("checked", "?")
         changed = data.get("changed", "?")
         failed = data.get("failed", "?")
+        email_failed = bool(data.get("email_failed", False))
 
         # Pretty-print the timestamp
         try:
@@ -524,6 +540,12 @@ def status() -> None:
             f"[bold]Last run:[/bold] {ts_display} — "
             f"{checked} checked, {changed} changed, {failed} failed"
         )
+        if email_failed:
+            _console.print(
+                "[bold red]Email failed:[/bold red] the last run could not send "
+                "its change email; changes are held and will be retried. "
+                "Check the SMTP settings (run `test-email`)."
+            )
     except (json.JSONDecodeError, KeyError) as exc:
         _console.print(f"[red]Could not parse last-run.json:[/red] {exc}")
 
