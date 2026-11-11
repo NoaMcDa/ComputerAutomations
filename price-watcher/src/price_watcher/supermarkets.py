@@ -8,8 +8,9 @@ Scope: only stores located in the regions listed in `_REGIONS` (the Sharon,
 Tel Aviv, and the Rishon LeZion area). Each chain's Stores file maps store
 ids to cities; every store of every chain inside those regions is scanned
 (`PW_STORES_PER_REGION` can cap that per chain for a faster run). Chains
-with no store there are skipped. The report keeps the best
-`PW_TOP_PER_REGION` deals (default 30) for each region, best first.
+with no store there are skipped. The report is organised by meat category:
+each category keeps its best `PW_TOP_PER_CATEGORY` deals (default 10), with
+at least one deal from every region that has one and a spread of chains.
 
 For every store the newest PromoFull and PriceFull of the chain's own chain
 id are paired; files older than `_MAX_FEED_AGE_DAYS` are ignored. Chains that
@@ -150,9 +151,9 @@ def _stores_per_region() -> int:
     return _env_int("PW_STORES_PER_REGION", 0)
 
 
-def _top_per_region() -> int:
-    """How many deals to keep per region in the report."""
-    return _env_int("PW_TOP_PER_REGION", 30) or 30
+def _top_per_category() -> int:
+    """How many deals to keep per meat category in the report."""
+    return _env_int("PW_TOP_PER_CATEGORY", 10) or 10
 
 
 # Parallel store downloads per chain (11 chains run at once, so keep it modest).
@@ -636,9 +637,10 @@ class MeatPromo:
     end_date: Optional[str] = None
     store_name: str = ""
     city: str = ""
-    regions: list[str] = field(default_factory=list)  # one region per promo row
+    regions: list[str] = field(default_factory=list)  # regions it was seen in (one per raw row)
     cities: list[str] = field(default_factory=list)   # cities it was seen in
     store_count: int = 1                              # stores it was seen in
+    category: str = ""                                # meat category (set by the report)
     # Multi-buy deals ("2 ב-90"): `discounted_price` is always the PER-UNIT
     # promo price (comparable with `regular_price`); these keep the deal itself.
     min_qty: Optional[Decimal] = None                 # units needed (> 1 only)
@@ -681,6 +683,9 @@ class SupermarketReport:
     stores_scanned: list[str] = field(default_factory=list)  # "chain – store (city)"
     stores_by_region: dict[str, int] = field(default_factory=dict)
     promos_by_region: dict[str, int] = field(default_factory=dict)  # before the top-N cut
+    promos_by_category: dict[str, int] = field(default_factory=dict)  # before the top-N cut
+    # After the scan: grouped by category (in `_CATEGORIES` order), best deal
+    # first inside each category.
     promos: list[MeatPromo] = field(default_factory=list)
     error: Optional[str] = None
     # chain -> Hebrew reason. Failed = could not be scanned (login, files,
@@ -1188,41 +1193,93 @@ def scan_and_report() -> SupermarketReport:
 
 
 def _finalize_report(report: SupermarketReport) -> None:
-    """Dedupe, drop implausible rows and keep the best deals of each region."""
-    # Dedupe inside each region: the same promotion runs in many stores of a
-    # chain and often covers several item variants (different brands of the
-    # same cut). Keep one row per (region, chain, promotion_description,
-    # rounded savings_pct) and remember the cities / store count behind it.
-    seen: dict[tuple[str, str, str, int], MeatPromo] = {}
-    seen_stores: dict[tuple[str, str, str, int], set[str]] = {}
+    """Dedupe, drop implausible rows and keep the best deals of each category."""
+    # Dedupe: the same promotion runs in many stores of a chain and often
+    # covers several item variants (different brands of the same cut). Keep
+    # one row per (chain, promotion_description, rounded savings_pct) and
+    # remember the regions / cities / store count behind it.
+    seen: dict[tuple[str, str, int], MeatPromo] = {}
+    seen_stores: dict[tuple[str, str, int], set[str]] = {}
     for p in report.promos:
         pct = p.savings_pct
         if pct is None or pct <= 0 or pct >= _MAX_SANE_DISCOUNT_PCT:
             continue
-        key = (p.region, p.chain, p.promotion_description, int(pct))
+        key = (p.chain, p.promotion_description, int(pct))
         kept = seen.get(key)
         if kept is None:
             seen[key] = kept = p
             seen_stores[key] = set()
         seen_stores[key].add(p.store_id)
-        if p.city not in kept.cities:
+        for region in p.regions:
+            if region not in kept.regions:
+                kept.regions.append(region)
+        if p.city and p.city not in kept.cities:
             kept.cities.append(p.city)
+    order = {region: i for i, region in enumerate(_REGION_ORDER)}
     for key, kept in seen.items():
         kept.store_count = len(seen_stores[key])
+        kept.regions.sort(key=lambda r: order.get(r, len(order)))
+        kept.category = _categorize(kept)
 
-    def _rank_key(p: MeatPromo) -> tuple:
-        pct = p.savings_pct or Decimal("0")
-        amt = p.savings_amount or Decimal("0")
-        return (-float(pct), -float(amt))
-
-    # Best deals first, region by region; keep the top N of each region.
-    top_n = _top_per_region()
-    ranked: list[MeatPromo] = []
     for region in _REGION_ORDER:
-        in_region = sorted((p for p in seen.values() if p.region == region), key=_rank_key)
-        report.promos_by_region[region] = len(in_region)
-        ranked.extend(in_region[:top_n])
+        report.promos_by_region[region] = sum(1 for p in seen.values() if region in p.regions)
+
+    # One block per category, in the fixed category order, best deal first.
+    by_category: dict[str, list[MeatPromo]] = {}
+    for p in seen.values():
+        by_category.setdefault(p.category, []).append(p)
+    labels = [label for label, _kws in _CATEGORIES]
+    labels += sorted(c for c in by_category if c not in labels)
+    top_n = _top_per_category()
+    ranked: list[MeatPromo] = []
+    for label in labels:
+        pool = by_category.get(label)
+        if not pool:
+            continue
+        report.promos_by_category[label] = len(pool)
+        ranked.extend(_pick_for_category(pool, top_n))
     report.promos = ranked
+
+
+def _rank_key(p: MeatPromo) -> tuple:
+    pct = p.savings_pct or Decimal("0")
+    amt = p.savings_amount or Decimal("0")
+    return (-float(pct), -float(amt), p.chain, p.item_name)
+
+
+def _pick_for_category(pool: list[MeatPromo], top_n: int) -> list[MeatPromo]:
+    """Choose up to `top_n` deals of one category, returned best first.
+
+    1. every region that has a deal in this category gets at least one row;
+    2. then one row for every chain not shown yet (so the table compares
+       supermarkets instead of listing one chain ten times);
+    3. the remaining places go to the best deals left.
+    """
+    pool = sorted(pool, key=_rank_key)
+    picked: list[MeatPromo] = []
+
+    def _take(p: MeatPromo) -> None:
+        picked.append(p)
+        pool.remove(p)
+
+    for region in _REGION_ORDER:
+        if len(picked) >= top_n:
+            break
+        if any(region in p.regions for p in picked):
+            continue
+        best = next((p for p in pool if region in p.regions), None)
+        if best is not None:
+            _take(best)
+    for p in list(pool):
+        if len(picked) >= top_n:
+            break
+        if all(p.chain != q.chain for q in picked):
+            _take(p)
+    for p in list(pool):
+        if len(picked) >= top_n:
+            break
+        _take(p)
+    return sorted(picked, key=_rank_key)
 
 
 # ---- State persistence (so we can diff tomorrow if desired) ----
@@ -1274,18 +1331,27 @@ def print_report(report: SupermarketReport) -> None:
         console.print("[dim]No meat promos found today.[/dim]")
         return
     table = Table(show_header=True, header_style="bold")
-    table.add_column("Region", width=10)
+    table.add_column("Category", width=12)
     table.add_column("Chain", width=10)
+    table.add_column("Regions", width=12)
     table.add_column("Item")
     table.add_column("Was")
     table.add_column("Now")
     table.add_column("Off")
     table.add_column("Promo")
+    previous = None
     for p in report.promos:
+        category = p.category or _categorize(p)
+        if previous is not None and category != previous:
+            table.add_section()
         was = f"₪{p.regular_price}" if p.regular_price else "—"
         now = f"₪{p.discounted_price}" if p.discounted_price else "—"
         if p.deal_text:
             now += f" ({p.deal_text})"
         off = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
-        table.add_row(p.region, p.chain, p.item_name[:50], was, now, off, p.promotion_description[:40])
+        table.add_row(
+            category if category != previous else "", p.chain, ", ".join(p.regions),
+            p.item_name[:50], was, now, off, p.promotion_description[:40],
+        )
+        previous = category
     console.print(table)

@@ -32,7 +32,7 @@ Chromium is needed for pages that only render prices in JavaScript, for shops th
    - `PW_EMAIL_TO` — the address that should receive the emails.
    - `PW_SMTP_*` — Gmail works out of the box. You need an **app password**, not your normal password. Port 587 uses STARTTLS; port 465 uses implicit TLS.
    - `PW_FAILURE_THRESHOLD`, `PW_SANITY_JUMP_PCT`, `PW_DELAY_*` — check behaviour, see "How changes are detected".
-   - `PW_STORES_PER_REGION`, `PW_TOP_PER_REGION` — size of the supermarket scan and of its email section.
+   - `PW_STORES_PER_REGION`, `PW_TOP_PER_CATEGORY` — size of the supermarket scan and of each category table in the email.
    - `PW_LOG_LEVEL` — `DEBUG`, `INFO`, `WARNING` or `ERROR`. The `--log-level` option overrides it for one run.
 
 A missing or malformed setting is reported as a one-line `Error: …` and the command exits with a non-zero code.
@@ -89,7 +89,7 @@ When you `add` a URL, tracking parameters (`utm_*`, `gclid`, `fbclid`, `ref`, �
 | Site-wide promos | Home page of every shop in the watch list | A code is only paired with the percentage of the same offer. Category-only offers are not listed. |
 | Creatine | iHerb search (Israel store) | iHerb usually blocks plain requests, so this section needs Chromium. Powders only; first results page only. |
 | The Sims 4 | EA "all packs" store page | Only the first 50 packs the page serves are read; the email says so. |
-| Supermarket meat deals | Government-mandated price feeds of the large chains | Stores in the regions listed in `_REGIONS` (`supermarkets.py`). |
+| Supermarket meat deals | Government-mandated price feeds of the large chains | Stores in the regions listed in `_REGIONS` (`supermarkets.py`). One table per meat category, up to `PW_TOP_PER_CATEGORY` deals (default 10), with at least one deal from every region that has one. |
 
 If a section's scan fails, the email says which one and why, and the subject line names the failed sections.
 
