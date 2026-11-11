@@ -38,6 +38,10 @@ _PLIST_LABEL = "com.noada.price-watcher"
 _PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_PLIST_LABEL}.plist"
 _WIN_TASK_NAME = "PriceWatcherHourly"
 
+_DIGEST_PLIST_LABEL = "com.noada.price-watcher.digest"
+_DIGEST_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_DIGEST_PLIST_LABEL}.plist"
+_DIGEST_WIN_TASK_NAME = "PriceWatcherDailyDigest"
+
 
 def _repo_dir() -> Path:
     """Root of the price-watcher sub-project (two levels above this package)."""
@@ -448,3 +452,161 @@ def _schtasks_installed() -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Daily digest schedule (9 AM local)
+# ---------------------------------------------------------------------------
+
+def install_digest_schedule() -> None:
+    """Install the daily sales-digest job at 9 AM local time."""
+    if sys.platform == "darwin":
+        _install_digest_launchd()
+    elif sys.platform.startswith("win"):
+        _install_digest_schtasks()
+    else:
+        _console.print(
+            "[yellow]Unsupported platform for automatic scheduling. "
+            "Add a cron entry manually:[/yellow]\n"
+            f"  0 9 * * * {_venv_python()} -m price_watcher digest"
+        )
+
+
+def uninstall_digest_schedule() -> None:
+    """Remove the daily digest job."""
+    if sys.platform == "darwin":
+        _uninstall_digest_launchd()
+    elif sys.platform.startswith("win"):
+        _uninstall_digest_schtasks()
+    else:
+        _console.print("[yellow]No automatic schedule to remove on this platform.[/yellow]")
+
+
+def _install_digest_launchd() -> None:
+    log_dir().mkdir(parents=True, exist_ok=True)
+
+    plist_data = {
+        "Label": _DIGEST_PLIST_LABEL,
+        "ProgramArguments": [_venv_python(), "-m", "price_watcher", "digest"],
+        "WorkingDirectory": str(_repo_dir()),
+        "StartCalendarInterval": {"Hour": 9, "Minute": 0},
+        "RunAtLoad": False,
+        "StandardOutPath": str(log_dir() / "launchd.digest.out.log"),
+        "StandardErrorPath": str(log_dir() / "launchd.digest.err.log"),
+    }
+
+    if _DIGEST_PLIST_PATH.exists():
+        _bootout_digest_launchd()
+
+    _DIGEST_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _DIGEST_PLIST_PATH.open("wb") as f:
+        plistlib.dump(plist_data, f)
+
+    _console.print(f"Wrote plist to {_DIGEST_PLIST_PATH}")
+
+    uid = os.getuid()
+    result = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(_DIGEST_PLIST_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        result2 = subprocess.run(
+            ["launchctl", "load", "-w", str(_DIGEST_PLIST_PATH)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result2.returncode != 0:
+            _console.print(
+                f"[red]launchctl bootstrap failed:[/red] {result.stderr.strip()}\n"
+                f"[red]launchctl load -w also failed:[/red] {result2.stderr.strip()}"
+            )
+            return
+
+    _console.print("[green]Digest schedule installed (launchd, daily at 09:00).[/green]")
+
+
+def _install_digest_schtasks() -> None:
+    python_path = _venv_python()
+    pythonw = Path(python_path).parent / "pythonw.exe"
+    if pythonw.exists():
+        python_path = str(pythonw)
+
+    xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Price Watcher daily sales digest</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2024-01-01T09:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Settings>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>{python_path}</Command>
+      <Arguments>-m price_watcher digest</Arguments>
+      <WorkingDirectory>{_repo_dir()}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"""
+
+    xml_path = data_dir() / "task-scheduler-digest.xml"
+    xml_path.write_text(xml_content, encoding="utf-16")
+
+    result = subprocess.run(
+        ["schtasks", "/create", "/xml", str(xml_path),
+         "/tn", _DIGEST_WIN_TASK_NAME, "/f"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        _console.print(f"[red]schtasks /create failed:[/red] {result.stderr.strip()}")
+        return
+
+    _console.print("[green]Digest schedule installed (Task Scheduler, daily at 09:00).[/green]")
+
+
+def _bootout_digest_launchd() -> None:
+    uid = os.getuid()
+    result = subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(_DIGEST_PLIST_PATH)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        subprocess.run(
+            ["launchctl", "unload", str(_DIGEST_PLIST_PATH)],
+            capture_output=True, text=True, check=False,
+        )
+
+
+def _uninstall_digest_launchd() -> None:
+    if not _DIGEST_PLIST_PATH.exists():
+        _console.print("[yellow]Digest plist not found — not installed.[/yellow]")
+        return
+    _bootout_digest_launchd()
+    _DIGEST_PLIST_PATH.unlink(missing_ok=True)
+    _console.print("[green]Digest schedule removed.[/green]")
+
+
+def _uninstall_digest_schtasks() -> None:
+    result = subprocess.run(
+        ["schtasks", "/delete", "/tn", _DIGEST_WIN_TASK_NAME, "/f"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        _console.print(f"[red]schtasks /delete failed:[/red] {result.stderr.strip()}")
+        return
+    _console.print("[green]Digest schedule removed.[/green]")

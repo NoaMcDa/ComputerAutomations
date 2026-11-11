@@ -390,3 +390,84 @@ def send_test_email() -> None:
     log.info("Sending test email to %s", cfg.email_to)
     _send_via_smtp(payload, cfg)
     log.info("Test email sent successfully")
+
+
+# ---------------------------------------------------------------------------
+# Daily sales digest
+# ---------------------------------------------------------------------------
+
+def build_digest_payload(digests) -> EmailPayload | None:
+    """Build the daily digest email payload. Returns None if nothing to report."""
+    from price_watcher.digest import SiteDigest  # lazy to avoid circular import
+    digests: list[SiteDigest] = list(digests)
+    if not digests:
+        return None
+
+    count_with_promo = sum(1 for d in digests if d.status == "ok" and d.promo and d.promo.discount_pct > 0)
+    if count_with_promo > 0:
+        subject = f"Daily sales digest: {count_with_promo} site{'s' if count_with_promo != 1 else ''} with active promos"
+    else:
+        subject = "Daily sales digest: no active promos today"
+
+    text_lines = ["Daily sales digest", "=" * 40, ""]
+    html_rows = []
+    for d in digests:
+        if d.status == "ok" and d.promo and d.promo.discount_pct > 0:
+            pct = d.promo.discount_pct
+            code_part = f" with code {d.promo.code}" if d.promo.code else ""
+            cond_part = f" ({d.promo.condition})" if d.promo.condition else ""
+            text_lines.append(f"• {d.display_name}: {pct}% off{code_part}{cond_part}")
+            html_rows.append(
+                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
+                f'<td style="padding:6px 12px">{pct}% off'
+                + (f' with code <code>{escape(d.promo.code)}</code>' if d.promo.code else '')
+                + (f'<br><span style="color:#666;font-size:13px">{escape(d.promo.condition or "")}</span>' if d.promo.condition else '')
+                + '</td></tr>'
+            )
+        elif d.status == "ok" and d.promo and d.promo.discount_pct == 0:
+            text_lines.append(f"• {d.display_name}: tiered promo ({d.promo.condition or 'up-to'})")
+            html_rows.append(
+                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
+                f'<td style="padding:6px 12px;color:#666">tiered promo (up-to, not computable)</td></tr>'
+            )
+        elif d.status == "no_banner":
+            text_lines.append(f"• {d.display_name}: no site-wide promo detected")
+            html_rows.append(
+                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
+                f'<td style="padding:6px 12px;color:#999">no site-wide promo detected</td></tr>'
+            )
+        else:
+            text_lines.append(f"• {d.display_name}: {d.status} ({d.error or '—'})")
+            html_rows.append(
+                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
+                f'<td style="padding:6px 12px;color:#c33">{escape(d.status)}: {escape(d.error or "—")}</td></tr>'
+            )
+
+    text_body = "\n".join(text_lines) + "\n\n— Price Watcher\n"
+    html_body = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8"></head>'
+        '<body style="font-family:sans-serif;padding:16px;max-width:600px">'
+        '<h2>Daily sales digest</h2>'
+        '<table style="border-collapse:collapse;width:100%">'
+        + "".join(html_rows)
+        + '</table>'
+        '<p style="color:#999;font-size:12px;margin-top:24px">— Price Watcher</p>'
+        '</body></html>'
+    )
+    return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
+
+
+def send_digest_email(digests) -> bool:
+    """Send the daily digest email. Returns True on success, False on failure."""
+    payload = build_digest_payload(digests)
+    if payload is None:
+        log.info("No digest to send (no sites)")
+        return True
+    cfg = _config_module.load().email
+    try:
+        _send_via_smtp(payload, cfg)
+        log.info("Digest email sent to %s", cfg.email_to)
+        return True
+    except (smtplib.SMTPException, OSError) as exc:
+        log.error("Digest email send failed: %s", type(exc).__name__)
+        return False

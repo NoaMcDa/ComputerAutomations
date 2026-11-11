@@ -90,5 +90,28 @@ def status() -> None:
     _status()
 
 
+@app.command()
+def digest(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Collect + print, but do not email"),
+) -> None:
+    """Send the daily sales digest: for each watched site, current promo banner (if any)."""
+    from price_watcher.digest import run_digest
+    run_digest(dry_run=dry_run)
+
+
+@app.command(name="install-digest-schedule")
+def install_digest_schedule() -> None:
+    """Install the daily digest job at 9 AM local time."""
+    from price_watcher.scheduler import install_digest_schedule as _install
+    _install()
+
+
+@app.command(name="uninstall-digest-schedule")
+def uninstall_digest_schedule() -> None:
+    """Remove the daily digest job."""
+    from price_watcher.scheduler import uninstall_digest_schedule as _uninstall
+    _uninstall()
+
+
 if __name__ == "__main__":
     app()
