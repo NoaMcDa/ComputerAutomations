@@ -11,9 +11,18 @@ ids to cities; every store of every chain inside those regions is scanned
 with no store there are skipped. The report keeps the best
 `PW_TOP_PER_REGION` deals (default 30) for each region, best first.
 
-Filters promotions down to items whose product name matches any Hebrew
-meat / deli keyword (fresh cuts, poultry, processed, cold cuts), excluding
-fish, dairy, and plant-based.
+For every store the newest PromoFull and PriceFull of the chain's own chain
+id are paired; files older than `_MAX_FEED_AGE_DAYS` are ignored. Chains that
+fail (login, no files, downloads) or return no meat deals are listed in the
+report (`chains_failed` / `chains_empty`) instead of silently disappearing.
+
+Only fresh / frozen raw meat and poultry cuts are kept (`_is_meat_product`):
+a Hebrew meat word in the product name (an unambiguous cut, two meat words,
+or one meat word plus a freshness / weighed-item signal from the feed), and
+no exclusion word (fish, pet food, dairy, plant-based, processed / deli,
+ready meals, snacks, non-food) in the name, the manufacturer or the promotion
+description. Multi-buy promotions ("2 ב-90") are converted to a per-unit
+price; compensation credits and payment-method discounts are skipped.
 """
 
 from __future__ import annotations
@@ -24,8 +33,9 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
-from decimal import Decimal
+from collections import Counter
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
 
@@ -48,10 +58,11 @@ _PP_BASE = "https://url.publishedprices.co.il"
 # Chains hosted on the shared Cerberus host at url.publishedprices.co.il.
 # Login credentials are publicly documented (law mandates free access).
 # (cerberus_username, chain_display_name)
+# Hazi Hinam is not listed: its account on this host lists no files any more
+# (it publishes on its own site now), so it could only ever come back empty.
 _PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
     ("RamiLevi", "רמי לוי"),
     ("yohananof", "יוחננוף"),
-    ("HaziHinam", "חצי חינם"),
     ("osherad", "אושר עד"),
     ("TivTaam", "טיב טעם"),
     ("Keshet", "קשת טעמים"),
@@ -227,176 +238,387 @@ def _candidates_by_region(stores: list[StoreInfo]) -> dict[str, list[StoreInfo]]
     return out
 
 
-_FEED_FILE_RE = re.compile(r"-(\d{3})-(\d{3,4})-(\d{8})-?(\d{4,6})")
+# <Kind><13-digit chain id>-[<subchain>-]<store>-<YYYYMMDD>[-]<HHMM[SS]>, e.g.
+# PromoFull7290027600007-001-001-20261111-032159.gz or (Keshet)
+# PromoFull7290785400000-105-202611110010.gz. Placeholders such as
+# PromoFull0000000000000-00-1-202411010501.gz do not match; files of another
+# chain id or from an old year (PriceFull7290055700007-0820-202403281445.gz in
+# Keshet's listing) are filtered out by `_latest_by_store`.
+_FEED_FILE_RE = re.compile(r"(\d{13})-(?:(\d{3})-)?(\d{3,4})-(\d{8})-?(\d{4,6})")
+
+# Feeds are refreshed daily; anything older is a leftover from a closed store
+# or a stale upload and must not be paired with today's prices.
+_MAX_FEED_AGE_DAYS = 7
 
 
-def _latest_by_store(names: list[str]) -> dict[int, str]:
-    """Map store id -> newest feed filename/URL for that store."""
-    best: dict[int, tuple[str, str]] = {}
+def _latest_by_store(
+    names: list[str],
+    chain_id: Optional[str] = None,
+    max_age_days: Optional[int] = _MAX_FEED_AGE_DAYS,
+    now: Optional[datetime] = None,
+) -> dict[int, str]:
+    """Map store id -> newest feed filename/URL for that store.
+
+    Only files of one chain id are used: `chain_id` when given, otherwise the
+    chain id most of the listed files carry (listings sometimes contain files
+    of another chain). Files older than `max_age_days` are dropped.
+    """
+    parsed: list[tuple[str, int, str, str]] = []  # (chain, store, stamp, name)
     for name in names:
-        m = _FEED_FILE_RE.search(name.split("?")[0])
+        m = _FEED_FILE_RE.search(name.split("?")[0].rsplit("/", 1)[-1])
         if not m:
             continue
-        sid, stamp = int(m.group(2)), m.group(3) + m.group(4)
+        parsed.append((m.group(1), int(m.group(3)), m.group(4) + m.group(5).ljust(6, "0"), name))
+    if not parsed:
+        return {}
+    if chain_id is None:
+        chain_id = Counter(p[0] for p in parsed).most_common(1)[0][0]
+    cutoff = None
+    if max_age_days is not None:
+        cutoff = ((now or datetime.now()) - timedelta(days=max_age_days)).strftime("%Y%m%d")
+    best: dict[int, tuple[str, str]] = {}
+    for chain, sid, stamp, name in parsed:
+        if chain != chain_id:
+            continue
+        if cutoff is not None and stamp[:8] < cutoff:
+            continue
         if sid not in best or stamp > best[sid][0]:
             best[sid] = (stamp, name)
     return {sid: name for sid, (_stamp, name) in best.items()}
 
 
-# Categories for grouping meat promos side-by-side across chains.
-# Order matters: more specific categories must come before generic ones.
-_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    # --- Specific premium cuts (match before generic cut names) ---
-    ("פילה מיניון",            ("פילה מיניון", "פילה-מיניון")),
-    ("פיקניה",                 ("פיקניה",)),
-    ("אנטריקוט",               ("אנטריקוט",)),
-    ("סינטה",                  ("סינטה",)),
-    ("טי-בון",                 ("ט-בון", "טיבון")),
-    ("צ'אק",                   ("צ'אק", "צ'ק")),
-    ("פלאנק / ראמפ",           ("פלאנק", "ראמפ")),
-    ("אסאדו",                  ("אסאדו",)),
-    ("בריסקט",                 ("בריסקט", "בריסקיט")),
-    ("אוסובוקו",               ("אוסובוקו", "אוסו בוקו")),
-    ("גולש",                   ("גולש", "גולאש")),
-    ("כתף",                    ("כתף",)),
-    ("שריר / חגורה",           ("שריר", "חגורה")),
-    ("צלעות",                  ("צלעות",)),
-    ("סטייק",                  ("סטייק",)),
-    ("פילה בקר",               ("פילה",)),
-    # --- Organ cuts ---
-    ("לשון בקר",               ("לשון",)),
-    ("מוח",                    ("מוח",)),
-    ("גרון",                   ("גרון",)),
-    ("קרביים, קורקבן וכרעיים", ("קרביים", "קורקבן", "כרעיים")),
-    # --- Veal / lamb / baby ---
-    ("בייבי בקר",              ("בבי בקר", "בייבי בקר", "בייבי-בקר")),
-    ("עגל",                    ("עגל",)),
-    ("כבש / טלה",              ("כבש", "טלה")),
-    # --- Liver / ground ---
-    ("כבד בקר",                ("כבד בקר",)),
-    ("כבד עוף",                ("כבד עוף", "כבד")),
-    ("צלי בקר",                ("צלי",)),
-    ("בשר טחון",               ("בשר טחון",)),
-    ("בקר – כללי",             ("בקר",)),
-    # --- Chicken parts (specific first) ---
-    ("חזה עוף",                ("חזה עוף",)),
-    ("כנפיים",                 ("כנפיים",)),
-    ("ירכיים",                 ("ירכיים", "ירך עוף")),
-    ("שוקיים",                 ("שוקיים", "שוק עוף")),
-    ("פולקע",                  ("פולקע", "פולקות")),
-    ("פרגיות",                 ("פרגית", "פרגיות")),
-    ("הודו",                   ("חזה הודו", "הודו")),
-    ("עוף – אחר",              ("עוף",)),
-    ("בשר – אחר",              ("בשר",)),
+def _dominant_chain_id(*name_lists: list[str]) -> Optional[str]:
+    """The chain id carried by most feed files across the given listings."""
+    ids = Counter(
+        m.group(1)
+        for names in name_lists
+        for name in names
+        if (m := _FEED_FILE_RE.search(name.split("?")[0].rsplit("/", 1)[-1]))
+    )
+    return ids.most_common(1)[0][0] if ids else None
+
+
+# ---- Hebrew word matching helpers ----
+
+_HEB = "א-ת"
+
+
+def _norm(text: str) -> str:
+    """Unify Hebrew geresh / gershayim so 'ק״ג' and 'ק"ג' compare equal."""
+    return (text or "").replace("״", '"').replace("׳", "'").replace("`", "'")
+
+
+def _alt(words) -> str:
+    return "|".join(sorted((re.escape(_norm(w)) for w in words), key=len, reverse=True))
+
+
+def _words_pat(words, prefixes: str = "", stem: bool = False) -> re.Pattern:
+    """Match whole Hebrew words (or word stems when `stem`).
+
+    `prefixes` are one-letter Hebrew prefixes allowed in front of the word
+    (ו/ה/ל/ב/מ/כ/ש). A stem match accepts any Hebrew suffix, so 'חתול' also
+    catches 'חתולים' and, with prefix 'ל', 'לחתול'.
+    """
+    pre = f"[{prefixes}]?" if prefixes else ""
+    end = "" if stem else f"(?![{_HEB}])"
+    return re.compile(f"(?<![{_HEB}]){pre}(?:{_alt(words)}){end}", re.IGNORECASE)
+
+
+_PREFIXES = "הולבמכש"
+
+
+# ---- Categories ----
+# Grouping for the email. The product NAME is matched first (whole words);
+# the promotion description is only consulted when the name gives nothing.
+# Rules are tried in order; a rule with a species only applies when the name
+# names that species (poultry / lamb), everything else is treated as beef/veal.
+
+_POULTRY_WORDS = ("עוף", "עופות", "הודו", "פרגית", "פרגיות", "פטם", "אווז", "ברווז")
+_LAMB_WORDS = ("כבש", "טלה")
+
+_CATEGORY_RULES: tuple[tuple[str, Optional[str], tuple[str, ...]], ...] = (
+    # label, species ("*" = any, None = beef / unknown), keywords
+    ("בשר טחון",                  "*",       ("טחון", "טחונה")),
+    ("כבש / טלה",                 "lamb",    _LAMB_WORDS),
+    # --- Poultry ---
+    ("הודו",                      "poultry", ("הודו",)),
+    ("אווז וברווז",               "poultry", ("אווז", "ברווז")),
+    ("פרגיות",                    "poultry", ("פרגית", "פרגיות")),
+    ("חזה / פילה עוף",            "poultry", ("חזה", "פילה")),
+    ("כנפיים",                    "poultry", ("כנפיים", "כנף", "כנפי")),
+    ("כרעיים",                    "poultry", ("כרעיים", "כרעים", "כרעי", "קוקטייל")),
+    ("ירכיים",                    "poultry", ("ירכיים", "ירך", "ירכי")),
+    ("שוקיים",                    "poultry", ("שוקיים", "שוק", "שוקי")),
+    ("פולקע",                     "poultry", ("פולקע", "פולקות")),
+    ("כבד עוף",                   "poultry", ("כבד",)),
+    ("קרביים, קורקבן ולבבות",     "poultry", ("קרביים", "קורקבן", "קורקבנים", "לבבות", "לב")),
+    ("גרון וצוואר",               "poultry", ("גרון", "גרונות", "צוואר")),
+    ("עוף שלם",                   "poultry", ("שלם",)),
+    ("עוף – אחר",                 "poultry", _POULTRY_WORDS),
+    # --- Beef / veal: specific premium cuts first ---
+    ("פילה מיניון",               None, ("פילה מיניון", "פילה-מיניון")),
+    ("פיקניה",                    None, ("פיקניה",)),
+    ("אנטריקוט",                  None, ("אנטריקוט", "ריב איי")),
+    ("סינטה",                     None, ("סינטה",)),
+    ("טי-בון",                    None, ("ט-בון", "טי-בון", "טי בון", "טיבון")),
+    ("צ'אק",                      None, ("צ'אק",)),
+    ("פלאנק / ראמפ",              None, ("פלאנק", "ראמפ")),
+    ("אסאדו",                     None, ("אסאדו", "אונטריב", "אונטר ריב")),
+    ("בריסקט",                    None, ("בריסקט", "בריסקיט", "חזה")),
+    ("אוסובוקו",                  None, ("אוסובוקו", "אוסבוקו", "אוסו בוקו")),
+    ("גולש",                      None, ("גולש", "גולאש")),
+    ("כתף",                       None, ("כתף",)),
+    ("שריר / חגורה",              None, ("שריר", "חגורה", "זרוע")),
+    ("צלעות",                     None, ("צלעות", "צלע")),
+    ("סטייק",                     None, ("סטייק", "דלמוניקו")),
+    ("פילה בקר",                  None, ("פילה",)),
+    # --- Organs ---
+    ("לשון בקר",                  None, ("לשון",)),
+    ("מוח",                       None, ("מוח", "מח")),
+    ("גרון וצוואר",               None, ("גרון", "גרונות", "צוואר")),
+    ("קרביים ולבבות",             None, ("קרביים", "לבבות", "לב")),
+    ("כבד בקר",                   None, ("כבד",)),
+    # --- Generic ---
+    ("בייבי בקר",                 None, ("בבי בקר", "בייבי בקר", "בייבי-בקר")),
+    ("צלי בקר",                   None, ("צלי",)),
+    ("עגל",                       None, ("עגל", "עגלה")),
+    ("בקר – כללי",                None, ("בקר",)),
+    ("בשר – אחר",                 None, ("בשר",)),
 )
 _CATEGORY_OTHER = "אחר"
 
+_POULTRY_PAT = _words_pat(_POULTRY_WORDS, prefixes="ו")
+_LAMB_PAT = _words_pat(_LAMB_WORDS, prefixes="ו")
+_CATEGORY_PATS: tuple[tuple[str, Optional[str], re.Pattern], ...] = tuple(
+    (label, species, _words_pat(kws, prefixes="ו")) for label, species, kws in _CATEGORY_RULES
+)
+
+# (label, keywords) in display order, labels de-duplicated (email_sender
+# orders its groups by this).
+_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
+    (label, tuple(kw for lb, _sp, kws in _CATEGORY_RULES if lb == label for kw in kws))
+    for label in dict.fromkeys(lb for lb, _sp, _kws in _CATEGORY_RULES)
+)
+
+
+def _species(text: str) -> Optional[str]:
+    if _LAMB_PAT.search(text):
+        return "lamb"
+    if _POULTRY_PAT.search(text):
+        return "poultry"
+    return None
+
+
+def _categorize_text(text: str, species: Optional[str]) -> Optional[str]:
+    if not text.strip():
+        return None
+    for label, rule_species, pat in _CATEGORY_PATS:
+        if rule_species != "*" and rule_species != species:
+            continue
+        if pat.search(text):
+            return label
+    return None
+
 
 def _categorize(promo: "MeatPromo") -> str:
-    """Return the category key for a promo (first matching category wins)."""
-    text = f"{promo.item_name} {promo.promotion_description}"
-    for cat_name, keywords in _CATEGORIES:
-        for kw in keywords:
-            if kw in text:
-                return cat_name
-    return _CATEGORY_OTHER
+    """Category label for a promo: by item name, else by promotion description.
 
-
-# ---- Hebrew keyword classifier ----
-
-_MEAT_KEYWORDS: tuple[str, ...] = (
-    # Fresh beef / cow parts
-    "בשר", "בקר", "עגל", "כבש", "טלה", "כבד",
-    "אנטריקוט", "פילה", "סטייק", "צלעות", "צלי",
-    # Specific cuts (Hebrew / Argentinian / international)
-    "אסאדו", "בריסקט", "בריסקיט", "פיקניה", "סינטה",
-    "אוסובוקו", "אוסו בוקו", "פלאנק", "ראמפ",
-    "ט-בון", "טיבון", "צ'אק", "צ'ק",
-    "כתף", "שריר", "חגורה", "גולש", "גולאש",
-    "פילה מיניון", "פילה-מיניון",
-    "בבי בקר", "בייבי בקר", "בייבי-בקר",
-    # Organ / utility cuts
-    "מוח", "גרון", "קורקבן", "קרביים", "כרעיים",
-    "פולקע", "פולקות", "לשון",
-    # Fresh poultry parts
-    "עוף", "הודו", "פרגית", "פרגיות",
-    "שוקיים", "כנפיים", "חזה עוף", "חזה הודו", "ירך עוף", "שוק עוף",
-    "אטליז",
-)
-
-_EXCLUDE_KEYWORDS: tuple[str, ...] = (
-    # Fish / seafood
-    "דג", "סלמון", "טונה", "סרדין", "הרינג", "שרימפ", "קרפיון",
-    "אמנון", "דניס", "לברק", "פורל", "בורי", "מושט", "נילוס",
-    "סיבס", "מוסר", "פילה דג", "דג סלמון",
-    "גפילטע", "פיש", "מולים",
-    # Plant-based
-    "טבעוני", "צמחוני", "צמחי", "VEGAN", "ווגן",
-    "סויה", "טופו", "סייטן",
-    "טבעול", "ביונד", "beyond",
-    "ללא בשר", "ללא עוף",
-    # Dairy / cheese
-    "חלבי", "גבינה", "גאודה", "גאודת", "אמנטל", "מוצרלה", "צ'דר",
-    "קוטג", "לבנה",
-    # Processed / deli (user wants fresh cuts only, not cured / smoked / cooked)
-    "נקניק", "נקניקיה", "פסטרמה", "סלמי", "קבנוס",
-    "קבב", "המבורגר", "קציצה", "קציצות",
-    "שווארמה", "צ'וריסו", "מרגז", "מרגז'",
-    "שניצל", "שיפוד",
-    "מעושן", "מעושנ", "מתובל", "בייקון", "פסטרמ",
-    "סלסול", "סלסולי",  # deli slices
-    "דק דק",
-    # Packaged soups / broths / spices / bouillon
-    "מרק", "אבקת", "בטעם", "קוביות", "בולון",
-    # Not food (sanitary / household that mentions meat keywords)
-    "תחבושות", "קוטקס", "אולווייז", "טמפון", "מגבונים", "חיתולים",
-    # Pet food
-    "חתולים", "כלבים", "חיות", "חיות מחמד",
-    "פריסקיז", "פרוסקיז", "רויאל", "פרוקל", "פרופלן", "ווסקוויק",
-    "ווסקס", "סמלט", "פדיגרי", "פרינה", "פטה",
-    # Breaded / coated / nuggets (processed kids products)
-    "בציפוי", "ציפוי", "נאגטס", "נתחונים",
-    # Instant / soluble soup
-    "נמס", "נמס בכוס", "בכוס",
-    # More cheeses
-    "בולגרית", "בולגרי", "פטה גבינה",
-    # Confusing
-    "מדומה",  # mock steak (often fish/soy)
-    # Noodles / snacks / frozen processed shapes / kitchenware / cat food brands
-    "נודלס", "צ'יפס", "ציפס", "נגיסי", "נגיסים", "כוכבי",
-    "סכין", "קרש", "פנסי", "פיסט",
-    "תיבול", "תבלין", "תבלינים",
-)
-
-
-# A Hebrew-safe word-boundary: the keyword must be preceded/followed by a non-letter
-# (space, punctuation, digit, or start/end). Prevents "לב" matching "שלב".
-def _build_keyword_pattern() -> re.Pattern:
-    escaped = sorted((re.escape(k) for k in _MEAT_KEYWORDS), key=len, reverse=True)
-    return re.compile(
-        r"(?:^|[^א-ת])(?:" + "|".join(escaped) + r")(?:$|[^א-ת])",
-        re.UNICODE,
+    The species comes from the name; only when the name names none (e.g.
+    "כבד במגש לצלייה") is it taken from the description ("כבד עוף טרי").
+    """
+    name = _norm(promo.item_name)
+    desc = _norm(promo.promotion_description)
+    species = _species(name) or _species(desc)
+    return (
+        _categorize_text(name, species)
+        or _categorize_text(desc, _species(desc) or species)
+        or _CATEGORY_OTHER
     )
 
 
-_MEAT_PAT = _build_keyword_pattern()
+# ---- Meat classifier ----
+#
+# Gate 1 (exclusions): a non-meat word in the product name, the manufacturer
+# or (for the subset that is safe there) the promotion description rejects
+# the item. Gate 2 (meat evidence) needs one of:
+#   * an unambiguous cut / species word ("אנטריקוט", "שוקיים", "כבש"), or
+#   * two different meat words ("חזה עוף", "בשר בקר", "פילה עוף"), or
+#   * one ambiguous meat word ("כתף", "לשון", "בקר") plus a freshness word in
+#     the name ("טרי", "קפוא", "ק"ג") or the feed marking it as weighed.
+# The feed's bIsWeighted flag alone is not enough: weighed cheeses, spices,
+# fish and deli are sold the same way.
+
+# Words that on their own identify a raw meat / poultry cut.
+_MEAT_STRONG: tuple[str, ...] = (
+    "עגל", "כבש", "טלה",
+    "אנטריקוט", "אסאדו", "פיקניה", "סינטה", "בריסקט", "בריסקיט", "שייטל",
+    "אוסובוקו", "אוסבוקו", "אוסו בוקו", "פלאנק", "ראמפ", "דנבר", "טומהוק",
+    "ריב איי", "ט-בון", "טי-בון", "טי בון", "פילה מיניון", "פילה-מיניון",
+    "מינוט סטייק", "דלמוניקו", "צ'אק", "אונטריב", "אונטר ריב", "ספריבס",
+    "גולש", "גולאש", "בבי בקר", "בייבי בקר", "בייבי-בקר",
+    "פרגית", "פרגיות", "שוקיים", "כרעיים", "כרעים", "ירכיים",
+    "קורקבן", "קורקבנים", "קרביים", "פולקע", "פולקות", "ניקור",
+    "אטליז", "נתח קצבים", "חזיר", "חזירון",
+)
+
+# Meat words that also occur in non-meat products ("לכסניות גרון",
+# "אורז בסמטי הודו", "תיק כתף", "בקר השקיה", "כנפיים" on sanitary pads).
+_MEAT_AMBIGUOUS: tuple[str, ...] = (
+    "בשר", "בקר", "עוף", "הודו", "אווז", "ברווז", "עגלה", "פטם",
+    "כתף", "לשון", "גרון", "גרונות", "מוח", "שריר", "חגורה", "זרוע", "צלי",
+    "כבד", "סטייק", "צלעות", "צלע", "כנפיים", "כנף", "כנפי",
+    "חזה", "ירך", "ירכי", "שוקי", "כרעי", "צוואר", "לסת", "רוסטביף", "לרוסטביף",
+)
+
+# Meat words that are too common elsewhere to count on their own even with a
+# freshness signal (ground spices, fish fillets, palm hearts, "שוק." chocolate,
+# celery heads): they only count as the second word of a pair ("פילה עוף").
+_MEAT_WEAK: tuple[str, ...] = (
+    "טחון", "טחונה", "פילה", "לב", "לבבות", "שוק", "גב", "ראש", "רגל", "זנב",
+    "נתח", "נתחי", "קוקטייל",
+)
+
+# Freshness / butcher-counter words that make a single ambiguous word credible.
+_FRESH_MARKERS: tuple[str, ...] = (
+    "טרי", "טריה", "טריים", "טריות", "קפוא", "קפואה", "קפואים", "קפואות",
+    "מוכשר", "צרכני", "צרכנית", "חלק", "גלאט", "מהדרין", "ארוז", "במגש",
+    "לצליה", "לצלייה", "לטחינה", "עצמי", "ק\"ג", "קג", "לק\"ג", "לקג", "ק\"ג.",
+)
+
+# Exclusions matched as word STEMS with an optional one-letter prefix.
+_EXCLUDE_STEMS: tuple[str, ...] = (
+    # Fish / seafood
+    "דג", "סלמון", "טונה", "סרדין", "הרינג", "שרימפ", "קרפיון", "אמנון", "דניס",
+    "לברק", "פורל", "מושט", "נילוס", "סיבס", "ברמונדי", "ברבוני", "מקרל",
+    "הליבוט", "פנגסיוס", "בקלה", "הייק", "מרלוז", "טילפי", "לוקוס", "טרית",
+    "אנשובי", "שפרוט", "קלמרי", "תמנון", "סרטן", "מולים", "גפילטע", "פיש",
+    "סושי", "קוויאר", "מטיאס", "אינטיאס", "ילוטייל", "אלבקור", "טראכון", "בוניטו",
+    "אלתית", "פארידה", "לקרדה", "זהבון", "נסיכת", "אדמונית", "מקרוסקה", "פלמידה",
+    # Pet food
+    "חתול", "חתלת", "כלב", "פריסקיז", "פרוסקיז", "רויאל", "פרוקל", "פרופלן",
+    "ווסקס", "ויסקס", "ווסקוויק", "סמלט", "פדיגרי", "פורינה", "פנסי", "פיסט",
+    "דוגלי", "בונזו", "רנדי", "דלידוג", "דלידג", "פאוץ",
+    "נוטרילאב", "חטיף",
+    # Plant-based
+    "טבעונ", "צמחונ", "צמחי", "סויה", "טופו", "סייטן", "טבעול", "ביונד",
+    "תחליפ", "רידפיין", "רידיפיין", "vegan", "ווגן", "beyond",
+    # Dairy
+    "גבינ", "גאוד", "אמנטל", "מוצרל", "צ'דר", "קוטג", "לבנה", "לאבנה", "חלב",
+    "יוגורט", "שמנת", "קממבר", "בולגרי", "חמאה", "צפתית", "עיזים", "חלומי",
+    "מנצגו", "פרמזן", "מסקרפונה", "טבורוג",
+    # Processed / deli / ready meals (fresh cuts only)
+    "נקניק", "פסטרמ", "סלמי", "קבנוס", "קבב", "המבורגר", "קציצ", "שווארמ", "שוארמ",
+    "צ'וריסו", "מרגז", "שניצל", "מעושן", "מעושנ", "עישון", "מתובל",
+    "בייקון", "סלסול", "נאגטס", "נגיס", "כוכבי", "צונגו", "אצבעות", "ציפוי",
+    "פריך", "קריספי", "נתחונ", "מוקפץ", "מבושל", "ממול", "מילוי", "קרפצ'יו",
+    "קרפציו", "פרושוטו", "ג'רקי", "בילטונג", "ממרח", "מעדן", "מחית", "כיסונ",
+    "כיסוני", "פלמני", "פלמיני", "ורניקי", "גיוזה", "בורקס", "פשטיד", "מאפה",
+    "פיצה", "לחמני", "כריך", "סנדוויץ", "ארוח", "ברביקיו", "מפולפל", "בדבש",
+    "זוגלובק", "קורנביף", "קורנד", "רוטב", "מוכן", "שימורי", "בלינצס", "בלינציס",
+    "אגרול", "נקנק", "פסטל", "כבוש", "פפרוני", "פיקנטי", "ויצינה", "רולדה",
+    "בוזנינה", "פייקון", "כמהין", "חינקלי", "קרפלך", "טושונקה", "גרקי", "צומח",
+    "הצומח", "מהצומח", "המצומח", "צאנק", "מעובד", "רומני", "קישקע", "פריזר",
+    "בורגר", "סטייקבורגר", "דקניק", "דקדק", "אמפנד", "סיגר", "ממתק", "אסיתי",
+    # Other foods, spices, snacks
+    "נודלס", "אטריות", "מגיק", "ראמן", "צ'יפס", "ציפס", "תירס", "חציל", "פטרי",
+    "סלט", "תבלין", "תבלינ", "תיבול", "אבקת", "בולון", "קוביית", "מרק", "טעם",
+    "אורז", "לכסני", "פסטה", "פתיתים", "קרקר", "במבה", "ביסלי", "סוכרי",
+    "שוקולד", "עוגי", "דקל", "חסה", "קיסר", "ארטישוק", "לקישוט", "מרשמלו",
+    # Not food
+    "תחבוש", "קוטקס", "אולוו", "טמפון", "מגבונ", "חיתול", "סכין", "קרש",
+    "שקית", "שקיות", "מנקה", "השקיה", "ספוג", "מברשת", "תבנית", "מלקחי", "כפפ",
+)
+
+# Exclusions that must match the whole word (too short / too common as stems).
+_EXCLUDE_WORDS: tuple[str, ...] = (
+    "קוד", "מוסר", "סול", "בורי", "גור", "גורים", "בוגר", "קיטן", "מחמד", "חיות",
+    "פטה", "מוס", "קובה", "קובות", "באו", "באן", "גריל", "לוף", "ציר", "לחם",
+    "פרמיו", "פרימיו", "גומי", "תיק", "פד", "פדים", "סיר", "קט", "דוג", "וואן", "דים סאם", "פאד תאי", "מנה חמה",
+    "פירות ים", "ללא בשר", "ללא עוף", "סגנון", "דמוי", "דמויי", "מאמא עוף",
+    "דק דק", "צלוי", "בס", "באס", "בסה", "ים", "סל", "ברי", "אדם", "לקס", "פסט",
+    "קרם", "כמו", "טירת", "מונג", "פוף", "שום", "דורות", "קרח",
+)
+
+# Exclusions matched as stems but without a prefix letter ("לשיפודים" = cubes
+# for skewers is a raw cut, "שיפודי פרגית" is a prepared product).
+_EXCLUDE_STEMS_NO_PREFIX: tuple[str, ...] = ("שיפוד",)
+
+# Abbreviations: "גב." = cheese, "שוק." = chocolate, "ש." = schnitzel,
+# "פסט." = pastrami.
+_EXCLUDE_ABBREV_PAT = re.compile(r"(?<![א-ת])(?:גב|שוק|ש|פסט|פי)\.")
+
+# Exclusions that are safe to apply to the promotion description as well:
+# a description naming fish, pets, substitutes or non-meat goods reveals what
+# a truncated product name really is ("פילה סל" → "מנות סלמון").
+_DESC_EXCLUDE_STEMS: tuple[str, ...] = (
+    "דג", "סלמון", "טונה", "הרינג", "מקרל", "ברמונדי", "ברבוני", "אמנון", "דניס",
+    "לברק", "פורל", "סושי",
+    "חתול", "חתלת", "כלב", "רנדי", "פאוץ", "שלוקים", "סקוויז",
+    "דוגלי", "בונזו", "פריסקיז", "פנסי", "דלידוג", "חטיף",
+    "תחליפ", "טבעונ", "צמחונ", "טבעול", "רידפיין", "רידיפיין",
+    "נודלס", "מגיק", "אטריות", "ראמן", "תבלינ", "תבלין", "סלטי", "פטרי", "ציפס",
+    "צ'יפס", "תירס", "מטוגנ", "זוגלובק", "תחבוש",
+)
+_DESC_EXCLUDE_WORDS: tuple[str, ...] = ("דים סאם", "מזון", "מנה חמה", "פרמיו", "פרימיו")
+
+# Manufacturers that only make non-meat / processed products.
+_EXCLUDE_MANUFACTURERS: tuple[str, ...] = (
+    "פורינה", "פריסקיז", "פנסי פיסט", "ראפא", "טבעול", "רידיפיין", "רידפיין",
+    "דגים", "דגת", "דים סאם", "נודלס", "אסם", "קנור", "יוניליוור", "תבליני",
+    "סלטי", "גבינות", "מחלבות", "קוטקס", "שלושת האופים", "מאמא עוף", "זוגלובק",
+    "יחיעם", "מעדני", "חטיפי", "דלידג", "טירת צבי",
+)
+
+_MEAT_STRONG_PAT = _words_pat(_MEAT_STRONG, prefixes="ול")  # "קוביות בקר לגולש"
+_MEAT_AMBIG_PAT = _words_pat(_MEAT_AMBIGUOUS, prefixes="ו")
+_MEAT_WEAK_PAT = _words_pat(_MEAT_WEAK, prefixes="ו")
+_EXCLUDE_STEM_NP_PAT = _words_pat(_EXCLUDE_STEMS_NO_PREFIX, stem=True)
+_FRESH_PAT = _words_pat(_FRESH_MARKERS)
+_EXCLUDE_STEM_PAT = _words_pat(_EXCLUDE_STEMS, prefixes=_PREFIXES, stem=True)
+_EXCLUDE_WORD_PAT = _words_pat(_EXCLUDE_WORDS, prefixes=_PREFIXES)
+_DESC_EXCLUDE_STEM_PAT = _words_pat(_DESC_EXCLUDE_STEMS, prefixes=_PREFIXES, stem=True)
+_DESC_EXCLUDE_WORD_PAT = _words_pat(_DESC_EXCLUDE_WORDS, prefixes=_PREFIXES)
+_EXCLUDE_MANUFACTURER_PAT = _words_pat(_EXCLUDE_MANUFACTURERS, prefixes=_PREFIXES, stem=True)
+
+# Kept for backwards compatibility: "does the name contain any meat word".
+_MEAT_PAT = re.compile(
+    f"{_MEAT_STRONG_PAT.pattern}|{_MEAT_AMBIG_PAT.pattern}|{_MEAT_WEAK_PAT.pattern}", re.IGNORECASE
+)
 
 
-def _is_meat_product(name: str, context: str = "") -> bool:
-    """Decide if a promo item is a fresh meat/poultry cut.
+def _is_meat_product(name: str, context: str = "", item: object = None) -> bool:
+    """Decide if a promo item is a fresh / frozen raw meat or poultry cut.
 
     `name` is the product name from PriceFull; `context` is the promotion
-    description — used as a secondary exclusion source because PromoFull
-    descriptions often reveal that a truncated product name is actually
-    something else (e.g. "פילה סל" → desc "מנות סלמון").
+    description (only a safe subset of exclusions is applied to it); `item`
+    is the PriceFull row (`_FeedItem`) when available — its manufacturer and
+    weighed-item flag are used as extra signals.
     """
-    if not name:
+    name = _norm(name)
+    if not name.strip():
         return False
-    combined = f"{name} {context}"
-    for kw in _EXCLUDE_KEYWORDS:
-        if kw in combined:
-            return False
-    return bool(_MEAT_PAT.search(name))
+    if (
+        _EXCLUDE_STEM_PAT.search(name)
+        or _EXCLUDE_WORD_PAT.search(name)
+        or _EXCLUDE_STEM_NP_PAT.search(name)
+        or _EXCLUDE_ABBREV_PAT.search(name)
+    ):
+        return False
+    desc = _norm(context)
+    if desc and (_DESC_EXCLUDE_STEM_PAT.search(desc) or _DESC_EXCLUDE_WORD_PAT.search(desc)):
+        return False
+    manufacturer = _norm(getattr(item, "manufacturer", "") or "")
+    if manufacturer and _EXCLUDE_MANUFACTURER_PAT.search(manufacturer):
+        return False
+    if _MEAT_STRONG_PAT.search(name):
+        return True
+    ambiguous = {m.group(0).lstrip("ו") for m in _MEAT_AMBIG_PAT.finditer(name)}
+    weak = {m.group(0).lstrip("ו") for m in _MEAT_WEAK_PAT.finditer(name)}
+    if len(ambiguous | weak) >= 2:
+        return True
+    if len(ambiguous) == 1:
+        return bool(_FRESH_PAT.search(name) or getattr(item, "weighted", False))
+    return False
 
 
 # ---- Data model ----
@@ -417,23 +639,37 @@ class MeatPromo:
     regions: list[str] = field(default_factory=list)  # one region per promo row
     cities: list[str] = field(default_factory=list)   # cities it was seen in
     store_count: int = 1                              # stores it was seen in
+    # Multi-buy deals ("2 ב-90"): `discounted_price` is always the PER-UNIT
+    # promo price (comparable with `regular_price`); these keep the deal itself.
+    min_qty: Optional[Decimal] = None                 # units needed (> 1 only)
+    bundle_price: Optional[Decimal] = None            # total price for min_qty units
+    is_weighted: bool = False                         # sold by weight: prices are per kg
 
     @property
     def region(self) -> str:
         return self.regions[0] if self.regions else ""
 
     @property
+    def deal_text(self) -> str:
+        """'2 ב-₪90' for a multi-buy deal, '' otherwise."""
+        if self.min_qty is None or self.bundle_price is None or self.min_qty <= 1:
+            return ""
+        return f"{self.min_qty.normalize():f} ב-₪{self.bundle_price}"
+
+    @property
     def savings_pct(self) -> Optional[Decimal]:
-        if self.discount_rate is not None and self.discount_rate > 0:
-            return self.discount_rate
-        if self.regular_price and self.discounted_price and self.regular_price > 0:
+        """Percent off, from the per-unit prices (falls back to DiscountRate)."""
+        if self.regular_price and self.discounted_price is not None and self.regular_price > 0:
             delta = (self.regular_price - self.discounted_price) / self.regular_price * 100
             return delta.quantize(Decimal("1"))
+        if self.discount_rate is not None and self.discount_rate > 0:
+            return self.discount_rate
         return None
 
     @property
     def savings_amount(self) -> Optional[Decimal]:
-        if self.regular_price and self.discounted_price:
+        """Saving per unit (per kg for weighed items)."""
+        if self.regular_price and self.discounted_price is not None:
             return (self.regular_price - self.discounted_price).quantize(Decimal("0.01"))
         return None
 
@@ -447,31 +683,71 @@ class SupermarketReport:
     promos_by_region: dict[str, int] = field(default_factory=dict)  # before the top-N cut
     promos: list[MeatPromo] = field(default_factory=list)
     error: Optional[str] = None
+    # chain -> Hebrew reason. Failed = could not be scanned (login, files,
+    # downloads); empty = scanned fine but nothing to show (no store in the
+    # regions, no meat deals today).
+    chains_failed: dict[str, str] = field(default_factory=dict)
+    chains_empty: dict[str, str] = field(default_factory=dict)
+
+
+class ChainScanError(Exception):
+    """A chain produced nothing; `reason` is a short Hebrew explanation."""
+
+    def __init__(self, reason: str, failed: bool = True):
+        super().__init__(reason)
+        self.reason = reason
+        self.failed = failed
+
+
+class _StoreFeedError(Exception):
+    """One store's feed files could not be downloaded or parsed."""
 
 
 # ---- Shared per-store scan ----
 
-def _build_item_index(pricefull_root: ET.Element) -> dict[str, tuple[str, Optional[Decimal]]]:
-    """Map ItemCode → (ItemName, Price) from a PriceFull XML tree."""
-    index: dict[str, tuple[str, Optional[Decimal]]] = {}
-    items = pricefull_root.find("Items") or pricefull_root.find(".//Items")
+@dataclass
+class _FeedItem:
+    """One <Item> of a PriceFull file (only the fields the scanner uses)."""
+    name: str
+    price: Optional[Decimal]
+    manufacturer: str = ""
+    weighted: bool = False
+    unit_of_measure: str = ""
+    unit_price: Optional[Decimal] = None  # UnitOfMeasurePrice
+
+
+def _dec(text: Optional[str]) -> Optional[Decimal]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        value = Decimal(text)
+    except (ArithmeticError, ValueError, InvalidOperation):
+        return None
+    return value if value.is_finite() else None
+
+
+def _build_item_index(pricefull_root: ET.Element) -> dict[str, _FeedItem]:
+    """Map ItemCode → _FeedItem from a PriceFull XML tree."""
+    index: dict[str, _FeedItem] = {}
+    items = pricefull_root.find("Items")
+    if items is None:
+        items = pricefull_root.find(".//Items")
     if items is None:
         return index
     for item in items.findall("Item"):
-        code_el = item.find("ItemCode")
-        name_el = item.find("ItemName")
-        price_el = item.find("ItemPrice")
-        if code_el is None or name_el is None:
-            continue
-        code = (code_el.text or "").strip()
-        name = (name_el.text or "").strip()
-        price_text = (price_el.text or "").strip() if price_el is not None else ""
-        try:
-            price = Decimal(price_text) if price_text else None
-        except (ArithmeticError, ValueError):
-            price = None
+        fields = {c.tag: (c.text or "").strip() for c in item}
+        code = fields.get("ItemCode", "")
+        name = fields.get("ItemName", "")
         if code and name:
-            index[code] = (name, price)
+            index[code] = _FeedItem(
+                name=name,
+                price=_dec(fields.get("ItemPrice")),
+                manufacturer=fields.get("ManufactureName", ""),
+                weighted=fields.get("bIsWeighted", "") == "1",
+                unit_of_measure=fields.get("UnitOfMeasure", ""),
+                unit_price=_dec(fields.get("UnitOfMeasurePrice")),
+            )
     return index
 
 
@@ -481,16 +757,17 @@ def _scan_store(
     price_raw: Optional[bytes],
     promo_raw: Optional[bytes],
 ) -> list[MeatPromo]:
-    """Parse one store's PriceFull + PromoFull and return its meat promos."""
+    """Parse one store's PriceFull + PromoFull and return its meat promos.
+
+    Raises _StoreFeedError when a file is missing or unparsable.
+    """
     if not price_raw or not promo_raw:
-        log.warning("%s / %s: download failed", chain_name, store.label)
-        return []
+        raise _StoreFeedError("download failed")
     try:
         price_root = ET.fromstring(_maybe_gunzip(price_raw))
         promo_root = ET.fromstring(_maybe_gunzip(promo_raw))
     except ET.ParseError as exc:
-        log.warning("%s / %s: parse failed: %s", chain_name, store.label, exc)
-        return []
+        raise _StoreFeedError(f"parse failed: {exc}") from exc
     item_index = _build_item_index(price_root)
     promos = _extract_meat_promos(chain_name, f"{store.store_id:03d}", promo_root, item_index)
     for p in promos:
@@ -512,7 +789,9 @@ def _scan_chain(
 ) -> tuple[list[MeatPromo], list[StoreInfo]]:
     """Scan every store of the chain inside the target regions.
 
-    Returns (promos, stores that yielded at least one meat promo).
+    Returns (promos, stores that yielded at least one meat promo). Raises
+    ChainScanError when no store could be scanned at all, so the report can
+    say why the chain is missing.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -520,7 +799,7 @@ def _scan_chain(
     candidates = _candidates_by_region(stores)
     if not candidates:
         log.info("%s: no stores in the target regions — skipped", chain_name)
-        return [], []
+        raise ChainScanError("אין סניפים באזורים שנבחרו", failed=False)
     todo = [
         store
         for region_stores in candidates.values()
@@ -528,23 +807,30 @@ def _scan_chain(
     ]
     log.info("%s: scanning %d stores in the target regions", chain_name, len(todo))
 
-    def _one(store: StoreInfo) -> tuple[StoreInfo, list[MeatPromo]]:
+    def _one(store: StoreInfo) -> tuple[StoreInfo, str, list[MeatPromo]]:
         try:
             files = fetch(store)
             if files is None:
-                return store, []
-            return store, _scan_store(chain_name, store, *files)
+                log.info("%s / %s: no current feed files", chain_name, store.label)
+                return store, "nofiles", []
+            return store, "ok", _scan_store(chain_name, store, *files)
         except Exception as exc:  # one bad store must not sink the chain
             log.warning("%s / %s: %s: %s", chain_name, store.label, type(exc).__name__, exc)
-            return store, []
+            return store, "error", []
 
     promos: list[MeatPromo] = []
     used: list[StoreInfo] = []
+    outcomes: Counter = Counter()
     with ThreadPoolExecutor(max_workers=_STORE_WORKERS) as pool:
-        for store, found in pool.map(_one, todo):
+        for store, outcome, found in pool.map(_one, todo):
+            outcomes[outcome] += 1
             if found:
                 promos.extend(found)
                 used.append(store)
+    if not outcomes["ok"]:
+        if outcomes["error"]:
+            raise ChainScanError(f"הורדת הקבצים נכשלה ב-{outcomes['error']} סניפים")
+        raise ChainScanError("אין קבצי מחירים ומבצעים עדכניים לסניפים באזורים")
     return promos, used
 
 
@@ -570,18 +856,24 @@ def _download(url: str) -> Optional[bytes]:
 
 
 def scan_shufersal() -> tuple[list[MeatPromo], list[StoreInfo]]:
-    """Meat promotions from Shufersal stores inside the target regions."""
+    """Meat promotions from Shufersal stores inside the target regions.
+
+    Raises ChainScanError when the chain could not be scanned.
+    """
     log.info("%s: fetching store list", _SHUFERSAL_NAME)
     store_links = _shufersal_links(cat=5)
     raw = _download(store_links[0]) if store_links else None
     if not raw:
         log.warning("%s: could not fetch Stores file", _SHUFERSAL_NAME)
-        return [], []
+        raise ChainScanError("הורדת קובץ הסניפים נכשלה")
     stores = _parse_stores(raw)
 
     def _fetch(store: StoreInfo):
-        promo_url = _latest_by_store(_shufersal_links(4, store.store_id)).get(store.store_id)
-        price_url = _latest_by_store(_shufersal_links(2, store.store_id)).get(store.store_id)
+        promo_links = _shufersal_links(4, store.store_id)
+        price_links = _shufersal_links(2, store.store_id)
+        chain_id = _dominant_chain_id(promo_links, price_links)
+        promo_url = _latest_by_store(promo_links, chain_id).get(store.store_id)
+        price_url = _latest_by_store(price_links, chain_id).get(store.store_id)
         if not promo_url or not price_url:
             return None
         return _download(price_url), _download(promo_url)
@@ -638,12 +930,15 @@ def scan_publishedprices_chain(
     username: str,
     chain_name: str,
 ) -> tuple[list[MeatPromo], list[StoreInfo]]:
-    """Scan one chain hosted on url.publishedprices.co.il (target regions only)."""
+    """Scan one chain hosted on url.publishedprices.co.il (target regions only).
+
+    Raises ChainScanError when the chain could not be scanned.
+    """
     log.info("%s: logging in to publishedprices", chain_name)
     with httpx.Client(follow_redirects=True, timeout=60, headers=_HEADERS) as client:
         if not _pp_login(client, username):
             log.warning("%s: login failed", chain_name)
-            return [], []
+            raise ChainScanError("ההתחברות לאתר המחירים נכשלה")
 
         def _names(prefix: str, limit: int) -> list[str]:
             return [
@@ -655,17 +950,24 @@ def scan_publishedprices_chain(
         stores_files = sorted(_names("Stores", 20))
         if not stores_files:
             log.warning("%s: no Stores file listed", chain_name)
-            return [], []
+            raise ChainScanError("לא נמצאו קבצים באתר המחירים")
         stores_raw = _pp_download(client, stores_files[-1])
         if not stores_raw:
             log.warning("%s: Stores file download failed", chain_name)
-            return [], []
+            raise ChainScanError("הורדת קובץ הסניפים נכשלה")
         stores = _parse_stores(stores_raw)
 
         # The host's search box only matches short prefixes, so list everything
-        # and pick each store's newest file locally.
-        promo_by_store = _latest_by_store(_names("PromoFull", 1000))
-        price_by_store = _latest_by_store(_names("PriceFull", 1000))
+        # and pick each store's newest file locally — PromoFull and PriceFull
+        # of the same chain id, both recent.
+        promo_names = _names("PromoFull", 1000)
+        price_names = _names("PriceFull", 1000)
+        chain_id = _dominant_chain_id(promo_names, price_names)
+        promo_by_store = _latest_by_store(promo_names, chain_id)
+        price_by_store = _latest_by_store(price_names, chain_id)
+        if not promo_by_store or not price_by_store:
+            log.warning("%s: no current PromoFull/PriceFull files listed", chain_name)
+            raise ChainScanError("אין קבצי מחירים ומבצעים עדכניים באתר")
 
         def _fetch(store: StoreInfo):
             promo_fname = promo_by_store.get(store.store_id)
@@ -677,15 +979,87 @@ def scan_publishedprices_chain(
         return _scan_chain(chain_name, stores, _fetch)
 
 
+# ---- Promotion parsing ----
+
+# Not real promotions: class-action compensation credits ("הנחה בגין תביעה
+# ייצוגית"), refunds, and permanent payment-method / loyalty discounts
+# (Shufersal's "תו זהב 5% הנחה מותג שופרסל", valid 2014–2031).
+_NOT_A_PROMO_PAT = _words_pat(
+    ("תביעה", "תביעת", "ייצוגית", "יצוגית", "פיצוי", "זיכוי", "החזר", "תו זהב",
+     "אשראי", "כרטיס"),
+    prefixes=_PREFIXES,
+)
+
+# Two prices for the same unit may differ by rounding; beyond this share of
+# the regular price they describe different units (per kg vs per 100 g).
+_PRICE_TOLERANCE = Decimal("0.03")
+
+
+def _per_unit_promo_price(
+    regular: Optional[Decimal],
+    discount_rate: Optional[Decimal],
+    discounted_price: Optional[Decimal],
+    per_mida: Optional[Decimal],
+    unit_price: Optional[Decimal],
+    min_qty: Optional[Decimal],
+) -> Optional[Decimal]:
+    """The promo price of ONE unit (or kg), or None when the row is inconsistent.
+
+    `discounted_price` is the total for `min_qty` units ("3 ב-40"), so the
+    per-unit price is discounted_price / min_qty. `per_mida` is the promo price
+    per unit of measure, comparable with PriceFull's UnitOfMeasurePrice. When
+    the feed gives a DiscountRate, the chosen price must agree with it.
+    """
+    qty = min_qty if min_qty is not None and min_qty >= 1 else Decimal(1)
+    candidates: list[Decimal] = []
+    if discounted_price is not None and discounted_price > 0:
+        candidates.append(discounted_price / qty)
+    if regular and regular > 0 and per_mida and per_mida > 0 and unit_price and unit_price > 0:
+        candidates.append(regular * per_mida / unit_price)
+    if not regular or regular <= 0:
+        return None
+    tolerance = regular * _PRICE_TOLERANCE
+    if discount_rate is not None and 0 < discount_rate < 100:
+        target = regular * (1 - discount_rate / 100)
+        if not candidates:
+            return target.quantize(Decimal("0.01"))
+        best = min(candidates, key=lambda c: abs(c - target))
+        return best.quantize(Decimal("0.01")) if abs(best - target) <= tolerance else None
+    if not candidates:
+        return None
+    if len(candidates) == 2 and abs(candidates[0] - candidates[1]) > tolerance:
+        return None
+    return candidates[0].quantize(Decimal("0.01"))
+
+
+# "2 ב 100", "ב2- ב 20 שח", "3 ק ג ב  40", "2קג ב42שח", "4ב10" -> (qty, total)
+_DESC_DEAL_RE = re.compile(
+    r"(?<![\d.])(\d{1,2})\s*(?:ק\"?ג|ק ג|קג|ק|יח'?)?\s*-?\s*ב\s*-?\s*(\d+(?:\.\d+)?)(?![\d%])"
+)
+
+
+def _desc_unit_price(desc: str) -> Optional[Decimal]:
+    """Per-unit price stated by a multi-buy description ("2 ב 100" -> 50)."""
+    m = _DESC_DEAL_RE.search(_norm(desc))
+    if not m:
+        return None
+    qty, total = Decimal(m.group(1)), _dec(m.group(2))
+    if qty < 2 or total is None or total <= 0:
+        return None
+    return total / qty
+
+
 def _extract_meat_promos(
     chain_name: str,
     store_id: str,
     promo_root: ET.Element,
-    item_index: dict[str, tuple[str, Optional[Decimal]]],
+    item_index: dict[str, _FeedItem],
 ) -> list[MeatPromo]:
     """Shared promo-filtering logic used by every chain."""
     results: list[MeatPromo] = []
-    promos_container = promo_root.find("Promotions") or promo_root.find(".//Promotions")
+    promos_container = promo_root.find("Promotions")
+    if promos_container is None:
+        promos_container = promo_root.find(".//Promotions")
     if promos_container is None:
         return []
     seen: set[tuple[str, str]] = set()
@@ -698,7 +1072,7 @@ def _extract_meat_promos(
         is_coupon_el = promo.find("AdditionalIsCoupon")
         if is_coupon_el is not None and (is_coupon_el.text or "").strip() == "1":
             continue
-        if "פיצוי" in desc:
+        if _NOT_A_PROMO_PAT.search(_norm(desc)):
             continue
         club_el = promo.find("ClubID")
         if club_el is not None and club_el.text:
@@ -710,46 +1084,53 @@ def _extract_meat_promos(
         if items_container is None:
             continue
         for pi in items_container.findall("PromotionItem"):
-            code_el = pi.find("ItemCode")
-            if code_el is None:
-                continue
-            code = (code_el.text or "").strip()
+            fields = {c.tag: (c.text or "").strip() for c in pi}
+            code = fields.get("ItemCode", "")
             if not code or code == "0" * len(code):
                 continue
-            indexed = item_index.get(code)
-            if not indexed:
+            item = item_index.get(code)
+            if item is None:
                 continue
-            name, regular_price = indexed
-            if not _is_meat_product(name, context=desc):
+            if not _is_meat_product(item.name, context=desc, item=item):
                 continue
             key = (code, desc)
             if key in seen:
                 continue
             seen.add(key)
 
-            dr_el = pi.find("DiscountRate")
-            dp_el = pi.find("DiscountedPrice")
-            try:
-                discount_rate = Decimal((dr_el.text or "").strip()) if dr_el is not None and dr_el.text else None
-            except (ArithmeticError, ValueError):
-                discount_rate = None
-            try:
-                discounted_price = Decimal((dp_el.text or "").strip()) if dp_el is not None and dp_el.text else None
-            except (ArithmeticError, ValueError):
-                discounted_price = None
-            if discount_rate is None and discounted_price is None:
+            discount_rate = _dec(fields.get("DiscountRate"))
+            bundle = _dec(fields.get("DiscountedPrice"))
+            min_qty = _dec(fields.get("MinQty"))
+            now = _per_unit_promo_price(
+                item.price, discount_rate, bundle,
+                _dec(fields.get("DiscountedPricePerMida")), item.unit_price, min_qty,
+            )
+            if now is None or item.price is None or now >= item.price:
+                continue  # inconsistent units / no real saving
+            stated = _desc_unit_price(desc)
+            if stated is not None and abs(stated - now) > item.price * _PRICE_TOLERANCE:
+                # The feed's numbers contradict the deal it advertises
+                # (seen live: "2 קג ב 60" published as 15/kg in some stores).
                 continue
+            weighted = item.weighted or fields.get("bIsWeighted", "") == "1"
+            multi = (
+                not weighted and min_qty is not None and min_qty > 1
+                and min_qty == min_qty.to_integral_value() and bundle is not None
+            )
 
             results.append(MeatPromo(
                 chain=chain_name,
                 store_id=store_id,
                 item_code=code,
-                item_name=name,
-                regular_price=regular_price,
-                discounted_price=discounted_price,
+                item_name=item.name,
+                regular_price=item.price,
+                discounted_price=now,
                 discount_rate=discount_rate,
                 promotion_description=desc,
                 end_date=end[:10] if end else None,
+                min_qty=min_qty.to_integral_value() if multi else None,
+                bundle_price=bundle if multi else None,
+                is_weighted=weighted,
             ))
     return results
 
@@ -766,38 +1147,48 @@ def scan_and_report() -> SupermarketReport:
     )
     report = SupermarketReport(status="ok")
 
-    def _shufersal_task() -> tuple[str, list[MeatPromo], list[StoreInfo]]:
-        promos, used = scan_shufersal()
-        return (_SHUFERSAL_NAME, promos, used)
-
-    def _pp_task(user: str, name: str) -> tuple[str, list[MeatPromo], list[StoreInfo]]:
-        promos, used = scan_publishedprices_chain(user, name)
-        return (name, promos, used)
-
-    tasks = [_shufersal_task] + [
-        (lambda u=u, n=n: _pp_task(u, n)) for u, n in _PUBLISHEDPRICES_CHAINS
-    ]
+    tasks: dict[str, object] = {_SHUFERSAL_NAME: scan_shufersal}
+    for user, name in _PUBLISHEDPRICES_CHAINS:
+        tasks[name] = (lambda u=user, n=name: scan_publishedprices_chain(u, n))
 
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-        futures = [pool.submit(task) for task in tasks]
+        futures = {pool.submit(task): name for name, task in tasks.items()}  # type: ignore[arg-type]
         for fut in as_completed(futures):
+            name = futures[fut]
             try:
-                name, promos, used = fut.result()
-                if promos:
-                    report.promos.extend(promos)
-                    report.chains_scanned.append(name)
-                    for store in used:
-                        report.stores_scanned.append(f"{name} – {store.label} ({store.city})")
-                        report.stores_by_region[store.region] = (
-                            report.stores_by_region.get(store.region, 0) + 1
-                        )
-                else:
-                    log.warning("%s: no promos returned", name)
+                promos, used = fut.result()
+            except ChainScanError as exc:
+                log.warning("%s: %s", name, exc.reason)
+                (report.chains_failed if exc.failed else report.chains_empty)[name] = exc.reason
+                continue
             except Exception as exc:
-                log.error("chain scan failed: %s: %s", type(exc).__name__, exc)
+                log.error("%s: chain scan failed: %s: %s", name, type(exc).__name__, exc)
+                report.chains_failed[name] = f"שגיאה: {type(exc).__name__}"
+                continue
+            if not promos:
+                log.warning("%s: no meat promos returned", name)
+                report.chains_empty[name] = "לא נמצאו מבצעי בשר"
+                continue
+            report.promos.extend(promos)
+            report.chains_scanned.append(name)
+            for store in used:
+                report.stores_scanned.append(f"{name} – {store.label} ({store.city})")
+                report.stores_by_region[store.region] = (
+                    report.stores_by_region.get(store.region, 0) + 1
+                )
     report.chains_scanned.sort()
     report.stores_scanned.sort()
+    report.chains_failed = dict(sorted(report.chains_failed.items()))
+    report.chains_empty = dict(sorted(report.chains_empty.items()))
+    _finalize_report(report)
+    if not report.chains_scanned:
+        report.status = "fetch_failed"
+        report.error = "לא נמצאו מבצעים באף רשת באזורים שנבחרו"
+    return report
 
+
+def _finalize_report(report: SupermarketReport) -> None:
+    """Dedupe, drop implausible rows and keep the best deals of each region."""
     # Dedupe inside each region: the same promotion runs in many stores of a
     # chain and often covers several item variants (different brands of the
     # same cut). Keep one row per (region, chain, promotion_description,
@@ -832,10 +1223,6 @@ def scan_and_report() -> SupermarketReport:
         report.promos_by_region[region] = len(in_region)
         ranked.extend(in_region[:top_n])
     report.promos = ranked
-    if not report.chains_scanned:
-        report.status = "fetch_failed"
-        report.error = "לא נמצאו מבצעים באף רשת באזורים שנבחרו"
-    return report
 
 
 # ---- State persistence (so we can diff tomorrow if desired) ----
@@ -850,6 +1237,8 @@ def _promo_to_dict(p: MeatPromo) -> dict:
         "regular_price": str(p.regular_price) if p.regular_price is not None else None,
         "discounted_price": str(p.discounted_price) if p.discounted_price is not None else None,
         "discount_rate": str(p.discount_rate) if p.discount_rate is not None else None,
+        "min_qty": str(p.min_qty) if p.min_qty is not None else None,
+        "bundle_price": str(p.bundle_price) if p.bundle_price is not None else None,
     }
 
 
@@ -868,11 +1257,19 @@ def persist(report: SupermarketReport) -> None:
 
 # ---- Terminal output ----
 
+def _print_chain_problems(report: SupermarketReport) -> None:
+    for title, chains in (("Chains failed", report.chains_failed), ("Chains empty", report.chains_empty)):
+        if chains:
+            console.print(f"[yellow]{title}: " + ", ".join(f"{c} ({r})" for c, r in chains.items()) + "[/yellow]")
+
+
 def print_report(report: SupermarketReport) -> None:
     if report.status != "ok":
         console.print(f"[red]Supermarket scan failed: {report.status}[/red]  {report.error or ''}")
+        _print_chain_problems(report)
         return
     console.print(f"[dim]Chains scanned: {', '.join(report.chains_scanned)}[/dim]")
+    _print_chain_problems(report)
     if not report.promos:
         console.print("[dim]No meat promos found today.[/dim]")
         return
@@ -887,6 +1284,8 @@ def print_report(report: SupermarketReport) -> None:
     for p in report.promos:
         was = f"₪{p.regular_price}" if p.regular_price else "—"
         now = f"₪{p.discounted_price}" if p.discounted_price else "—"
+        if p.deal_text:
+            now += f" ({p.deal_text})"
         off = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
         table.add_row(p.region, p.chain, p.item_name[:50], was, now, off, p.promotion_description[:40])
     console.print(table)

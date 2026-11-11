@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Trimmed from real PromoFull files captured 2026-11-11; item codes renumbered to match PriceFull_small.xml. -->
+<Root>
+  <ChainID>7290000000001</ChainID>
+  <SubChainID>001</SubChainID>
+  <StoreID>001</StoreID>
+  <Promotions>
+    <Promotion>
+      <PromotionDescription>ב2- ב 20 שח  כנפיים עוף טרי</PromotionDescription>
+      <PromotionEndDateTime>2026-11-14T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0 - כלל הלקוחות</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1001</ItemCode><RewardType>10</RewardType><MinQty>1.50</MinQty><MaxQty></MaxQty><DiscountRate>28</DiscountRate><DiscountedPrice>15.00</DiscountedPrice><DiscountedPricePerMida>10.000</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>בריסקט/כתף/גולש דל שומן עטרה 2 ב 100 מגד</PromotionDescription>
+      <PromotionEndDateTime>2026-11-13T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1002</ItemCode><RewardType>10</RewardType><MinQty>1.850</MinQty><MaxQty></MaxQty><DiscountRate>44.38</DiscountRate><DiscountedPrice>92.50</DiscountedPrice><DiscountedPricePerMida>50.000</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>כרעיים עוף 3 ק ג ב  40</PromotionDescription>
+      <PromotionEndDateTime>2026-12-05T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1003</ItemCode><RewardType>10</RewardType><MinQty>3</MinQty><MaxQty></MaxQty><DiscountRate>46.47</DiscountRate><DiscountedPrice>39.99</DiscountedPrice><DiscountedPricePerMida></DiscountedPricePerMida><bIsWeighted>0</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>פלמי טופ כבד אווז -ב399לק ג</PromotionDescription>
+      <PromotionEndDateTime>2026-12-05T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1004</ItemCode><RewardType>3</RewardType><MinQty>1</MinQty><MaxQty></MaxQty><DiscountRate>18.57</DiscountRate><DiscountedPrice>39.90</DiscountedPrice><DiscountedPricePerMida></DiscountedPricePerMida><bIsWeighted>0</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>הנחה בגין תביעה יצוגית קפואים</PromotionDescription>
+      <PromotionEndDateTime>2027-03-31T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1005</ItemCode><RewardType>3</RewardType><MinQty>1</MinQty><MaxQty></MaxQty><DiscountRate>100.00</DiscountRate><DiscountedPrice>0.00</DiscountedPrice><DiscountedPricePerMida>0.00</DiscountedPricePerMida><bIsWeighted>0</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>תו זהב 5% הנחה מותג שופרסל</PromotionDescription>
+      <PromotionEndDateTime>2031-01-01T02:59:00.000</PromotionEndDateTime>
+      <ClubID>0 - כלל הלקוחות</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1006</ItemCode><RewardType>2</RewardType><MinQty>0.01</MinQty><MaxQty></MaxQty><DiscountRate>5</DiscountRate><DiscountedPrice>37.91</DiscountedPrice><DiscountedPricePerMida>37.905</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>פרמיו דליקט 2 ב18</PromotionDescription>
+      <PromotionEndDateTime>2026-12-05T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1007</ItemCode><RewardType>10</RewardType><MinQty>2</MinQty><MaxQty></MaxQty><DiscountRate>24.37</DiscountRate><DiscountedPrice>18.00</DiscountedPrice><DiscountedPricePerMida></DiscountedPricePerMida><bIsWeighted>0</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>פילה ברמונדי קפוא ב49.90</PromotionDescription>
+      <PromotionEndDateTime>2026-12-05T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1008</ItemCode><RewardType>3</RewardType><MinQty>0.01</MinQty><MaxQty></MaxQty><DiscountRate>16.69</DiscountRate><DiscountedPrice>49.90</DiscountedPrice><DiscountedPricePerMida>49.900</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>ירכיים עוף טרי  הכפר  2 ב 45</PromotionDescription>
+      <PromotionEndDateTime>2026-11-16T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1009</ItemCode><RewardType>3</RewardType><MinQty>1.850</MinQty><MaxQty></MaxQty><DiscountRate></DiscountRate><DiscountedPrice>41.63</DiscountedPrice><DiscountedPricePerMida>22.500</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>נודלס 70 גרם רמי לוי 4ב10</PromotionDescription>
+      <PromotionEndDateTime>2026-12-05T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1010</ItemCode><RewardType>10</RewardType><MinQty>4</MinQty><MaxQty></MaxQty><DiscountRate>48.98</DiscountRate><DiscountedPrice>10.00</DiscountedPrice><DiscountedPricePerMida>3.571</DiscountedPricePerMida><bIsWeighted>0</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>כבד 2 ב 22 מועדון</PromotionDescription>
+      <PromotionEndDateTime>2026-11-24T23:59:00.000</PromotionEndDateTime>
+      <ClubID>1 - המועדון החדש</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1011</ItemCode><RewardType>1</RewardType><MinQty>2.00</MinQty><MaxQty></MaxQty><DiscountRate>45</DiscountRate><DiscountedPrice>22.00</DiscountedPrice><DiscountedPricePerMida>11.000</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>ב. 39.90 לשון קפואה</PromotionDescription>
+      <PromotionEndDateTime>2026-11-28T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0 - כלל הלקוחות</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1012</ItemCode><RewardType>3</RewardType><MinQty>0.01</MinQty><MaxQty></MaxQty><DiscountRate>29</DiscountRate><DiscountedPrice>39.90</DiscountedPrice><DiscountedPricePerMida>39.900</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+    <Promotion>
+      <PromotionDescription>רשת חזה/טחון עוף טרי 2 קג ב 60 שח</PromotionDescription>
+      <PromotionEndDateTime>2026-11-30T23:59:00.000</PromotionEndDateTime>
+      <ClubID>0</ClubID><AdditionalIsCoupon>0</AdditionalIsCoupon>
+      <PromotionItems>
+        <PromotionItem><ItemCode>1013</ItemCode><RewardType>10</RewardType><MinQty>2</MinQty><MaxQty></MaxQty><DiscountRate>62.41</DiscountRate><DiscountedPrice>30.00</DiscountedPrice><DiscountedPricePerMida>15.000</DiscountedPricePerMida><bIsWeighted>1</bIsWeighted></PromotionItem>
+      </PromotionItems>
+    </Promotion>
+  </Promotions>
+</Root>
