@@ -5,12 +5,10 @@ and codes. Produces a detailed per-site report with every detected promo,
 code, condition, and a raw source excerpt (so the owner can sanity-check
 what the extractor saw).
 
-Two-pass extraction:
-  1. Inline <script> content — many sites (Terminal X, Castro) embed banner
-     text inside JSON blobs rendered server-side. These aren't visible to
-     a BS4 DOM selector-based scan.
-  2. DOM elements — class-substring selectors on promo/offer/banner/code
-     + the <header> + <meta name="description">.
+Text sources (see "Promo extraction" below for the offer/pairing rules):
+  1. String values inside <script> — some sites (Terminal X) embed banner
+     text inside JSON blobs rendered server-side.
+  2. The page's visible text (with <img alt>) + meta descriptions.
 
 After collection, promos are deduped by (discount_pct, code) and ranked:
   - having an explicit code wins
@@ -68,210 +66,270 @@ class SiteDigest:
 
 
 # ---------------------------------------------------------------------------
-# Promo extraction (improved)
+# Promo extraction
 # ---------------------------------------------------------------------------
+#
+# Pipeline:
+#   1. Text sources: the page's *visible* text (scripts/styles/svg removed,
+#      <img alt> kept) plus every JSON/JS string *value* found in <script>
+#      tags (Terminal X's SINGLES20 banner only exists inside a script blob).
+#      Raw markup, CSS and JSON keys are never scanned, and each script string
+#      is scanned on its own, so neighbouring JSON fields cannot be combined.
+#   2. Offers: each source is split into lines (<br>, block elements, list
+#      items, newlines inside strings) and each line into segments on "|".
+#      One segment ~ one offer ("APP EXCLUSIVE | EXTRA 5% OFF | USE CODE: APP5"
+#      is three segments).
+#   3. Pairing: a code is paired with the nearest discount percentage in its
+#      own segment (at most _MAX_PAIR_GAP chars away). A segment holding only
+#      a code ("USE CODE: APP5", Castro's "בהקלדת קוד קופון: OFF11" <div>)
+#      borrows the percentage of the directly preceding segment, else the
+#      directly following one, but only if that neighbour has no code of its
+#      own and both segments are short. Nothing pairs across further segments.
+#   4. A percentage counts only if it has a left boundary ("150%" is not 50%),
+#      is not "up to N%" (tiered) and has a discount word next to it
+#      ("off", "extra", "הנחה", ...). Codes must be upper-case in the source
+#      and follow a code keyword ("code", "קוד", "קופון", ...); only the
+#      keyword is case-insensitive.
+#   5. A percentage without a code is reported only when a site-wide phrase
+#      ("everything", "sitewide", "על כל האתר", ...) follows it.
 
-# Patterns that indicate a SITE-WIDE sale rather than per-product.
-# Match an explicit CODE + percentage near each other.
-# Gap is up to 250 chars because Castro's Hebrew banner has the pct and the
-# code in separate <div>s with ~120 chars of markup between them.
-# Percent NEAR an explicit code keyword. "off/OFF/הנחה" immediately after %
-# is optional — Castro's banner says "EXTRA 11% על כל האתר" (no "off" word),
-# but has "קוד קופון: OFF11" later. We filter the span for a promo-context
-# word afterward to reject noise.
-_PCT_CODE_PAT = re.compile(
-    r"(\d{1,2})\s*%\s*(?:off|הנחה|OFF)?"
-    r"[\s\S]{0,120}?"
-    r"\b(?:code|קופון|קוד)\b[^A-Z0-9]{0,20}([A-Z][A-Z0-9]{2,19})",
-    re.IGNORECASE | re.UNICODE,
+# Max distance (chars) between a percentage and a code in the same segment.
+_MAX_PAIR_GAP = 120
+# Max length of each segment when a code borrows its neighbour's percentage.
+_MAX_NEIGHBOUR_LEN = 120
+
+# Percentage: left boundary (no digit / decimal point before), 1-2 digits.
+_PCT_PAT = re.compile(r"(?<![\d.,])(\d{1,2})\s*%")
+
+_UP_TO_PAT = re.compile(r"(?:\bup\s+to|(?<!\w)עד)\s*$", re.IGNORECASE)
+
+# Discount words that must sit right before or right after the percentage.
+_DISCOUNT_WORD_PAT = re.compile(
+    r"\b(?:off|extra|discount|save|savings|sale)\b|הנחה|הנחת",
+    re.IGNORECASE,
+)
+_DISCOUNT_BEFORE_CHARS = 20
+_DISCOUNT_AFTER_CHARS = 15
+
+# Code keyword (case-insensitive) + short punctuation gap + UPPER-CASE code.
+# English keywords need a word boundary ("postcode" is not "code"); Hebrew
+# ones may carry a prefix letter ("בקוד") but must end there ("קודם" is not).
+_CODE_PAT = re.compile(
+    r"(?:(?i:\b(?:promo\s*code|code|coupon|voucher))|קוד|קופון)(?!\w)"
+    r"[\s:：\-–—\"'״“”«»()\[\]]{0,6}"
+    r"([A-Z][A-Z0-9]{2,19})(?![A-Za-z0-9])"
 )
 
-_CODE_PCT_PAT = re.compile(
-    r"\b(?:code|קופון|קוד)\b[^A-Z0-9]{0,20}([A-Z][A-Z0-9]{2,19})"
-    r"[\s\S]{0,120}?"
-    r"(\d{1,2})\s*%\s*(?:off|הנחה|OFF)?",
-    re.IGNORECASE | re.UNICODE,
+# Site-wide phrases that must follow a bare (code-less) percentage.
+_SITEWIDE_PAT = re.compile(
+    r"\b(?:everything|all\s+items|all\s+products|site\s*-?\s*wide"
+    r"|store\s*-?\s*wide|entire\s+(?:site|store|order))\b"
+    r"|(?<!\w)(?:על\s+|ב)?כל\s+האתר(?!\w)|(?<!\w)על\s+הכל(?!\w)",
+    re.IGNORECASE,
 )
+_SITEWIDE_AFTER_CHARS = 40
 
-# Site-wide bare-% promo (no code advertised). Must be adjacent to a strong
-# "everything / all items / sitewide" phrase to filter per-product discounts.
-_SITEWIDE_BARE_PAT = re.compile(
-    r"(\d{1,2})\s*%\s*(?:off|הנחה|OFF)"
-    r"[^<>\n]{0,40}"
-    r"(?:everything|everything!|all items|site\s*wide|sitewide|הכל|על כל האתר|site|אתר)",
-    re.IGNORECASE | re.UNICODE,
-)
+# Upper-case words that follow "code" in banners but are not codes
+# ("USE CODE BELOW", "CODE APPLIED AT CHECKOUT").
+_NON_CODES = {
+    "SALE", "SAVE", "OFFER", "FREE", "GIFT", "BUY", "NEW", "NOW", "TODAY",
+    "CODE", "CODES", "COUPON", "BELOW", "HERE", "AT", "CHECKOUT", "APPLIED",
+    "SHOP", "OFF", "THE",
+}
 
-_CONTEXT_KEYWORDS = re.compile(
-    r"\b(off|OFF|הנחה|EXTRA|SALE|סייל|deal|final|sale|end[s]?\s+in|בתוקף)\b",
-    re.IGNORECASE | re.UNICODE,
-)
+_LINE_BREAK = ""  # private-use sentinel for structural breaks (not matched by \s)
+_SKIP_TAGS = ["script", "style", "noscript", "template", "svg", "iframe", "head"]
+_BLOCK_TAGS = [
+    "p", "div", "li", "ul", "ol", "dl", "dt", "dd", "h1", "h2", "h3", "h4",
+    "h5", "h6", "section", "article", "aside", "header", "footer", "nav",
+    "main", "table", "tr", "td", "th", "form", "button", "blockquote",
+    "figure", "figcaption", "option",
+]
 
-
-def _is_promotional_span(span: str) -> bool:
-    """Reject the match if the surrounding text doesn't look promotional."""
-    return bool(_CONTEXT_KEYWORDS.search(span))
-
-# Pattern for a bare "N% off" without a visible code (newsletter, first-time, etc.)
-_PCT_BARE_PAT = re.compile(
-    r"(\d{1,2})\s*%\s*(?:off|הנחה)",
-    re.IGNORECASE | re.UNICODE,
-)
-
-# "up to N%" / "עד N%" — tiered, not computable
-_UP_TO_PAT = re.compile(
-    r"(?:up\s+to|עד)\s+(\d{1,2})\s*%",
-    re.IGNORECASE | re.UNICODE,
-)
-
-# Words to use as condition heuristics (after the match, up to a sentence boundary)
-_COND_PAT_AFTER = re.compile(r".{0,120}?(?:[.!?\n\|]|בתוקף|$)", re.UNICODE)
+# JSON / JS double-quoted string literal that is a value, not an object key.
+_JS_STRING_PAT = re.compile(r'"((?:[^"\\\n]|\\.){4,})"(?!\s*:)')
+_JS_ESCAPE_PAT = re.compile(r"\\(u[0-9a-fA-F]{4}|.)", re.DOTALL)
+_JS_SIMPLE_ESCAPES = {"n": "\n", "r": "\n", "t": " ", "b": "", "f": ""}
 
 
-def _extract_promos_from_text(text: str, max_len: int = 250) -> list[PromoInfo]:
-    """Find every CODE+% promo in a text blob. Returns dedup'd list."""
-    if not text:
-        return []
-    found: dict[tuple[int, str], PromoInfo] = {}
+def _render_text(soup: BeautifulSoup) -> str:
+    """Visible text of *soup* with structural breaks as "\\n".
 
-    def _condition_around(pos_start: int, pos_end: int) -> Optional[str]:
-        snippet = text[max(0, pos_start - 50):pos_end + 100]
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        return snippet[:max_len]
+    Mutates *soup* (callers pass a soup they own).
+    """
+    for tag in soup.find_all(_SKIP_TAGS):
+        tag.decompose()
+    for img in soup.find_all("img"):
+        alt = img.get("alt")
+        img.replace_with(f"{_LINE_BREAK}{alt}{_LINE_BREAK}" if alt else "")
+    for br in soup.find_all("br"):
+        br.replace_with(_LINE_BREAK)
+    for tag in soup.find_all(_BLOCK_TAGS):
+        tag.insert_before(_LINE_BREAK)
+        tag.insert_after(_LINE_BREAK)
+    # " " between text nodes so inline items (flex <a>/<span>) don't fuse.
+    text = re.sub(r"\s+", " ", soup.get_text(" "))
+    lines = (ln.strip() for ln in text.split(_LINE_BREAK))
+    return "\n".join(ln for ln in lines if ln)
 
-    # Pattern A: pct ... code
-    for m in _PCT_CODE_PAT.finditer(text):
+
+def _html_fragment_text(fragment: str) -> str:
+    """Visible text of an HTML (or plain-text) fragment, lines kept."""
+    if "<" not in fragment:
+        lines = (re.sub(r"\s+", " ", ln).strip() for ln in fragment.splitlines())
+        return "\n".join(ln for ln in lines if ln)
+    return _render_text(BeautifulSoup(fragment, "lxml"))
+
+
+def _unescape_js(raw: str) -> str:
+    def _one(m: re.Match) -> str:
+        esc = m.group(1)
+        if esc[0] == "u" and len(esc) == 5:
+            return chr(int(esc[1:], 16))
+        return _JS_SIMPLE_ESCAPES.get(esc, esc)
+    return _JS_ESCAPE_PAT.sub(_one, raw)
+
+
+def _script_strings(script_text: str, depth: int = 0) -> list[str]:
+    """String values inside a script that could hold a banner (contain '%')."""
+    out: list[str] = []
+    for m in _JS_STRING_PAT.finditer(script_text):
+        raw = m.group(1)
+        if "%" not in raw:
+            continue
+        value = _unescape_js(raw)
+        if depth == 0 and '":"' in value:
+            # A JSON document serialised inside a JS string: look inside it.
+            out.extend(_script_strings(value, depth + 1))
+            continue
+        out.append(value)
+    return out
+
+
+def _segments(text: str) -> list[str]:
+    segs: list[str] = []
+    for line in text.split("\n"):
+        for part in line.split("|"):
+            part = part.strip(" \t-–—•·")
+            if part:
+                segs.append(part)
+    return segs
+
+
+def _discount_pcts(seg: str) -> list[tuple[int, int, int]]:
+    """(pct, start, end) for each real discount percentage in *seg*."""
+    found: list[tuple[int, int, int]] = []
+    for m in _PCT_PAT.finditer(seg):
         pct = int(m.group(1))
-        code = m.group(2).upper()
-        key = (pct, code)
-        if not (1 <= pct <= 99) or key in found:
+        if not 1 <= pct <= 99:
             continue
-        if not _is_promotional_span(m.group(0)):
+        before = seg[max(0, m.start() - _DISCOUNT_BEFORE_CHARS):m.start()]
+        if _UP_TO_PAT.search(before):
             continue
-        found[key] = PromoInfo(
-            code=code,
-            discount_pct=Decimal(pct),
-            condition=_condition_around(m.start(), m.end()),
-            source_text=text[max(0, m.start() - 30):m.end() + 60][:max_len],
-        )
-
-    # Pattern B: code ... pct
-    for m in _CODE_PCT_PAT.finditer(text):
-        code = m.group(1).upper()
-        pct = int(m.group(2))
-        key = (pct, code)
-        if not (1 <= pct <= 99) or key in found:
+        after = seg[m.end():m.end() + _DISCOUNT_AFTER_CHARS]
+        if not (_DISCOUNT_WORD_PAT.search(before) or _DISCOUNT_WORD_PAT.search(after)):
             continue
-        if not _is_promotional_span(m.group(0)):
-            continue
-        found[key] = PromoInfo(
-            code=code,
-            discount_pct=Decimal(pct),
-            condition=_condition_around(m.start(), m.end()),
-            source_text=text[max(0, m.start() - 30):m.end() + 60][:max_len],
-        )
-
-    # Pattern C: bare pct in site-wide context (no code advertised)
-    for m in _SITEWIDE_BARE_PAT.finditer(text):
-        pct = int(m.group(1))
-        if not (1 <= pct <= 99):
-            continue
-        # Dedupe against any already-found coded promo at the same pct
-        if any(k[0] == pct for k in found):
-            continue
-        key = (pct, "")
-        if key in found:
-            continue
-        found[key] = PromoInfo(
-            code=None,
-            discount_pct=Decimal(pct),
-            condition=_condition_around(m.start(), m.end()),
-            source_text=text[max(0, m.start() - 30):m.end() + 60][:max_len],
-        )
-
-    return list(found.values())
+        found.append((pct, m.start(), m.end()))
+    return found
 
 
-def _extract_bare_promos(text: str, with_codes: set[tuple[int, str]]) -> list[PromoInfo]:
-    """Find bare 'N% off' promos that DON'T have a code nearby. Lower-ranked."""
-    if not text:
-        return []
-    results: list[PromoInfo] = []
-    seen_pcts: set[int] = set()
-
-    # Strip "up to N%" fragments first (they're tiered, handled separately)
-    cleaned = _UP_TO_PAT.sub("", text)
-
-    for m in _PCT_BARE_PAT.finditer(cleaned):
-        pct = int(m.group(1))
-        if not (1 <= pct <= 99):
-            continue
-        if pct in seen_pcts:
-            continue
-        # Skip if this same pct was already found paired with a code
-        if any(p == pct for p, _ in with_codes):
-            seen_pcts.add(pct)
-            continue
-        seen_pcts.add(pct)
-        snippet = cleaned[max(0, m.start() - 60):m.end() + 80]
-        snippet = re.sub(r"\s+", " ", snippet).strip()[:200]
-        results.append(PromoInfo(
-            code=None,
-            discount_pct=Decimal(pct),
-            condition=snippet,
-            source_text=snippet,
-        ))
-    return results
+def _codes(seg: str) -> list[tuple[str, int]]:
+    return [
+        (m.group(1), m.start())
+        for m in _CODE_PAT.finditer(seg)
+        if m.group(1) not in _NON_CODES
+    ]
 
 
-def _text_sources(html: str, soup: BeautifulSoup) -> list[str]:
-    """Return every text source worth scanning for promos."""
+def _nearest_pct(pcts: list[tuple[int, int, int]], code_pos: int) -> Optional[int]:
+    """Nearest preceding percentage, else nearest following, within the gap."""
+    before = [p for p in pcts if p[2] <= code_pos and code_pos - p[2] <= _MAX_PAIR_GAP]
+    if before:
+        return max(before, key=lambda p: p[2])[0]
+    after = [p for p in pcts if p[1] > code_pos and p[1] - code_pos <= _MAX_PAIR_GAP]
+    if after:
+        return min(after, key=lambda p: p[1])[0]
+    return None
+
+
+def parse_offers(text: str, max_len: int = 250) -> list[PromoInfo]:
+    """Every coded or code-less site-wide offer in one banner text.
+
+    Lines are separated by "\\n"; segments within a line by "|" (see the
+    pipeline above). Also used by the site plugins (MyProtein) so product
+    pages and the digest read banners the same way.
+    """
+    segs = _segments(text)
+    pcts = [_discount_pcts(s) for s in segs]
+    codes = [_codes(s) for s in segs]
+    offers: list[PromoInfo] = []
+    used: set[tuple[int, int]] = set()  # (segment index, pct) consumed by a code
+
+    def _make(code: Optional[str], pct: int, idxs: list[int]) -> PromoInfo:
+        lo, hi = min(idxs), max(idxs)
+        condition = " | ".join(segs[lo:hi + 1])[:max_len]
+        source = " | ".join(segs[max(0, lo - 1):hi + 2])[:max_len]
+        return PromoInfo(code=code, discount_pct=Decimal(pct),
+                         condition=condition, source_text=source)
+
+    for i, seg in enumerate(segs):
+        for code, pos in codes[i]:
+            if pcts[i]:
+                pct = _nearest_pct(pcts[i], pos)
+                if pct is not None:
+                    used.add((i, pct))
+                    offers.append(_make(code, pct, [i]))
+                continue
+            if len(seg) > _MAX_NEIGHBOUR_LEN:
+                continue
+            for j in (i - 1, i + 1):
+                if (0 <= j < len(segs) and pcts[j] and not codes[j]
+                        and len(segs[j]) <= _MAX_NEIGHBOUR_LEN):
+                    pct = pcts[j][-1][0] if j < i else pcts[j][0][0]
+                    used.add((j, pct))
+                    offers.append(_make(code, pct, [i, j]))
+                    break
+
+    for i, seg in enumerate(segs):
+        for pct, _start, end in pcts[i]:
+            if (i, pct) in used:
+                continue
+            if _SITEWIDE_PAT.search(seg[end:end + _SITEWIDE_AFTER_CHARS]):
+                offers.append(_make(None, pct, [i]))
+    return offers
+
+
+def _text_sources(soup: BeautifulSoup) -> list[str]:
+    """Every text source worth scanning: script string values, visible text,
+    meta descriptions. *soup* is consumed (scripts are removed)."""
     sources: list[str] = []
-
-    # 1. The entire raw HTML — the strict (code + pct) regex is anchored enough
-    #    that false positives are rare, and this catches banner JSON embedded
-    #    anywhere in a <script> tag (Terminal X's SINGLES20 lives at pos ~333k).
-    sources.append(html)
-
-    # 2. Promo/banner DOM elements — stripped text is cleaner for bare-pct scans
-    for sel in ('[class*="promo"]', '[class*="offer"]', '[class*="banner"]',
-                '[class*="code"]', '[data-component*="promo"]'):
-        for el in soup.select(sel):
-            t = el.get_text(" ", strip=True)
-            if t:
-                sources.append(t)
-
-    # 3. Header area
-    header = soup.find("header")
-    if header:
-        t = header.get_text(" ", strip=True)
-        if t:
-            sources.append(t)
-
-    # 4. Meta description
-    meta = soup.find("meta", attrs={"name": "description"})
-    if meta and meta.get("content"):
-        sources.append(str(meta["content"]))
-
+    for script in soup.find_all("script"):
+        for value in _script_strings(script.string or script.get_text() or ""):
+            text = _html_fragment_text(value)
+            if text:
+                sources.append(text)
+    for attrs in ({"name": "description"}, {"property": "og:description"}):
+        meta = soup.find("meta", attrs=attrs)
+        if meta and meta.get("content"):
+            sources.append(_html_fragment_text(str(meta["content"])))
+    sources.append(_render_text(soup))
     return sources
 
 
 def extract_promos(html: str) -> list[PromoInfo]:
     """Find every promo on the page. Returns dedup'd, ranked list."""
     soup = BeautifulSoup(html, "lxml")
-    sources = _text_sources(html, soup)
+    sources = _text_sources(soup)
 
     # Collect coded promos (dedup by code) and site-wide bare promos (dedup by pct).
     all_coded: dict[str, PromoInfo] = {}
     all_bare: dict[int, PromoInfo] = {}
     for src in sources:
-        for p in _extract_promos_from_text(src):
+        for p in parse_offers(src):
             if p.code is None:
                 pct_key = int(p.discount_pct)
                 if pct_key not in all_bare or len(p.condition or "") > len(all_bare[pct_key].condition or ""):
                     all_bare[pct_key] = p
-                continue
-            if p.code in _COMMON_NON_CODES:
                 continue
             key = p.code
             if key not in all_coded or p.discount_pct > all_coded[key].discount_pct:
@@ -290,11 +348,20 @@ def extract_promos(html: str) -> list[PromoInfo]:
     return merged
 
 
-_COMMON_NON_CODES = {
-    "SALE", "OFFER", "FREE", "GIFT", "BUY", "NEW", "TODAY",
-    "CODE", "KOD", "CODES", "COUPON", "COLOR", "COLOUR", "STAMPA",
-    "MANGO", "BRAND", "TYPE", "SIZE",
-}
+def element_text(tag) -> str:
+    """Visible text of one element with <br>/block breaks kept as "\\n"."""
+    return _render_text(BeautifulSoup(str(tag), "lxml"))
+
+
+def has_up_to_discount(text: str) -> bool:
+    """True if *text* advertises an 'up to N% off' (tiered) discount."""
+    for seg in _segments(text):
+        for m in _PCT_PAT.finditer(seg):
+            before = seg[max(0, m.start() - _DISCOUNT_BEFORE_CHARS):m.start()]
+            after = seg[m.end():m.end() + _DISCOUNT_AFTER_CHARS]
+            if _UP_TO_PAT.search(before) and _DISCOUNT_WORD_PAT.search(after):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +388,15 @@ def _fetch_homepage(host: str) -> tuple[Optional[str], str, Optional[str]]:
     try:
         with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
             resp = client.get(url)
-    except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError) as exc:
-        return None, "unreachable", str(exc)
-    if resp.status_code in (403, 429):
-        return None, "blocked", f"HTTP {resp.status_code}"
-    if resp.status_code >= 400:
-        return None, "unreachable", f"HTTP {resp.status_code}"
-    return resp.text, "ok", None
+            if resp.status_code in (403, 429):
+                return None, "blocked", f"HTTP {resp.status_code}"
+            if resp.status_code >= 400:
+                return None, "unreachable", f"HTTP {resp.status_code}"
+            return resp.text, "ok", None
+    # HTTPError covers TooManyRedirects / DecodingError / protocol errors too;
+    # InvalidURL is not an HTTPError subclass.
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        return None, "unreachable", f"{type(exc).__name__}: {exc}"
 
 
 def collect_digest() -> list[SiteDigest]:
@@ -339,16 +408,23 @@ def collect_digest() -> list[SiteDigest]:
             display_name=_display_name(host),
             homepage_url=f"https://{host}/",
         )
-        html, status, err = _fetch_homepage(host)
-        if status != "ok" or html is None:
-            site.status = status
-            site.error = err
-            digests.append(site)
-            continue
+        try:
+            html, status, err = _fetch_homepage(host)
+            if status != "ok" or html is None:
+                site.status = status
+                site.error = err
+                digests.append(site)
+                continue
 
-        promos = extract_promos(html)
-        site.promos = promos
-        site.status = "ok" if promos else "no_promo"
+            promos = extract_promos(html)
+            site.promos = promos
+            site.status = "ok" if promos else "no_promo"
+        except Exception as exc:
+            # One misbehaving homepage must not cancel the other sites.
+            log.error("Digest scan failed for %s: %s: %s", host, type(exc).__name__, exc)
+            site.promos = []
+            site.status = "unreachable"
+            site.error = f"{type(exc).__name__}: {exc}"
         digests.append(site)
     return digests
 
@@ -386,7 +462,10 @@ class DailyReport:
 def collect_daily_report() -> DailyReport:
     """Run every daily data-gathering stage and return a combined report."""
     report = DailyReport()
-    report.site_digests = collect_digest()
+    try:
+        report.site_digests = collect_digest()
+    except Exception as exc:
+        log.error("Sales digest stage failed: %s: %s", type(exc).__name__, exc)
     try:
         from price_watcher import creatine as _creatine
         report.creatine = _creatine.scan_and_report()
