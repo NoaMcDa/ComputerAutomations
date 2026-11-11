@@ -1342,11 +1342,12 @@ def build_daily_payload(report) -> EmailPayload | None:
     sm = getattr(report, "supermarkets", None)
     meat_blurb = ""
     if sm is not None and sm.status == "ok" and sm.promos:
-        best = max((int(p.savings_pct) for p in sm.promos if p.savings_pct is not None), default=0)
-        meat_blurb = (
-            f"מבצעי בשר ב-{len(sm.chains_scanned)} רשתות"
-            + (f", עד {best}% הנחה" if best else "")
-        )
+        # The meat tables are ranked by price per kg, not by discount, so the
+        # subject names where the deals are rather than a "best discount".
+        cities = list(getattr(sm, "cities", None) or [])
+        meat_blurb = f"מבצעי בשר ב-{len(sm.chains_scanned)} רשתות"
+        if 0 < len(cities) <= 3:
+            meat_blurb += " (" + ", ".join(cities) + ")"
 
     sims4_report = getattr(report, "sims4", None)
     sims_blurb = ""
