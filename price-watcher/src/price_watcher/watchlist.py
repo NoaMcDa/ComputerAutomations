@@ -8,7 +8,7 @@ import tempfile
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import unquote_plus, urlparse, urlunparse
 
 from rich.console import Console
 from rich.table import Table
@@ -19,25 +19,44 @@ from price_watcher.paths import watchlist_file
 console = Console()
 
 _SCHEMA_VERSION = 1
-_KEEP_PARAMS = {"variant", "size", "sku", "color", "colour", "flavour", "pid", "product_id", "id"}
+# Known tracking / attribution params that never identify a product; everything
+# else in the query string is kept.
+_TRACKING_PARAMS = {
+    "gclid", "gclsrc", "dclid", "gbraid", "wbraid", "fbclid", "msclkid", "srsltid",
+    "yclid", "twclid", "ttclid", "igshid", "ref", "ref_", "ref_src", "mc_cid", "mc_eid",
+    "_ga", "_gl", "_hsenc", "_hsmi", "mkt_tok",
+}
+
+
+def _is_tracking_param(key: str) -> bool:
+    k = unquote_plus(key).strip().lower()
+    return k.startswith("utm_") or k in _TRACKING_PARAMS
 
 
 def _normalise_url(raw: str) -> str:
     parsed = urlparse(raw)
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(f"Invalid URL (must have scheme and host): {raw!r}")
-    qs = parse_qs(parsed.query, keep_blank_values=True)
-    kept = {k: v for k, v in qs.items() if k in _KEEP_PARAMS}
-    new_query = urlencode(kept, doseq=True)
+    # Keep the remaining query pairs verbatim (order and encoding preserved).
+    pairs = [p for p in parsed.query.split("&") if p and not _is_tracking_param(p.split("=", 1)[0])]
+    new_query = "&".join(pairs)
     # Strip fragment; preserve path with non-ASCII chars as-is (no re-encoding)
-    normalised = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, ""))
-    return normalised
+    return urlunparse(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, parsed.params, new_query, "")
+    )
 
 
 def _make_id(normalised_url: str) -> str:
-    host = urlparse(normalised_url).netloc.lstrip("www.")
+    host = urlparse(normalised_url).netloc.lower().removeprefix("www.")
     short = hashlib.sha1(normalised_url.encode()).hexdigest()[:8]
     return f"{host}-{short}"
+
+
+def _same_url(stored: str, normalised: str) -> bool:
+    try:
+        return _normalise_url(stored) == normalised
+    except ValueError:
+        return stored == normalised
 
 
 class _Encoder(json.JSONEncoder):
@@ -94,7 +113,7 @@ def add(url: str, name: str | None = None, selector: str | None = None) -> None:
     watch_id = _make_id(normalised)
     watches = load_all()
 
-    if any(w.id == watch_id for w in watches):
+    if any(w.id == watch_id or _same_url(w.url, normalised) for w in watches):
         console.print(f"[yellow]Already watching:[/yellow] {normalised}")
         return
 
@@ -111,7 +130,12 @@ def add(url: str, name: str | None = None, selector: str | None = None) -> None:
         raise SystemExit(1)
 
     label = name or normalised
-    price_str = f"{result.price} {result.currency}" if result.price is not None else "unknown"
+    if result.price is None:
+        price_str = "unknown"
+    elif result.currency:
+        price_str = f"{result.price} {result.currency}"
+    else:
+        price_str = f"{result.price}"
     console.print(f"Added: {label} — current price: {price_str}")
 
     watch = Watch(
@@ -167,22 +191,27 @@ def remove(target: str) -> None:
         target_id = target
         normalised = None
 
-    before = len(watches)
-    watches = [
-        w for w in watches
-        if w.id != target_id and w.id != target and w.url != normalised
-    ]
+    def _matches(w: Watch) -> bool:
+        return (
+            w.id == target_id
+            or w.id == target
+            or w.url == normalised
+            or (normalised is not None and _same_url(w.url, normalised))
+        )
 
-    if len(watches) == before:
+    removed_ids = [w.id for w in watches if _matches(w)]
+    watches = [w for w in watches if not _matches(w)]
+
+    if not removed_ids:
         console.print(f"[yellow]Not found:[/yellow] {target!r}")
         raise SystemExit(1)
 
     save_all(watches)
 
-    removed_id = target_id if target_id else target
     try:
         from price_watcher.state import drop_watch
-        drop_watch(removed_id)
+        for rid in removed_ids:
+            drop_watch(rid)
     except Exception:
         pass
 

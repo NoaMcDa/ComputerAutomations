@@ -8,10 +8,13 @@ from price_watcher.paths import log_dir
 
 
 _configured = False
+VALID_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 def configure(level: str = "INFO") -> None:
     global _configured
+    if level.upper() not in VALID_LEVELS:
+        raise ValueError(f"Invalid log level {level!r}; use one of {', '.join(VALID_LEVELS)}")
     if _configured:
         return
 
