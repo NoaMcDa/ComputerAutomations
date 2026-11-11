@@ -255,6 +255,8 @@ def _parse_cells(html: str) -> tuple[list[CreatineProduct], int]:
     soup = BeautifulSoup(html, "lxml")
     cells = soup.select(".product-cell")
     products: list[CreatineProduct] = []
+    seen: set[str] = set()
+    duplicates = 0
     for cell in cells:
         title_el = cell.select_one(".product-title")
         if not title_el:
@@ -275,10 +277,24 @@ def _parse_cells(html: str) -> tuple[list[CreatineProduct], int]:
             continue
         price, currency, per_unit, unit, on_sale = parsed
 
-        link_el = cell.select_one("a[href]")
+        # The product link is the title's own anchor, else the first /pr/ link;
+        # iHerb's own brands carry an "/iherb-brands" badge anchor first.
+        link_el = (title_el.find_parent("a", href=True)
+                   or title_el.select_one("a[href]")
+                   or cell.select_one('a[href*="/pr/"]')
+                   or cell.select_one("a[href]"))
         href = link_el.get("href", "") if link_el else ""
         if href and not href.startswith("http"):
             href = f"https://il.iherb.com{href}"
+
+        # iHerb repeats products (sponsored + organic): keep the first one.
+        m_id = re.search(r"/pr/[^?#]*?/(\d+)(?:[/?#]|$)", href)
+        key = m_id.group(1) if m_id else f"{href.split('?')[0].split('#')[0]}|{name}"
+        if href:
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
 
         products.append(CreatineProduct(
             name=name,
@@ -290,7 +306,7 @@ def _parse_cells(html: str) -> tuple[list[CreatineProduct], int]:
             on_sale=on_sale,
             seller="iHerb",
         ))
-    return products, len(cells)
+    return products, len(cells) - duplicates
 
 
 _scan_cells_seen = 0

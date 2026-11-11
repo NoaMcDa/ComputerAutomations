@@ -63,3 +63,20 @@ def test_cheapest_only_compares_dominant_currency():
     ]) + "</body>"
     products, _ = creatine._parse_cells(html)
     assert creatine.pick_cheapest(products).name == "Creatine A Powder"
+
+
+def test_duplicate_products_are_listed_once_and_counted_once():
+    cells = (_cell("A", "₪90.00 (₪9.00 ל-100 גרם)", "/pr/a/111")
+             + _cell("B", "₪50.00 (₪10.00 ל-100 גרם)", "/pr/b/222")
+             + _cell("A", "₪90.00 (₪9.00 ל-100 גרם)", "/pr/a/111?sponsored=1"))
+    products, seen = creatine._parse_cells(f"<body>{cells}</body>")
+    assert [p.name for p in products] == ["A", "B"]
+    assert seen == 2
+
+
+def test_iherb_brand_badge_is_not_used_as_product_link():
+    cell = ('<div class="product-cell"><a href="/iherb-brands">iHerb brands</a>'
+            '<a href="https://il.iherb.com/pr/cgn-creatine/71026"><span class="product-title">CGN</span></a>'
+            '<span class="product-price">₪90.00 (₪9.00 ל-100 גרם)</span></div>')
+    (p,), _ = creatine._parse_cells(f"<body>{cell}</body>")
+    assert p.url == "https://il.iherb.com/pr/cgn-creatine/71026"
