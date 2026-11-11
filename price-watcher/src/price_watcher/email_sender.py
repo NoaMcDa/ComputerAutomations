@@ -99,6 +99,9 @@ _STATUS_HE = {
     "fetch_failed": "האחזור נכשל",
     "no_powder": "לא נמצאה אבקת קריאטין",
     "unavailable": "לא זמין",
+    "not_found": "הדף לא נמצא",
+    "price_not_found": "לא נמצא מחיר בדף",
+    "no_promo": "לא זוהה מבצע",
 }
 
 _SIGNATURE = "מעקב מחירים"
@@ -110,6 +113,31 @@ def _direction_he(pct: float | None) -> str:
 
 def _status_he(status: str | None) -> str:
     return _STATUS_HE.get(status or "unavailable", status or "")
+
+
+def failure_detail_he(fetch: "FetchResult") -> str:
+    """Hebrew explanation of why a watch's fetch failed (empty if it did not)."""
+    from price_watcher.contracts import FetchResult, FetchStatus  # noqa: F401
+
+    msg = (fetch.error_message or "").strip()
+    http = f" (HTTP {fetch.http_status})" if fetch.http_status else ""
+    if fetch.status == FetchStatus.OK:
+        if fetch.price is not None and fetch.price == 0:
+            return "המחיר באתר הוצג כ-0 – ייתכן שהמוצר אינו זמין או שהדף השתנה"
+        return ""
+    if fetch.status == FetchStatus.NOT_FOUND and "variant" in msg.lower():
+        return (
+            "הווריאציה שנבחרה (מידה/צבע) הוסרה מהמוצר באתר – "
+            "מומלץ למחוק את המעקב ולהוסיף אותו מחדש עם הווריאציה הנכונה"
+            + (f" ({msg})" if msg else "")
+        )
+    if fetch.status == FetchStatus.NOT_FOUND:
+        base = f"הדף לא נמצא{http} – ייתכן שהמוצר הוסר מהאתר"
+    elif fetch.status == FetchStatus.BLOCKED:
+        base = f"האתר חסם את הבקשה{http} – כדאי להמתין או להגדיר סלקטור"
+    else:
+        base = f"{_status_he(fetch.status.value)}{http}"
+    return f"{base} ({msg})" if msg else base
 
 
 def _stock_he(in_stock: bool | None) -> str:
@@ -281,6 +309,7 @@ def _text_event(event: ChangeEvent) -> str:
         lines += [
             f"המעקב הפסיק לעבוד: {label}",
             f"  סיבה: {reason}",
+            *([f"  פירוט: {detail}"] if (detail := failure_detail_he(event.fetch)) else []),
             "  ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש.",
             f"  קישור: {url}",
         ]
@@ -405,6 +434,7 @@ def _html_event(event: ChangeEvent) -> str:
         heading = f'המעקב הפסיק לעבוד: {label}'
         rows += [
             row("סיבה", reason),
+            *([row("פירוט", escape(detail))] if (detail := failure_detail_he(event.fetch)) else []),
             row("הערה", "ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש."),
             row("קישור", link),
         ]
