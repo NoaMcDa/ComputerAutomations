@@ -16,7 +16,7 @@ from html import escape
 from urllib.parse import urlparse
 
 from price_watcher import config as _config_module
-from price_watcher.contracts import ChangeEvent, ChangeType, EmailPayload
+from price_watcher.contracts import ChangeEvent, ChangeType, EmailPayload, PromoInfo
 from price_watcher.logging_setup import get as _get_logger
 
 log = _get_logger(__name__)
@@ -44,9 +44,15 @@ _CURRENCY_SYMBOLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _currency_symbol(code: str | None) -> str:
-    if code is None:
-        return "₪"
+    """Symbol for an ISO code; unknown codes are shown as-is, a missing
+    currency as nothing (never guessed as ₪)."""
+    if not code:
+        return ""
     return _CURRENCY_SYMBOLS.get(code.upper(), code.upper())
+
+
+def _with_sym(amount: str, symbol: str) -> str:
+    return f"{amount} {symbol}" if symbol else amount
 
 
 def _watch_label(event: ChangeEvent) -> str:
@@ -65,17 +71,27 @@ def _truncate(s: str, max_len: int = 35) -> str:
 def _fmt_price(price: Decimal | None, symbol: str) -> str:
     if price is None:
         return "?"
-    return f"{price:,.2f} {symbol}".rstrip("0").rstrip(".")
+    return _with_sym(f"{price:,.2f}", symbol)
+
+
+def _subject_amounts(*prices: Decimal | None) -> list[str]:
+    """Amounts for a subject line: whole numbers when every price is whole,
+    otherwise two decimals for all (so 9.90 → 9.50 never reads "10 → 10")."""
+    known = [p for p in prices if p is not None]
+    decimals = 0 if all(p == p.to_integral_value() for p in known) else 2
+    return [f"{p:,.{decimals}f}" if p is not None else "?" for p in prices]
 
 
 def _direction_word(pct: float | None) -> str:
     """Internal (English) direction key — see _DIRECTION_HE for display."""
     if pct is None:
         return "changed"
+    if pct == 0:
+        return "unchanged"
     return "dropped" if pct < 0 else "rose"
 
 
-_DIRECTION_HE = {"dropped": "ירד", "rose": "עלה", "changed": "השתנה"}
+_DIRECTION_HE = {"dropped": "ירד", "rose": "עלה", "changed": "השתנה", "unchanged": "לא השתנה"}
 
 _STATUS_HE = {
     "unreachable": "האתר לא זמין",
@@ -105,6 +121,32 @@ def _ltr(value: object) -> str:
     return f'<span dir="ltr">{escape(str(value))}</span>'
 
 
+def _promo_word(event: ChangeEvent) -> str:
+    """Heading for a promo change: ended vs. changed."""
+    return "המבצע הסתיים" if event.fetch.promo is None else "המבצע השתנה"
+
+
+def _promo_details(promo: PromoInfo) -> str:
+    """Code + percentage; the percentage is shown even without a code."""
+    if promo.code:
+        return f"קוד: {promo.code}  ({promo.discount_pct}% הנחה)"
+    return f"הנחה: {promo.discount_pct}%"
+
+
+def _old_symbol(event: ChangeEvent, sym: str) -> str:
+    return _currency_symbol(event.old_currency) if event.old_currency else sym
+
+
+def _price_diff_str(event: ChangeEvent, sym: str) -> str:
+    if event.diff is None or event.pct_change is None:
+        return ""
+    return f"{_with_sym(f'{event.diff:+,.2f}', sym)}, {event.pct_change:+.1f}%"
+
+
+def _currency_note(event: ChangeEvent) -> str:
+    return f"המטבע השתנה מ-{event.old_currency} ל-{event.fetch.currency}"
+
+
 # ---------------------------------------------------------------------------
 # Subject builders
 # ---------------------------------------------------------------------------
@@ -113,23 +155,39 @@ def _subject_single(event: ChangeEvent) -> str:
     label = _truncate(_watch_label(event))
     sym = _currency_symbol(event.fetch.currency)
 
-    if event.type == ChangeType.PRICE_CHANGED:
-        old = f"{event.old_price:,.0f}" if event.old_price is not None else "?"
-        new = f"{event.new_price:,.0f}" if event.new_price is not None else "?"
+    def price_part() -> str:
+        old, new = _subject_amounts(event.old_price, event.new_price)
+        if event.old_currency:
+            return (
+                f"מ-{_with_sym(old, _old_symbol(event, sym))} ל-{_with_sym(new, sym)}"
+                " (המטבע השתנה)"
+            )
         pct = f" ({event.pct_change:+.1f}%)" if event.pct_change is not None else ""
-        return f"המחיר {_direction_he(event.pct_change)}: {label} – מ-{old} ל-{new} {sym}{pct}"
+        return f"מ-{old} ל-{_with_sym(new, sym)}{pct}"
+
+    # Secondary changes carried by the same event.
+    extras = ""
+    if event.stock_changed and event.type != ChangeType.STOCK_CHANGED:
+        extras += f" · {_stock_he(event.fetch.in_stock)}"
+    if event.promo_changed and event.type != ChangeType.PROMO_CHANGED:
+        extras += f" · {_promo_word(event)}"
+
+    if event.type == ChangeType.PRICE_CHANGED:
+        return f"המחיר {_direction_he(event.pct_change)}: {label} – {price_part()}{extras}"
 
     if event.type == ChangeType.STOCK_CHANGED:
-        return f"עדכון מלאי: {label} – {_stock_he(event.fetch.in_stock)}"
+        return f"עדכון מלאי: {label} – {_stock_he(event.fetch.in_stock)}{extras}"
 
     if event.type == ChangeType.PROMO_CHANGED:
-        return f"המבצע השתנה: {label}"
+        return f"{_promo_word(event)}: {label}"
 
     if event.type == ChangeType.THRESHOLD_FAILURE:
         return f"המעקב הפסיק לעבוד: {label}"
 
     if event.type == ChangeType.RECOVERED:
-        return f"המעקב חזר לעבוד: {label}"
+        if event.old_price is not None or event.new_price is not None:
+            extras = f" – המחיר {_direction_he(event.pct_change)} {price_part()}" + extras
+        return f"המעקב חזר לעבוד: {label}{extras}"
 
     return f"עדכון ממעקב המחירים: {label}"
 
@@ -157,16 +215,43 @@ def _text_event(event: ChangeEvent) -> str:
     ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
     lines: list[str] = []
 
-    if event.type == ChangeType.PRICE_CHANGED:
-        old = _fmt_price(event.old_price, sym)
+    def price_lines() -> list[str]:
+        old = _fmt_price(event.old_price, _old_symbol(event, sym))
         new = _fmt_price(event.new_price, sym)
-        diff_str = ""
-        if event.diff is not None and event.pct_change is not None:
-            diff_str = f"  ({event.diff:+,.2f} {sym}, {event.pct_change:+.1f}%)"
-        lines += [
-            f"המחיר {_direction_he(event.pct_change)}: {label}",
+        diff_str = _price_diff_str(event, sym)
+        out = [
             f"  מחיר קודם: {old}",
-            f"  מחיר חדש: {new}{diff_str}",
+            f"  מחיר חדש: {new}" + (f"  ({diff_str})" if diff_str else ""),
+        ]
+        if event.old_currency:
+            out.append(f"  {_currency_note(event)}")
+        return out
+
+    def promo_lines() -> list[str]:
+        promo = event.fetch.promo
+        if promo is None:
+            line = "  המבצע הסתיים"
+            if event.old_promo is not None:
+                line += f" (היה: {_promo_details(event.old_promo)})"
+            return [line]
+        out = [f"  {_promo_details(promo)}"]
+        if promo.condition:
+            out.append(f"  תנאים: {promo.condition}")
+        return out
+
+    def extra_lines() -> list[str]:
+        out: list[str] = []
+        if event.stock_changed and event.type != ChangeType.STOCK_CHANGED:
+            out.append(f"  מלאי: {_stock_he(event.fetch.in_stock)}")
+        if event.promo_changed and event.type != ChangeType.PROMO_CHANGED:
+            out += promo_lines()
+        return out
+
+    if event.type == ChangeType.PRICE_CHANGED:
+        lines += [f"המחיר {_direction_he(event.pct_change)}: {label}"]
+        lines += price_lines()
+        lines += extra_lines()
+        lines += [
             f"  קישור: {url}",
             f"  נבדק: {ts}",
         ]
@@ -177,24 +262,19 @@ def _text_event(event: ChangeEvent) -> str:
             f"עדכון מלאי: {_stock_he(event.fetch.in_stock)}",
             f"  מוצר: {label}",
             f"  מחיר נוכחי: {price_str}",
-            f"  קישור: {url}",
         ]
+        lines += extra_lines()
+        lines += [f"  קישור: {url}"]
 
     elif event.type == ChangeType.PROMO_CHANGED:
-        promo = event.fetch.promo
         displayed = _fmt_price(event.fetch.price, sym)
-        estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-        lines += [f"המבצע השתנה: {label}"]
-        if promo:
-            if promo.code:
-                lines.append(f"  קוד: {promo.code}  ({promo.discount_pct}% הנחה)")
-            if promo.condition:
-                lines.append(f"  תנאים: {promo.condition}")
-        lines += [
-            f"  מחיר מוצג: {displayed}",
-            f"  מחיר סופי משוער: {estimated}",
-            f"  קישור: {url}",
-        ]
+        lines += [f"{_promo_word(event)}: {label}"]
+        lines += promo_lines()
+        lines.append(f"  מחיר מוצג: {displayed}")
+        if event.fetch.estimated_final_price is not None:
+            estimated = _fmt_price(event.fetch.estimated_final_price, sym)
+            lines.append(f"  מחיר סופי משוער: {estimated}")
+        lines += [f"  קישור: {url}"]
 
     elif event.type == ChangeType.THRESHOLD_FAILURE:
         reason = event.reason or "שגיאה לא ידועה"
@@ -206,12 +286,14 @@ def _text_event(event: ChangeEvent) -> str:
         ]
 
     elif event.type == ChangeType.RECOVERED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        lines += [
-            f"המעקב חזר לעבוד: {label}",
-            f"  מחיר נוכחי: {price_str}",
-            f"  קישור: {url}",
-        ]
+        lines += [f"המעקב חזר לעבוד: {label}"]
+        if event.old_price is not None or event.new_price is not None:
+            lines += [f"  המחיר {_direction_he(event.pct_change)} בזמן התקלה:"]
+            lines += price_lines()
+        else:
+            lines += [f"  מחיר נוכחי: {_fmt_price(event.fetch.price, sym)}"]
+        lines += extra_lines()
+        lines += [f"  קישור: {url}"]
 
     return "\n".join(lines)
 
@@ -241,21 +323,59 @@ def _html_event(event: ChangeEvent) -> str:
             f'<td style="padding:4px 8px;text-align:right">{val}</td></tr>'
         )
 
-    if event.type == ChangeType.PRICE_CHANGED:
-        direction = _direction_word(event.pct_change)
-        color = "#c00" if direction == "rose" else "#080"
-        old = _fmt_price(event.old_price, sym)
+    direction = _direction_word(event.pct_change)
+    price_color = "#c00" if direction == "rose" else "#080"
+
+    def price_rows() -> list[str]:
+        old = _fmt_price(event.old_price, _old_symbol(event, sym))
         new = _fmt_price(event.new_price, sym)
-        diff_str = ""
-        if event.diff is not None and event.pct_change is not None:
-            diff_str = f"{event.diff:+,.2f} {sym}, {event.pct_change:+.1f}%"
-        heading = (
-            f'המחיר <span style="color:{color}">{_DIRECTION_HE[direction]}</span>: {label}'
-        )
-        rows += [
+        out = [
             row("מחיר קודם", _ltr(old)),
-            row("מחיר חדש", f'<strong style="color:{color}">{_ltr(new)}</strong>'),
-            row("שינוי", _ltr(diff_str)),
+            row("מחיר חדש", f'<strong style="color:{price_color}">{_ltr(new)}</strong>'),
+        ]
+        diff_str = _price_diff_str(event, sym)
+        if diff_str:
+            out.append(row("שינוי", _ltr(diff_str)))
+        if event.old_currency:
+            out.append(row("מטבע", escape(_currency_note(event))))
+        return out
+
+    def promo_rows() -> list[str]:
+        promo = event.fetch.promo
+        if promo is None:
+            val = "המבצע הסתיים"
+            old = event.old_promo
+            if old is not None:
+                val += f" (היה: {escape(_promo_details(old))})"
+            return [row("מבצע", val)]
+        out: list[str] = []
+        if promo.code:
+            out.append(row(
+                "קוד",
+                f'<strong dir="ltr">{escape(promo.code)}</strong> '
+                f'({escape(str(promo.discount_pct))}% הנחה)',
+            ))
+        else:
+            out.append(row("הנחה", _ltr(f"{promo.discount_pct}%")))
+        if promo.condition:
+            out.append(row("תנאים", escape(promo.condition)))
+        return out
+
+    def extra_rows() -> list[str]:
+        out: list[str] = []
+        if event.stock_changed and event.type != ChangeType.STOCK_CHANGED:
+            out.append(row("מלאי", escape(_stock_he(event.fetch.in_stock))))
+        if event.promo_changed and event.type != ChangeType.PROMO_CHANGED:
+            out += promo_rows()
+        return out
+
+    if event.type == ChangeType.PRICE_CHANGED:
+        heading = (
+            f'המחיר <span style="color:{price_color}">{_DIRECTION_HE[direction]}</span>: {label}'
+        )
+        rows += price_rows()
+        rows += extra_rows()
+        rows += [
             row("נבדק", _ltr(ts)),
             row("קישור", link),
         ]
@@ -264,29 +384,21 @@ def _html_event(event: ChangeEvent) -> str:
         color = "#080" if event.fetch.in_stock else "#c00"
         price_str = _fmt_price(event.new_price or event.fetch.price, sym)
         heading = f'<span style="color:{color}">{_stock_he(event.fetch.in_stock)}</span>: {label}'
-        rows += [
-            row("מחיר נוכחי", _ltr(price_str)),
-            row("קישור", link),
-        ]
+        rows += [row("מחיר נוכחי", _ltr(price_str))]
+        rows += extra_rows()
+        rows += [row("קישור", link)]
 
     elif event.type == ChangeType.PROMO_CHANGED:
-        promo = event.fetch.promo
         displayed = _fmt_price(event.fetch.price, sym)
-        estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-        heading = f"המבצע השתנה: {label}"
-        if promo and promo.code:
+        heading = f"{_promo_word(event)}: {label}"
+        rows += promo_rows()
+        rows.append(row("מחיר מוצג", _ltr(displayed)))
+        if event.fetch.estimated_final_price is not None:
+            estimated = _fmt_price(event.fetch.estimated_final_price, sym)
             rows.append(row(
-                "קוד",
-                f'<strong dir="ltr">{escape(promo.code)}</strong> '
-                f'({escape(str(promo.discount_pct))}% הנחה)',
+                "מחיר סופי משוער", f'<strong>{_ltr(estimated)}</strong> <em>(הערכה)</em>'
             ))
-        if promo and promo.condition:
-            rows.append(row("תנאים", escape(promo.condition)))
-        rows += [
-            row("מחיר מוצג", _ltr(displayed)),
-            row("מחיר סופי משוער", f'<strong>{_ltr(estimated)}</strong> <em>(הערכה)</em>'),
-            row("קישור", link),
-        ]
+        rows += [row("קישור", link)]
 
     elif event.type == ChangeType.THRESHOLD_FAILURE:
         reason = escape(event.reason or "שגיאה לא ידועה")
@@ -298,12 +410,13 @@ def _html_event(event: ChangeEvent) -> str:
         ]
 
     elif event.type == ChangeType.RECOVERED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
         heading = f'המעקב חזר לעבוד: {label}'
-        rows += [
-            row("מחיר נוכחי", _ltr(price_str)),
-            row("קישור", link),
-        ]
+        if event.old_price is not None or event.new_price is not None:
+            rows += price_rows()
+        else:
+            rows += [row("מחיר נוכחי", _ltr(_fmt_price(event.fetch.price, sym)))]
+        rows += extra_rows()
+        rows += [row("קישור", link)]
     else:
         heading = f"עדכון: {label}"
 

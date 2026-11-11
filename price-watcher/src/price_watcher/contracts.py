@@ -96,6 +96,13 @@ class ChangeEvent:
     diff: Optional[Decimal] = None
     reason: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
+    # Secondary changes carried by the same event (e.g. a PRICE_CHANGED that
+    # also went out of stock, or a RECOVERED whose price moved meanwhile).
+    stock_changed: bool = False
+    promo_changed: bool = False
+    old_promo: Optional[PromoInfo] = None
+    # Set when the price is compared across a currency switch.
+    old_currency: Optional[str] = None
 
 
 # ---- Email ----
