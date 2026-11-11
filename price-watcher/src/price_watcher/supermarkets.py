@@ -4,13 +4,22 @@ Uses the government-mandated price transparency XML feeds. Each chain
 publishes PriceFull (every item + price) and PromoFull (active promotions)
 files per store, refreshed daily.
 
-Scope: only stores located in the regions listed in `_REGIONS` (the Sharon,
-Tel Aviv, and the Rishon LeZion area). Each chain's Stores file maps store
-ids to cities; every store of every chain inside those regions is scanned
-(`PW_STORES_PER_REGION` can cap that per chain for a faster run). Chains
-with no store there are skipped. The report is organised by meat category:
-each category keeps its best `PW_TOP_PER_CATEGORY` deals (default 10), with
-at least one deal from every region that has one and a spread of chains.
+Chains: Shufersal, the chains on url.publishedprices.co.il
+(`_PUBLISHEDPRICES_CHAINS`) and the Bina Projects portals (`_BINA_CHAINS`,
+Super Bareket).
+
+Scope: only stores in the cities switched ON in `_REGIONS` (now Herzliya and
+Ramat HaSharon; the other Sharon cities, Tel Aviv and the Rishon LeZion area
+are listed but OFF), or the cities named in PW_MEAT_CITIES. Each chain's
+Stores file maps store ids to cities; every store of every chain in those
+cities is scanned (`PW_STORES_PER_REGION` can cap that per chain and region).
+A chain with no store there is reported as empty ("אין סניפים בערים
+שנבחרו"). The report is organised by meat category: each category keeps its
+`PW_TOP_PER_CATEGORY` cheapest deals (default 5) by promo price PER KG; a
+deal whose price per kg cannot be derived reliably is left out of the ranking
+and counted (`unpriced_by_category`, see `_pack_grams`). A category is one
+cut of one animal, fresh or frozen ("כנפיים עוף", "לשון בקר – קפוא"); the
+catch-all groups ("בשר – אחר", ...) are counted but not ranked (`_CATCH_ALL`).
 
 For every store the newest PromoFull and PriceFull of the chain's own chain
 id are paired; files older than `_MAX_FEED_AGE_DAYS` are ignored. Chains that
@@ -74,69 +83,112 @@ _PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
 )
 _SHUFERSAL_NAME = "שופרסל"
 
+# Chains hosted by Bina Projects, each on its own <subdomain>.binaprojects.com
+# portal (an ASP.NET page whose JSON endpoints list and hand out the files).
+# (subdomain, chain_display_name)
+_BINA_URL = "https://{sub}.binaprojects.com/"
+_BINA_CHAINS: tuple[tuple[str, str], ...] = (
+    ("superbareket", "סופר ברקת"),
+)
 
-# ---- Regions ----
-# Only stores in these regions are scanned. Each city is (CBS locality code,
-# Hebrew spellings). The code is matched against the Stores file's <City>;
-# the spellings are a fallback for chains that publish City=0 and only name
-# the city inside the store name / address. A code of None = name match only.
-_REGIONS: tuple[tuple[str, tuple[tuple[Optional[str], tuple[str, ...]], ...]], ...] = (
+
+# ---- Scan area: regions and cities ----
+#
+# Which cities are scanned. Every city is written as
+#     (CBS locality code, (Hebrew spellings...), ON or OFF)
+# ON = stores in that city are scanned, OFF = known but skipped. To switch a
+# city on or off, change ON/OFF here — or, without editing code, set
+# PW_MEAT_CITIES in .env to a comma-separated list of city (or region) names,
+# e.g. "PW_MEAT_CITIES=הרצליה,רמת השרון,תל אביב", or "הכל" for every city
+# below. PW_MEAT_CITIES, when set, replaces the ON/OFF column.
+#
+# The code is matched against the Stores file's <City>; the spellings are used
+# for chains that publish City=0 and only name the city inside the store name
+# or address (see `_region_for_store`). A code of None = name match only. OFF
+# cities still matter: a store recognised as being in an OFF city is left out
+# even when its address mentions an ON city ("רחוב הרצליה" in Netanya).
+ON, OFF = True, False
+
+_REGIONS: tuple[tuple[str, tuple[tuple[Optional[str], tuple[str, ...], bool], ...]], ...] = (
     ("השרון", (
-        ("7400", ("נתניה",)),
-        ("6400", ("הרצליה",)),
-        ("8700", ("רעננה",)),
-        ("6900", ("כפר סבא", 'כפ"ס')),
-        ("9700", ("הוד השרון",)),
-        ("2650", ("רמת השרון", 'רמה"ש')),
-        ("168", ("כפר יונה",)),
-        ("182", ("אבן יהודה",)),
-        ("154", ("תל מונד",)),
-        ("195", ("קדימה", "צורן")),
-        ("171", ("פרדסיה",)),
-        ("2720", ("טירה",)),
-        ("2730", ("טייבה",)),
-        ("346", ("גליל ים",)),
-        (None, ("קלנסווה",)),
-        (None, ("כוכב יאיר",)),
+        ("6400", ("הרצליה", "הרצלייה"), ON),
+        ("2650", ("רמת השרון", "רמת-השרון", 'רמה"ש'), ON),
+        ("7400", ("נתניה",), OFF),
+        ("8700", ("רעננה",), OFF),
+        ("6900", ("כפר סבא", "כפר-סבא", 'כפ"ס'), OFF),
+        ("9700", ("הוד השרון", "הוד-השרון"), OFF),
+        ("168", ("כפר יונה",), OFF),
+        ("182", ("אבן יהודה",), OFF),
+        ("154", ("תל מונד",), OFF),
+        ("195", ("קדימה", "צורן"), OFF),
+        ("171", ("פרדסיה",), OFF),
+        ("2720", ("טירה",), OFF),
+        ("2730", ("טייבה",), OFF),
+        ("346", ("גליל ים",), OFF),
+        (None, ("קלנסווה",), OFF),
+        (None, ("כוכב יאיר",), OFF),
     )),
     ("תל אביב", (
-        ("5000", ("תל אביב", "תל-אביב", 'ת"א')),
+        ("5000", ("תל אביב", "תל-אביב", 'ת"א', "יד אליהו", "רמת אביב", "נווה צדק", "פלורנטין"), OFF),
     )),
     ("ראשון לציון והסביבה", (
-        ("8300", ("ראשון לציון", 'ראשל"צ', "ראשון")),
-        ("7200", ("נס ציונה",)),
-        ("2530", ("באר יעקב",)),
-        ("466", ("בית דגן",)),
-        ("6600", ("חולון",)),
-        ("6200", ("בת ים",)),
+        ("8300", ("ראשון לציון", "ראשון-לציון", 'ראשל"צ', "ראשלצ"), OFF),
+        ("7200", ("נס ציונה", "נס-ציונה"), OFF),
+        ("2530", ("באר יעקב",), OFF),
+        ("466", ("בית דגן",), OFF),
+        ("6600", ("חולון",), OFF),
+        ("6200", ("בת ים", "בת-ים"), OFF),
     )),
 )
 
 _REGION_ORDER: tuple[str, ...] = tuple(name for name, _ in _REGIONS)
 
+# Every known city in table order: (region, city display name, enabled flag).
+_ALL_CITIES: tuple[tuple[str, str, bool], ...] = tuple(
+    (region, names[0], on) for region, cities in _REGIONS for _code, names, on in cities
+)
+_CITY_ORDER: tuple[str, ...] = tuple(city for _r, city, _on in _ALL_CITIES)
+
 # code -> (region, city display name)
 _CODE_TO_REGION: dict[str, tuple[str, str]] = {
     code: (region, names[0])
     for region, cities in _REGIONS
-    for code, names in cities
+    for code, names, _on in cities
     if code is not None
 }
 
-# (compiled pattern, region, city display name), longest spelling first.
-_NAME_TO_REGION: list[tuple[re.Pattern, str, str]] = sorted(
+
+def _norm(text: str) -> str:
+    """Unify Hebrew geresh / gershayim so 'ק״ג' and 'ק"ג' compare equal."""
+    return (text or "").replace("״", '"').replace("׳", "'").replace("`", "'")
+
+
+# (compiled pattern, region, city display name, spelling length), longest
+# spelling first. A spelling must stand as whole words ("הרצל" street never
+# matches "הרצליה", "רמת השרוני" is not "רמת השרון").
+_NAME_TO_REGION: list[tuple[re.Pattern, str, str, int]] = sorted(
     (
         (
-            re.compile(r"(?:^|[^א-ת])" + re.escape(spelling) + r"(?:$|[^א-ת\"])"),
+            re.compile(r"(?<![א-ת])" + re.escape(_norm(spelling)) + r"(?![א-ת\"])"),
             region,
             names[0],
             len(spelling),
         )
         for region, cities in _REGIONS
-        for _code, names in cities
+        for _code, names, _on in cities
         for spelling in names
     ),
     key=lambda t: -t[3],
-)  # type: ignore[assignment]
+)
+
+# A city spelling right after one of these words names a street, not the city
+# ("רחוב נתניה", "דרך רעננה", "שד' ראשון לציון").
+_STREET_WORD_RE = re.compile(
+    r"(?<![א-ת])(?:רחוב|רח'|רח\.|רח|דרך|שדרות|שדרת|שד'|שד\.|שד|כביש|סמטת|סמ'|כיכר|ככר|מבוא)"
+    r"\s*$"
+)
+# In an address, a spelling followed by a house number is a street ("תל אביב 11").
+_HOUSE_NUMBER_RE = re.compile(r"^\s*-?\s*\d")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -153,7 +205,51 @@ def _stores_per_region() -> int:
 
 def _top_per_category() -> int:
     """How many deals to keep per meat category in the report."""
-    return _env_int("PW_TOP_PER_CATEGORY", 10) or 10
+    return _env_int("PW_TOP_PER_CATEGORY", 5) or 5
+
+
+_ALL_CITIES_WORDS = {"הכל", "הכול", "all", "*"}
+
+
+def _enabled_cities() -> tuple[str, ...]:
+    """City display names to scan, in table order.
+
+    PW_MEAT_CITIES (comma-separated city or region names, any spelling from
+    `_REGIONS`, or "הכל") overrides the ON/OFF column. Unknown names are
+    logged and ignored; if nothing valid is left the ON/OFF column is used.
+    """
+    raw = (os.environ.get("PW_MEAT_CITIES") or "").strip()
+    default = tuple(city for _r, city, on in _ALL_CITIES if on)
+    if not raw:
+        return default
+    wanted: set[str] = set()
+    for part in re.split(r"[,;\n]+", raw):
+        part = _norm(part).strip()
+        if not part:
+            continue
+        if part.lower() in _ALL_CITIES_WORDS:
+            return _CITY_ORDER
+        hits = {city for region, city, _on in _ALL_CITIES if _norm(region) == part}
+        for region, cities in _REGIONS:
+            for _code, names, _on in cities:
+                if part in {_norm(n) for n in names}:
+                    hits.add(names[0])
+        if not hits:
+            log.warning("PW_MEAT_CITIES: unknown city or region %r ignored", part)
+        wanted |= hits
+    if not wanted:
+        log.warning("PW_MEAT_CITIES names no known city; using the ON/OFF list in supermarkets.py")
+        return default
+    return tuple(city for city in _CITY_ORDER if city in wanted)
+
+
+def _active_regions(cities: Optional[tuple[str, ...]] = None) -> tuple[str, ...]:
+    """Regions with at least one enabled city, in `_REGION_ORDER`."""
+    cities = _enabled_cities() if cities is None else cities
+    return tuple(
+        region for region in _REGION_ORDER
+        if any(r == region and c in cities for r, c, _on in _ALL_CITIES)
+    )
 
 
 # Parallel store downloads per chain (11 chains run at once, so keep it modest).
@@ -175,20 +271,55 @@ class StoreInfo:
     def label(self) -> str:
         return self.name or self.city
 
+    @property
+    def branch(self) -> str:
+        """Branch name with its city, e.g. 'סוקולוב הרצליה' or 'קרית אליעזר (חיפה)'."""
+        name = (self.name or "").strip()
+        if not name or name == self.city:
+            return self.city
+        if self.city and self.city not in _norm(name) and self.city not in name:
+            return f"{name} ({self.city})"
+        return name
 
-def _region_for_store(store: dict[str, str]) -> Optional[tuple[str, str]]:
-    """Return (region, city) if the store is inside a target region."""
-    city = (store.get("city") or "").strip()
-    if city.isdigit() and int(city) != 0:
-        return _CODE_TO_REGION.get(str(int(city)))
-    if city and not city.isdigit():
-        text = city
-    else:
-        text = f"{store.get('storename', '')} {store.get('address', '')}"
+
+def _match_city(text: str, address: bool = False) -> Optional[tuple[str, str]]:
+    """(region, city) of the longest city spelling in `text` that names the city.
+
+    A spelling right after a street word ("רחוב", "דרך", "שד'") is a street
+    name; in an address, so is a spelling followed by a house number.
+    """
+    text = _norm(text)
     for pat, region, city_name, _len in _NAME_TO_REGION:
-        if pat.search(text):
+        for m in pat.finditer(text):
+            if _STREET_WORD_RE.search(text[: m.start()]):
+                continue
+            if address and _HOUSE_NUMBER_RE.match(text[m.end():]):
+                continue
             return region, city_name
     return None
+
+
+def _region_for_store(store: dict[str, str]) -> Optional[tuple[str, str]]:
+    """Return (region, city) when the store is in a city listed in `_REGIONS`.
+
+    Any listed city counts, ON or OFF (the caller filters by `_enabled_cities`).
+    1. A real CBS code in <City> decides — unless the store NAME names another
+       listed city: chains do mistype codes (Fresh Market's "סופר יודה רמת
+       השרון" carries Holon's code), and a name is chosen by the chain itself.
+    2. A city written out in <City> is matched as text.
+    3. City=0: the store name first, the address only when the name gives
+       nothing — never a street named after a city ("תל אביב 11", "רח' הרצליה").
+    """
+    city = (store.get("city") or "").strip()
+    name_hit = _match_city(store.get("storename", ""))
+    if city.isdigit() and int(city) != 0:
+        code_hit = _CODE_TO_REGION.get(str(int(city)))
+        if code_hit is not None and name_hit is not None and name_hit != code_hit:
+            return name_hit
+        return code_hit
+    if city and not city.isdigit() and city.lower() != "unknown":
+        return _match_city(city)
+    return name_hit or _match_city(store.get("address", ""), address=True)
 
 
 def _maybe_gunzip(raw: bytes) -> bytes:
@@ -198,13 +329,14 @@ def _maybe_gunzip(raw: bytes) -> bytes:
         return raw
 
 
-def _parse_stores(raw: bytes) -> list[StoreInfo]:
-    """Parse a Stores XML file and keep only stores inside a target region."""
+def _parse_stores(raw: bytes, cities: Optional[tuple[str, ...]] = None) -> list[StoreInfo]:
+    """Parse a Stores XML file and keep only stores in the enabled cities."""
     try:
         root = ET.fromstring(_maybe_gunzip(raw))
     except ET.ParseError as exc:
         log.warning("Stores XML parse failed: %s", exc)
         return []
+    enabled = set(_enabled_cities() if cities is None else cities)
     out: list[StoreInfo] = []
     for el in root.iter():
         if el.tag.lower() != "store":
@@ -214,7 +346,7 @@ def _parse_stores(raw: bytes) -> list[StoreInfo]:
         if not sid.isdigit():
             continue
         hit = _region_for_store(fields)
-        if hit is None:
+        if hit is None or hit[1] not in enabled:
             continue
         region, city = hit
         out.append(StoreInfo(int(sid), fields.get("storename", ""), city, region))
@@ -304,11 +436,6 @@ def _dominant_chain_id(*name_lists: list[str]) -> Optional[str]:
 _HEB = "א-ת"
 
 
-def _norm(text: str) -> str:
-    """Unify Hebrew geresh / gershayim so 'ק״ג' and 'ק"ג' compare equal."""
-    return (text or "").replace("״", '"').replace("׳", "'").replace("`", "'")
-
-
 def _alt(words) -> str:
     return "|".join(sorted((re.escape(_norm(w)) for w in words), key=len, reverse=True))
 
@@ -329,96 +456,225 @@ _PREFIXES = "הולבמכש"
 
 
 # ---- Categories ----
-# Grouping for the email. The product NAME is matched first (whole words);
-# the promotion description is only consulted when the name gives nothing.
-# Rules are tried in order; a rule with a species only applies when the name
-# names that species (poultry / lamb), everything else is treated as beef/veal.
+# Grouping for the email. A ranked category is ONE cut of ONE animal, in one
+# state (fresh or frozen), so the prices in its table are comparable (#51).
+#
+# 1. The animal comes from the product name (`_species`): turkey, goose,
+#    duck, chicken, beef / veal, lamb, pork. When the name names none, the
+#    promotion description is tried, then a poultry-only cut word
+#    ("כנפיים טרי", "שוקיים מחפוד") means chicken, and anything else is beef.
+# 2. The rules of that animal are tried in order against the name, then
+#    against the description. A keyword with "+" needs all its parts
+#    ("אנטריקוט+עם עצם"). Beef cut numbers ("בשר מס' 8") count as the cut.
+# 3. A frozen item (name says קפוא, or the description does and the name does
+#    not say טרי) goes to the frozen twin of its category ("לשון בקר – קפוא").
+# Catch-all groups (`_CATCH_ALL`: "בשר – אחר", "עוף – אחר", ...) mix
+# unrelated cuts; they are counted but not ranked or shown in the email.
 
-_POULTRY_WORDS = ("עוף", "עופות", "הודו", "פרגית", "פרגיות", "פטם", "אווז", "ברווז")
-_LAMB_WORDS = ("כבש", "טלה")
+_TURKEY_WORDS = ("הודו",)
+_GOOSE_WORDS = ("אווז",)
+_DUCK_WORDS = ("ברווז", "מגרה")
+_CHICKEN_WORDS = ("עוף", "עופות", "פרגית", "פרגיות", "פטם")
+_BEEF_WORDS = ("בקר", "עגל", "עגלה", "אנגוס", "וואגיו")
+_LAMB_WORDS = ("כבש", "טלה", "כבשים")
+_PORK_WORDS = ("חזיר", "חזירון")
+# Cut words that only poultry has (plus the Machpud poultry brand).
+_POULTRY_CUT_WORDS = (
+    "כנפיים", "כנף", "כנפי", "כנפית", "כרעיים", "כרעים", "כרעי", "ירכיים", "ירכי",
+    "שוקיים", "שוקי", "פולקע", "פולקות", "קורקבן", "קורקבנים", "קוקטייל", "קוקטיל",
+    "להקפצה", "מחפוד", "מחפו",
+)
+_POULTRY_SPECIES = ("chicken", "turkey", "goose", "duck")
 
-_CATEGORY_RULES: tuple[tuple[str, Optional[str], tuple[str, ...]], ...] = (
-    # label, species ("*" = any, None = beef / unknown), keywords
-    ("בשר טחון",                  "*",       ("טחון", "טחונה")),
-    ("כבש / טלה",                 "lamb",    _LAMB_WORDS),
-    # --- Poultry ---
-    ("הודו",                      "poultry", ("הודו",)),
-    ("אווז וברווז",               "poultry", ("אווז", "ברווז")),
-    ("פרגיות",                    "poultry", ("פרגית", "פרגיות")),
-    ("חזה / פילה עוף",            "poultry", ("חזה", "פילה")),
-    ("כנפיים",                    "poultry", ("כנפיים", "כנף", "כנפי")),
-    ("כרעיים",                    "poultry", ("כרעיים", "כרעים", "כרעי", "קוקטייל")),
-    ("ירכיים",                    "poultry", ("ירכיים", "ירך", "ירכי")),
-    ("שוקיים",                    "poultry", ("שוקיים", "שוק", "שוקי")),
-    ("פולקע",                     "poultry", ("פולקע", "פולקות")),
-    ("כבד עוף",                   "poultry", ("כבד",)),
-    ("קרביים, קורקבן ולבבות",     "poultry", ("קרביים", "קורקבן", "קורקבנים", "לבבות", "לב")),
-    ("גרון וצוואר",               "poultry", ("גרון", "גרונות", "צוואר")),
-    ("עוף שלם",                   "poultry", ("שלם",)),
-    ("עוף – אחר",                 "poultry", _POULTRY_WORDS),
-    # --- Beef / veal: specific premium cuts first ---
-    ("פילה מיניון",               None, ("פילה מיניון", "פילה-מיניון")),
-    ("פיקניה",                    None, ("פיקניה",)),
-    ("אנטריקוט",                  None, ("אנטריקוט", "ריב איי")),
-    ("סינטה",                     None, ("סינטה",)),
-    ("טי-בון",                    None, ("ט-בון", "טי-בון", "טי בון", "טיבון")),
-    ("צ'אק",                      None, ("צ'אק",)),
-    ("פלאנק / ראמפ",              None, ("פלאנק", "ראמפ")),
-    ("אסאדו",                     None, ("אסאדו", "אונטריב", "אונטר ריב")),
-    ("בריסקט",                    None, ("בריסקט", "בריסקיט", "חזה")),
-    ("אוסובוקו",                  None, ("אוסובוקו", "אוסבוקו", "אוסו בוקו")),
-    ("גולש",                      None, ("גולש", "גולאש")),
-    ("כתף",                       None, ("כתף",)),
-    ("שריר / חגורה",              None, ("שריר", "חגורה", "זרוע")),
-    ("צלעות",                     None, ("צלעות", "צלע")),
-    ("סטייק",                     None, ("סטייק", "דלמוניקו")),
-    ("פילה בקר",                  None, ("פילה",)),
-    # --- Organs ---
-    ("לשון בקר",                  None, ("לשון",)),
-    ("מוח",                       None, ("מוח", "מח")),
-    ("גרון וצוואר",               None, ("גרון", "גרונות", "צוואר")),
-    ("קרביים ולבבות",             None, ("קרביים", "לבבות", "לב")),
-    ("כבד בקר",                   None, ("כבד",)),
-    # --- Generic ---
-    ("בייבי בקר",                 None, ("בבי בקר", "בייבי בקר", "בייבי-בקר")),
-    ("צלי בקר",                   None, ("צלי",)),
-    ("עגל",                       None, ("עגל", "עגלה")),
-    ("בקר – כללי",                None, ("בקר",)),
-    ("בשר – אחר",                 None, ("בשר",)),
+_NECK = ("גרון", "גרונות", "צוואר")
+_WINGS = ("כנפיים", "כנף", "כנפי", "כנפית")
+_DRUMSTICKS = ("שוקיים", "שוק", "שוקי")
+_THIGHS = ("ירכיים", "ירך", "ירכי")
+_GROUND = ("טחון", "טחונה")
+
+_CATEGORY_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    # label, species, keywords
+    # --- Chicken ---
+    ("טחון עוף",                  "chicken", _GROUND),
+    ("פרגיות",                    "chicken", ("פרגית", "פרגיות")),
+    ("חזה / פילה עוף",            "chicken", ("חזה", "פילה", "להקפצה")),
+    ("כנפיים עוף",                "chicken", ("כנפיים", "כנף", "כנפי")),  # "כנפית" (tip): other
+    ("כרעיים עוף",                "chicken", ("כרעיים", "כרעים", "כרעי", "קוקטייל", "קוקטיל")),
+    ("ירכיים עוף",                "chicken", _THIGHS),
+    ("שוקיים עוף",                "chicken", _DRUMSTICKS),
+    ("פולקע",                     "chicken", ("פולקע", "פולקות")),
+    ("כבד עוף",                   "chicken", ("כבד",)),
+    ("קורקבן עוף",                "chicken", ("קורקבן", "קורקבנים", "קרביים")),
+    ("לבבות עוף",                 "chicken", ("לבבות", "לב")),
+    ("גרון / צוואר עוף",          "chicken", _NECK),
+    ("עוף שלם / חצי עוף",         "chicken", ("שלם", "חצי")),
+    ("עוף – אחר",                 "chicken", _CHICKEN_WORDS + _POULTRY_CUT_WORDS),
+    # --- Turkey ---
+    ("טחון הודו אדום",            "turkey",  ("טחון+אדום", "טחונה+אדום")),
+    ("טחון הודו",                 "turkey",  _GROUND),
+    ("חזה הודו",                  "turkey",  ("חזה", "פילה", "שניצל")),
+    ("גרון / צוואר הודו",         "turkey",  _NECK),
+    ("כנפיים הודו",               "turkey",  _WINGS),
+    ("שוקיים הודו",               "turkey",  _DRUMSTICKS),
+    ("ירך הודו",                  "turkey",  _THIGHS),
+    ("הודו אדום",                 "turkey",  ("אדום",)),
+    ("שישליק / נתחי הודו",        "turkey",  ("שישליק", "נתחי", "נתחים", "קוביות")),
+    ("כבד הודו",                  "turkey",  ("כבד",)),
+    ("הודו – אחר",                "turkey",  _TURKEY_WORDS),
+    # --- Goose / duck ---
+    ("חזה אווז",                  "goose",   ("חזה",)),
+    ("שוק אווז",                  "goose",   _DRUMSTICKS),
+    ("כנפיים אווז",               "goose",   _WINGS),
+    ("כבד אווז",                  "goose",   ("כבד",)),
+    ("אווז – אחר",                "goose",   _GOOSE_WORDS),
+    ("חזה ברווז",                 "duck",    ("חזה", "מגרה")),
+    ("ברווז – אחר",               "duck",    _DUCK_WORDS),
+    # --- Lamb ---
+    ("טחון כבש",                  "lamb",    _GROUND),
+    ("צלעות כבש",                 "lamb",    ("צלעות", "צלע", "קרה")),
+    ("צוואר כבש",                 "lamb",    _NECK),
+    ("כתף כבש",                   "lamb",    ("כתף",)),
+    ("חזה כבש",                   "lamb",    ("חזה",)),
+    ("שוק כבש",                   "lamb",    _DRUMSTICKS + ("רגל",)),
+    ("כבש – אחר",                 "lamb",    _LAMB_WORDS),
+    # --- Pork (one catch-all group) ---
+    ("חזיר",                      "pork",    _PORK_WORDS),
+    # --- Beef / veal: specific cuts first ---
+    ("טחון בקר",                  "beef",    _GROUND),
+    ("מינוט סטייק",               "beef",    ("מינוט סטייק", "סטייק מינוט", "מינוט")),
+    ("פילה מדומה",                "beef",    ("פילה מדומה",)),
+    ("פילה מיניון",               "beef",    ("פילה מיניון", "פילה-מיניון")),
+    ("פיקניה",                    "beef",    ("פיקניה",)),
+    ("אנטריקוט עם עצם",           "beef",    ("אנטריקוט+עם עצם", "אנטריקוט+עם עצ", "אנטריקוט+ע.ע",
+                                              "ריבס אנטריקוט", "ריב איי+עם עצם")),
+    ("אנטריקוט",                  "beef",    ("אנטריקוט", "ריב איי", "ריבאיי")),
+    ("סינטה",                     "beef",    ("סינטה",)),
+    ("טי-בון",                    "beef",    ("ט-בון", "טי-בון", "טי בון", "טיבון", "פורטר האוס")),
+    ("צ'אק",                      "beef",    ("צ'אק", "צאק", "שפיץ")),
+    ("פלאנק / ראמפ",              "beef",    ("פלאנק", "ראמפ")),
+    ("שייטל",                     "beef",    ("שייטל",)),
+    ("דנבר",                      "beef",    ("דנבר",)),
+    ("רוסטביף",                   "beef",    ("רוסטביף", "לרוסטביף")),
+    ("אסאדו",                     "beef",    ("אסאדו", "אונטריב", "אונטריפ", "אונטר ריב")),
+    ("בריסקט",                    "beef",    ("בריסקט", "בריסקיט", "חזה")),
+    ("אוסובוקו",                  "beef",    ("אוסובוקו", "אוסבוקו", "אוסו בוקו")),
+    ("גולש",                      "beef",    ("גולש", "גולאש")),
+    ("כתף בקר",                   "beef",    ("כתף",)),
+    ("שריר / זרוע",               "beef",    ("שריר", "חגורה", "זרוע")),
+    ("צלעות בקר",                 "beef",    ("צלעות", "צלע")),
+    ("סטייק",                     "beef",    ("סטייק", "דלמוניקו")),
+    ("פילה בקר",                  "beef",    ("פילה",)),
+    # --- Beef / veal organs ---
+    ("לשון בקר",                  "beef",    ("לשון",)),
+    ("עצמות מוח",                 "beef",    ("עצמות", "עצמות מוח")),
+    ("מוח",                       "beef",    ("מוח", "מח")),
+    ("גרון / צוואר בקר",          "beef",    _NECK),
+    ("לבבות וקרביים בקר",         "beef",    ("קרביים", "לבבות", "לב")),
+    ("כבד בקר",                   "beef",    ("כבד",)),
+    ("בשר ראש",                   "beef",    ("ראש",)),
+    ("ריאות",                     "beef",    ("ריאות", "ריאה")),
+    # --- Generic (catch-all) ---
+    ("בייבי בקר",                 "beef",    ("בבי בקר", "בייבי בקר", "בייבי-בקר")),
+    ("צלי בקר",                   "beef",    ("צלי",)),
+    ("עגל – כללי",                "beef",    ("עגל", "עגלה")),
+    ("בקר – כללי",                "beef",    ("בקר",)),
+    ("בשר – אחר",                 "beef",    ("בשר",)),
 )
 _CATEGORY_OTHER = "אחר"
+_FROZEN_SUFFIX = " – קפוא"
 
-_POULTRY_PAT = _words_pat(_POULTRY_WORDS, prefixes="ו")
-_LAMB_PAT = _words_pat(_LAMB_WORDS, prefixes="ו")
-_CATEGORY_PATS: tuple[tuple[str, Optional[str], re.Pattern], ...] = tuple(
-    (label, species, _words_pat(kws, prefixes="ו")) for label, species, kws in _CATEGORY_RULES
+# Groups that mix unrelated cuts: counted, never ranked (`unranked_by_category`).
+_CATCH_ALL: frozenset[str] = frozenset({
+    "עוף – אחר", "הודו – אחר", "אווז – אחר", "ברווז – אחר", "כבש – אחר", "חזיר",
+    "בייבי בקר", "צלי בקר", "עגל – כללי", "בקר – כללי", "בשר – אחר", _CATEGORY_OTHER,
+})
+
+# Israeli beef cut numbers ("בשר מס' 8" = foreshank) -> the cut word.
+_CUT_NUMBERS = {"1": "אנטריקוט", "2": "צלעות", "3": "חזה", "4": "כתף", "5": "כתף",
+                "6": "פילה מדומה", "8": "שריר"}
+_CUT_NUMBER_RE = re.compile(r"(?<![א-ת])(?:מס|מספר)\s*['`.]?\s*(\d{1,2})(?!\d)")
+
+
+def _species_pat(words) -> re.Pattern:
+    # No geresh before the word either: "סטרצ'טלה" (cheese) is not "טלה".
+    return re.compile(r"(?<!['\"])" + _words_pat(words, prefixes="ו").pattern, re.IGNORECASE)
+
+
+_SPECIES_PATS: tuple[tuple[str, re.Pattern], ...] = (
+    ("turkey", _species_pat(_TURKEY_WORDS)),
+    ("goose", _species_pat(_GOOSE_WORDS)),
+    ("duck", _species_pat(_DUCK_WORDS)),
+    ("chicken", _species_pat(_CHICKEN_WORDS)),
+    ("beef", _species_pat(_BEEF_WORDS)),   # before lamb: "טחון בקר עם כבש" is beef
+    ("lamb", _species_pat(_LAMB_WORDS)),
+    ("pork", _species_pat(_PORK_WORDS)),
+)
+_POULTRY_CUT_PAT = _words_pat(_POULTRY_CUT_WORDS, prefixes="ו")
+_FROZEN_PAT = _words_pat(("קפוא", "קפואה", "קפואים", "קפואות", "קפו", "קפ", "מוקפא", "מקפוא",
+                          "מוקפאים", "פרוזן"), prefixes="ו")
+_FRESH_NAME_PAT = _words_pat(("טרי", "טריה", "טריים", "טריות", "מצונן", "מצוננת"), prefixes="ו")
+
+
+def _rule_matcher(keywords: tuple[str, ...]):
+    groups = [
+        [_words_pat((part,), prefixes="ו") for part in kw.split("+")]
+        for kw in keywords
+    ]
+    return lambda text: any(all(p.search(text) for p in group) for group in groups)
+
+
+_CATEGORY_PATS = tuple(
+    (label, species, _rule_matcher(kws)) for label, species, kws in _CATEGORY_RULES
 )
 
-# (label, keywords) in display order, labels de-duplicated (email_sender
-# orders its groups by this).
+
+def _frozen_label(label: str) -> str:
+    return label + _FROZEN_SUFFIX
+
+
+# (label, keywords) in display order, labels de-duplicated, each followed by
+# its frozen twin (email_sender orders its groups by this).
 _CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
-    (label, tuple(kw for lb, _sp, kws in _CATEGORY_RULES if lb == label for kw in kws))
+    entry
     for label in dict.fromkeys(lb for lb, _sp, _kws in _CATEGORY_RULES)
-)
+    for entry in (
+        (label, tuple(kw for lb, _sp, kws in _CATEGORY_RULES if lb == label for kw in kws)),
+        (_frozen_label(label), ()),
+    )
+) + ((_CATEGORY_OTHER, ()),)
 
 
 def _species(text: str) -> Optional[str]:
-    if _LAMB_PAT.search(text):
-        return "lamb"
-    if _POULTRY_PAT.search(text):
-        return "poultry"
+    """The animal a text names, or None."""
+    for species, pat in _SPECIES_PATS:
+        if pat.search(text):
+            return species
     return None
 
 
-def _categorize_text(text: str, species: Optional[str]) -> Optional[str]:
+def _with_cut_number(text: str) -> str:
+    """Append the cut word for a beef cut number: 'בשר מס 8 חלק' -> '... שריר'."""
+    words = [_CUT_NUMBERS[m.group(1)] for m in _CUT_NUMBER_RE.finditer(text) if m.group(1) in _CUT_NUMBERS]
+    return " ".join([text, *words]) if words else text
+
+
+def _categorize_text(text: str, species: str) -> Optional[str]:
     if not text.strip():
         return None
-    for label, rule_species, pat in _CATEGORY_PATS:
-        if rule_species != "*" and rule_species != species:
-            continue
-        if pat.search(text):
+    if species == "beef":
+        text = _with_cut_number(text)
+    for label, rule_species, matches in _CATEGORY_PATS:
+        if rule_species == species and matches(text):
             return label
     return None
+
+
+def _is_frozen(name: str, desc: str = "") -> bool:
+    if _FROZEN_PAT.search(name):
+        return True
+    if _FRESH_NAME_PAT.search(name):
+        return False
+    return bool(desc and _FROZEN_PAT.search(desc))
 
 
 def _categorize(promo: "MeatPromo") -> str:
@@ -430,11 +686,20 @@ def _categorize(promo: "MeatPromo") -> str:
     name = _norm(promo.item_name)
     desc = _norm(promo.promotion_description)
     species = _species(name) or _species(desc)
-    return (
+    if species is None:
+        species = "chicken" if _POULTRY_CUT_PAT.search(name) else "beef"
+    label = (
         _categorize_text(name, species)
-        or _categorize_text(desc, _species(desc) or species)
+        or _categorize_text(desc, species)
         or _CATEGORY_OTHER
     )
+    if label != _CATEGORY_OTHER and _is_frozen(name, desc):
+        return _frozen_label(label)
+    return label
+
+
+def _is_catch_all(label: str) -> bool:
+    return label.removesuffix(_FROZEN_SUFFIX) in _CATCH_ALL
 
 
 # ---- Meat classifier ----
@@ -506,7 +771,7 @@ _EXCLUDE_STEMS: tuple[str, ...] = (
     # Dairy
     "גבינ", "גאוד", "אמנטל", "מוצרל", "צ'דר", "קוטג", "לבנה", "לאבנה", "חלב",
     "יוגורט", "שמנת", "קממבר", "בולגרי", "חמאה", "צפתית", "עיזים", "חלומי",
-    "מנצגו", "פרמזן", "מסקרפונה", "טבורוג",
+    "מנצגו", "פרמזן", "מסקרפונה", "טבורוג", "סטרצ'טלה", "סטרצטלה", "סטרציאטלה", "בוראטה",
     # Processed / deli / ready meals (fresh cuts only)
     "נקניק", "פסטרמ", "סלמי", "קבנוס", "קבב", "המבורגר", "קציצ", "שווארמ", "שוארמ",
     "צ'וריסו", "מרגז", "שניצל", "מעושן", "מעושנ", "עישון", "מתובל",
@@ -646,10 +911,45 @@ class MeatPromo:
     min_qty: Optional[Decimal] = None                 # units needed (> 1 only)
     bundle_price: Optional[Decimal] = None            # total price for min_qty units
     is_weighted: bool = False                         # sold by weight: prices are per kg
+    # Kilograms in one unit of `regular_price` / `discounted_price`: 1 for
+    # weighed items, the pack weight for packaged ones, None when unknown.
+    unit_kg: Optional[Decimal] = None
+    stores: list[str] = field(default_factory=list)   # branches: "name (city)"
 
     @property
     def region(self) -> str:
         return self.regions[0] if self.regions else ""
+
+    @property
+    def kg_per_unit(self) -> Optional[Decimal]:
+        if self.unit_kg is not None and self.unit_kg > 0:
+            return self.unit_kg
+        return Decimal(1) if self.is_weighted else None
+
+    @property
+    def price_per_kg(self) -> Optional[Decimal]:
+        """Promo price per kg (the ranking key), None when it cannot be derived."""
+        kg = self.kg_per_unit
+        if kg is None or self.discounted_price is None:
+            return None
+        return (self.discounted_price / kg).quantize(Decimal("0.01"))
+
+    @property
+    def regular_per_kg(self) -> Optional[Decimal]:
+        kg = self.kg_per_unit
+        if kg is None or self.regular_price is None:
+            return None
+        return (self.regular_price / kg).quantize(Decimal("0.01"))
+
+    @property
+    def pack_text(self) -> str:
+        """'מארז 500 גרם' for packaged items with a known weight, '' otherwise."""
+        if self.is_weighted or self.unit_kg is None:
+            return ""
+        grams = (self.unit_kg * 1000).quantize(Decimal("1"))
+        if grams >= 1000 and grams % 100 == 0:
+            return f'מארז {(grams / 1000).normalize():f} ק"ג'
+        return f"מארז {grams} גרם"
 
     @property
     def deal_text(self) -> str:
@@ -683,16 +983,34 @@ class SupermarketReport:
     stores_scanned: list[str] = field(default_factory=list)  # "chain – store (city)"
     stores_by_region: dict[str, int] = field(default_factory=dict)
     promos_by_region: dict[str, int] = field(default_factory=dict)  # before the top-N cut
-    promos_by_category: dict[str, int] = field(default_factory=dict)  # before the top-N cut
-    # After the scan: grouped by category (in `_CATEGORIES` order), best deal
-    # first inside each category.
+    # Deals with a price per kg, per category, before the top-N cut.
+    promos_by_category: dict[str, int] = field(default_factory=dict)
+    # After the scan: grouped by category (in `_CATEGORIES` order), cheapest
+    # promo price per kg first inside each category.
     promos: list[MeatPromo] = field(default_factory=list)
     error: Optional[str] = None
     # chain -> Hebrew reason. Failed = could not be scanned (login, files,
     # downloads); empty = scanned fine but nothing to show (no store in the
-    # regions, no meat deals today).
+    # cities, no meat deals today).
     chains_failed: dict[str, str] = field(default_factory=dict)
     chains_empty: dict[str, str] = field(default_factory=dict)
+    # Scan area at scan time (empty = not recorded; readers fall back to the
+    # current settings).
+    cities: list[str] = field(default_factory=list)
+    regions: list[str] = field(default_factory=list)
+    stores_by_city: dict[str, int] = field(default_factory=dict)
+    # Deals left out of the ranking because no price per kg could be derived.
+    unpriced_by_category: dict[str, int] = field(default_factory=dict)
+    # Deals in catch-all groups ("בשר – אחר", "עוף – אחר", ...): not ranked, not shown.
+    unranked_by_category: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def unranked_count(self) -> int:
+        return sum(self.unranked_by_category.values())
+
+    @property
+    def unpriced_count(self) -> int:
+        return sum(self.unpriced_by_category.values())
 
 
 class ChainScanError(Exception):
@@ -719,6 +1037,8 @@ class _FeedItem:
     weighted: bool = False
     unit_of_measure: str = ""
     unit_price: Optional[Decimal] = None  # UnitOfMeasurePrice
+    unit_qty: str = ""                    # UnitQty: the unit Quantity is in
+    quantity: Optional[Decimal] = None    # Quantity: pack content in UnitQty
 
 
 def _dec(text: Optional[str]) -> Optional[Decimal]:
@@ -752,8 +1072,105 @@ def _build_item_index(pricefull_root: ET.Element) -> dict[str, _FeedItem]:
                 weighted=fields.get("bIsWeighted", "") == "1",
                 unit_of_measure=fields.get("UnitOfMeasure", ""),
                 unit_price=_dec(fields.get("UnitOfMeasurePrice")),
+                unit_qty=fields.get("UnitQty", ""),
+                quantity=_dec(fields.get("Quantity")),
             )
     return index
+
+
+# ---- Price per kg ----
+#
+# Prices inside a category are ranked per kilogram. What the PriceFull fields
+# mean (checked against Shufersal, Rami Levy, Osher Ad, Tiv Taam and Bareket
+# files of 2026-11-11):
+#   * bIsWeighted=1: ItemPrice is per kg. UnitQty/UnitOfMeasure say so
+#     ("קילוגרם", '1 ק"ג') except at Osher Ad, which writes "יחידות"/"יחידה"
+#     for weighed meat priced per kg — the flag is trusted, not the unit text.
+#   * packaged (bIsWeighted=0): Quantity is the pack content in UnitQty
+#     ("גרם" 500 / "קילוגרם" 1). Osher Ad writes UnitQty "לא ידוע" with the unit
+#     in UnitOfMeasure ('ק"ג', Quantity 1.20). UnitOfMeasurePrice is the price
+#     per UnitOfMeasure ("100 גרם" -> per 100 g), so it implies a pack size too.
+# A pack weight is used only when every source that states one agrees (within
+# 5%): Quantity+unit, UnitOfMeasurePrice, and a weight written in the item
+# name ("500 גרם"). Otherwise — no weight anywhere (Quantity 0, "יחידות"), or
+# sources that contradict each other — the deal has no price per kg and is
+# left out of the ranking (counted in `unpriced_by_category`).
+
+_GRAM_UNITS = ("גרם", "גר", "גר'", "ג", "ג'")
+_KG_UNITS = ("קילוגרם", "קילו", "ק\"ג", "קג", "ק\"", "ק'ג")
+_UNIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)?\s*([א-ת\"'.]+)\s*$")
+_NAME_WEIGHT_RE = re.compile(
+    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(קילוגרם|קילו|ק\"ג|קג|ק\"|גרם|גר'|גר|ג'|ג)(?![א-ת])"
+)
+_PACK_TOLERANCE = Decimal("0.05")
+_MIN_PACK_G, _MAX_PACK_G = Decimal("50"), Decimal("10000")
+
+
+def _grams_per(unit: str) -> Optional[Decimal]:
+    unit = _norm(unit).strip().rstrip(".")
+    if unit in _GRAM_UNITS:
+        return Decimal(1)
+    if unit in _KG_UNITS:
+        return Decimal(1000)
+    return None
+
+
+def _measure_grams(text: str) -> Optional[Decimal]:
+    """'100 גרם' -> 100, '1קילוגרם' / 'ק"ג' -> 1000, 'יחידה' -> None."""
+    m = _UNIT_RE.match(_norm(text))
+    if not m:
+        return None
+    per = _grams_per(m.group(2))
+    if per is None:
+        return None
+    qty = _dec(m.group(1)) if m.group(1) else Decimal(1)
+    return qty * per if qty and qty > 0 else None
+
+
+def _name_grams(name: str) -> Optional[Decimal]:
+    m = _NAME_WEIGHT_RE.search(_norm(name))
+    if not m:
+        return None
+    qty, per = _dec(m.group(1)), _grams_per(m.group(2))
+    return qty * per if qty and per and qty > 0 else None
+
+
+def _pack_grams(item: _FeedItem) -> Optional[Decimal]:
+    """Pack weight in grams of a packaged item, or None when not reliable."""
+    stated: list[Decimal] = []
+    qty = item.quantity
+    if qty is not None and qty > 0:
+        per = _grams_per(item.unit_qty)
+        if per is None:
+            # UnitQty "לא ידוע": the unit is in UnitOfMeasure ('ק"ג').
+            base = _measure_grams(item.unit_of_measure)
+            per = base if base in (Decimal(1), Decimal(1000)) else None
+        if per is not None:
+            stated.append(qty * per)
+    from_name = _name_grams(item.name)
+    if from_name is not None:
+        stated.append(from_name)
+    if not stated:
+        return None
+    base = _measure_grams(item.unit_of_measure)
+    if base is not None and item.unit_price and item.unit_price > 0 and item.price and item.price > 0:
+        stated.append(item.price / item.unit_price * base)
+    first = stated[0]
+    if any(abs(s - first) > first * _PACK_TOLERANCE for s in stated[1:]):
+        return None
+    if not (_MIN_PACK_G <= first <= _MAX_PACK_G):
+        return None
+    return first
+
+
+def _unit_kg(item: _FeedItem, weighted: bool) -> Optional[Decimal]:
+    """Kilograms in one unit of the item's price: 1 for weighed items."""
+    if weighted:
+        # A weighed item priced per 100 g would rank 10x too cheap.
+        base = _measure_grams(item.unit_of_measure)
+        return None if base is not None and base != Decimal(1000) else Decimal(1)
+    grams = _pack_grams(item)
+    return grams / 1000 if grams is not None else None
 
 
 def _scan_store(
@@ -780,6 +1197,7 @@ def _scan_store(
         p.city = store.city
         p.regions = [store.region]
         p.cities = [store.city]
+        p.stores = [store.branch]
     log.info(
         "%s / %s (%s, %s): %d items, %d meat promos",
         chain_name, store.label, store.city, store.region, len(item_index), len(promos),
@@ -792,7 +1210,7 @@ def _scan_chain(
     stores: list[StoreInfo],
     fetch,  # (StoreInfo) -> (price_bytes, promo_bytes) | None when the store has no files
 ) -> tuple[list[MeatPromo], list[StoreInfo]]:
-    """Scan every store of the chain inside the target regions.
+    """Scan every store of the chain in the enabled cities.
 
     Returns (promos, stores that yielded at least one meat promo). Raises
     ChainScanError when no store could be scanned at all, so the report can
@@ -803,14 +1221,14 @@ def _scan_chain(
     limit = _stores_per_region()
     candidates = _candidates_by_region(stores)
     if not candidates:
-        log.info("%s: no stores in the target regions — skipped", chain_name)
-        raise ChainScanError("אין סניפים באזורים שנבחרו", failed=False)
+        log.info("%s: no stores in the selected cities — skipped", chain_name)
+        raise ChainScanError("אין סניפים בערים שנבחרו", failed=False)
     todo = [
         store
         for region_stores in candidates.values()
         for store in (region_stores[:limit] if limit else region_stores)
     ]
-    log.info("%s: scanning %d stores in the target regions", chain_name, len(todo))
+    log.info("%s: scanning %d stores in the selected cities", chain_name, len(todo))
 
     def _one(store: StoreInfo) -> tuple[StoreInfo, str, list[MeatPromo]]:
         try:
@@ -835,7 +1253,7 @@ def _scan_chain(
     if not outcomes["ok"]:
         if outcomes["error"]:
             raise ChainScanError(f"הורדת הקבצים נכשלה ב-{outcomes['error']} סניפים")
-        raise ChainScanError("אין קבצי מחירים ומבצעים עדכניים לסניפים באזורים")
+        raise ChainScanError("אין קבצי מחירים ומבצעים עדכניים לסניפים שנבחרו")
     return promos, used
 
 
@@ -980,6 +1398,90 @@ def scan_publishedprices_chain(
             if not promo_fname or not price_fname:
                 return None
             return _pp_download(client, price_fname), _pp_download(client, promo_fname)
+
+        return _scan_chain(chain_name, stores, _fetch)
+
+
+# ---- Bina Projects portals (<chain>.binaprojects.com) ----
+#
+# Main.aspx is a page whose script calls three JSON endpoints (no login):
+#   POST MainIO_Hok.aspx  wReshet=הכל, WStore=<store id or 0>, WDate=<dd/mm/yyyy
+#                         or empty = all days>, WFileType=<1 Stores, 2 Price,
+#                         3 Promo, 4 PriceFull, 5 PromoFull>
+#        -> [{"FileNm": "PriceFull7290875100001-002-061-20261111-040711.GZ", ...}]
+#   POST Download.aspx?FileNm=<name>  -> [{"SPath": "<direct URL of the file>"}]
+# The files are gzipped XML in the same <Root><Items>/<Promotions> layout as
+# the other chains, so the shared parsers read them as they are.
+
+_BINA_STORES, _BINA_PRICEFULL, _BINA_PROMOFULL = "1", "4", "5"
+
+
+def _bina_list(client: httpx.Client, base: str, file_type: str, store: int = 0) -> list[str]:
+    r = client.post(
+        base + "MainIO_Hok.aspx",
+        data={"wReshet": "הכל", "WStore": str(store), "WDate": "", "WFileType": file_type},
+    )
+    if r.status_code != 200:
+        log.warning("bina listing %s: HTTP %s", base, r.status_code)
+        return []
+    try:
+        rows = r.json()
+    except ValueError:
+        return []
+    return [str(row.get("FileNm", "")).strip() for row in rows if isinstance(row, dict)]
+
+
+def _bina_download(client: httpx.Client, base: str, filename: str) -> Optional[bytes]:
+    r = client.post(base + "Download.aspx", params={"FileNm": filename})
+    if r.status_code != 200:
+        return None
+    try:
+        path = (r.json() or [{}])[0].get("SPath", "")
+    except (ValueError, AttributeError, IndexError):
+        return None
+    if not path:
+        return None
+    r = client.get(path, timeout=120)
+    return r.content if r.status_code == 200 else None
+
+
+def scan_bina_chain(subdomain: str, chain_name: str) -> tuple[list[MeatPromo], list[StoreInfo]]:
+    """Scan one chain hosted by Bina Projects (enabled cities only).
+
+    Raises ChainScanError when the chain could not be scanned.
+    """
+    base = _BINA_URL.format(sub=subdomain)
+    log.info("%s: fetching store list from %s", chain_name, base)
+    with httpx.Client(follow_redirects=True, timeout=60, headers=_HEADERS) as client:
+        try:
+            stores_files = sorted(
+                n for n in _bina_list(client, base, _BINA_STORES) if n.startswith("Stores")
+            )
+        except httpx.HTTPError as exc:
+            log.warning("%s: price portal unreachable: %s", chain_name, exc)
+            raise ChainScanError("אתר המחירים של הרשת אינו זמין") from exc
+        if not stores_files:
+            log.warning("%s: no Stores file listed", chain_name)
+            raise ChainScanError("לא נמצאו קבצים באתר המחירים")
+        stores_raw = _bina_download(client, base, stores_files[-1])
+        if not stores_raw:
+            log.warning("%s: Stores file download failed", chain_name)
+            raise ChainScanError("הורדת קובץ הסניפים נכשלה")
+        stores = _parse_stores(stores_raw)
+
+        # Listings are per store (a few dozen files each) rather than one
+        # listing of the whole chain, which the portal caps at 1000 rows.
+        def _fetch(store: StoreInfo):
+            names = {
+                kind: [n for n in _bina_list(client, base, ft, store.store_id) if n.startswith(kind)]
+                for kind, ft in (("PriceFull", _BINA_PRICEFULL), ("PromoFull", _BINA_PROMOFULL))
+            }
+            chain_id = _dominant_chain_id(names["PromoFull"], names["PriceFull"])
+            price = _latest_by_store(names["PriceFull"], chain_id).get(store.store_id)
+            promo = _latest_by_store(names["PromoFull"], chain_id).get(store.store_id)
+            if not price or not promo:
+                return None
+            return _bina_download(client, base, price), _bina_download(client, base, promo)
 
         return _scan_chain(chain_name, stores, _fetch)
 
@@ -1136,6 +1638,7 @@ def _extract_meat_promos(
                 min_qty=min_qty.to_integral_value() if multi else None,
                 bundle_price=bundle if multi else None,
                 is_weighted=weighted,
+                unit_kg=_unit_kg(item, weighted),
             ))
     return results
 
@@ -1146,15 +1649,20 @@ def scan_and_report() -> SupermarketReport:
     """Scan every configured chain in parallel and return a combined report."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    log.info(
-        "Running supermarket meat scan across %d chains (regions: %s)",
-        1 + len(_PUBLISHEDPRICES_CHAINS), ", ".join(_REGION_ORDER),
+    cities = _enabled_cities()
+    report = SupermarketReport(
+        status="ok", cities=list(cities), regions=list(_active_regions(cities)),
     )
-    report = SupermarketReport(status="ok")
 
     tasks: dict[str, object] = {_SHUFERSAL_NAME: scan_shufersal}
     for user, name in _PUBLISHEDPRICES_CHAINS:
         tasks[name] = (lambda u=user, n=name: scan_publishedprices_chain(u, n))
+    for sub, name in _BINA_CHAINS:
+        tasks[name] = (lambda s=sub, n=name: scan_bina_chain(s, n))
+    log.info(
+        "Running supermarket meat scan across %d chains (cities: %s)",
+        len(tasks), ", ".join(cities),
+    )
 
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
         futures = {pool.submit(task): name for name, task in tasks.items()}  # type: ignore[arg-type]
@@ -1181,34 +1689,51 @@ def scan_and_report() -> SupermarketReport:
                 report.stores_by_region[store.region] = (
                     report.stores_by_region.get(store.region, 0) + 1
                 )
+                report.stores_by_city[store.city] = report.stores_by_city.get(store.city, 0) + 1
     report.chains_scanned.sort()
     report.stores_scanned.sort()
     report.chains_failed = dict(sorted(report.chains_failed.items()))
     report.chains_empty = dict(sorted(report.chains_empty.items()))
+    report.stores_by_city = {
+        c: report.stores_by_city[c] for c in _CITY_ORDER if c in report.stores_by_city
+    }
     _finalize_report(report)
+    if report.unpriced_count:
+        log.info(
+            "%d deals left out of the ranking: no reliable price per kg (%s)",
+            report.unpriced_count,
+            ", ".join(f"{c} {n}" for c, n in report.unpriced_by_category.items()),
+        )
     if not report.chains_scanned:
         report.status = "fetch_failed"
-        report.error = "לא נמצאו מבצעים באף רשת באזורים שנבחרו"
+        report.error = "לא נמצאו מבצעים באף רשת בערים שנבחרו"
     return report
 
 
 def _finalize_report(report: SupermarketReport) -> None:
-    """Dedupe, drop implausible rows and keep the best deals of each category."""
+    """Dedupe, drop implausible rows and keep the cheapest deals of each category."""
     # Dedupe: the same promotion runs in many stores of a chain and often
     # covers several item variants (different brands of the same cut). Keep
-    # one row per (chain, promotion_description, rounded savings_pct) and
-    # remember the regions / cities / store count behind it.
-    seen: dict[tuple[str, str, int], MeatPromo] = {}
-    seen_stores: dict[tuple[str, str, int], set[str]] = {}
+    # one row per (chain, promotion description, promo price per kg) — or,
+    # without a price per kg, per rounded percent — and remember the regions /
+    # cities / branches behind it.
+    seen: dict[tuple, MeatPromo] = {}
+    seen_stores: dict[tuple, set[str]] = {}
     for p in report.promos:
         pct = p.savings_pct
         if pct is None or pct <= 0 or pct >= _MAX_SANE_DISCOUNT_PCT:
             continue
-        key = (p.chain, p.promotion_description, int(pct))
+        per_kg = p.price_per_kg
+        key = (p.chain, p.promotion_description, per_kg if per_kg is not None else f"{int(pct)}%")
         kept = seen.get(key)
         if kept is None:
             seen[key] = kept = p
             seen_stores[key] = set()
+            kept.stores = list(p.stores)
+        elif p.stores:
+            for branch in p.stores:
+                if branch not in kept.stores:
+                    kept.stores.append(branch)
         seen_stores[key].add(p.store_id)
         for region in p.regions:
             if region not in kept.regions:
@@ -1224,7 +1749,7 @@ def _finalize_report(report: SupermarketReport) -> None:
     for region in _REGION_ORDER:
         report.promos_by_region[region] = sum(1 for p in seen.values() if region in p.regions)
 
-    # One block per category, in the fixed category order, best deal first.
+    # One block per category, in the fixed category order, cheapest first.
     by_category: dict[str, list[MeatPromo]] = {}
     for p in seen.values():
         by_category.setdefault(p.category, []).append(p)
@@ -1236,50 +1761,21 @@ def _finalize_report(report: SupermarketReport) -> None:
         pool = by_category.get(label)
         if not pool:
             continue
-        report.promos_by_category[label] = len(pool)
-        ranked.extend(_pick_for_category(pool, top_n))
+        if _is_catch_all(label):
+            report.unranked_by_category[label] = len(pool)
+            continue
+        priced = [p for p in pool if p.price_per_kg is not None]
+        if len(priced) < len(pool):
+            report.unpriced_by_category[label] = len(pool) - len(priced)
+        if priced:
+            report.promos_by_category[label] = len(priced)
+            ranked.extend(sorted(priced, key=_price_rank_key)[:top_n])
     report.promos = ranked
 
 
-def _rank_key(p: MeatPromo) -> tuple:
-    pct = p.savings_pct or Decimal("0")
-    amt = p.savings_amount or Decimal("0")
-    return (-float(pct), -float(amt), p.chain, p.item_name)
-
-
-def _pick_for_category(pool: list[MeatPromo], top_n: int) -> list[MeatPromo]:
-    """Choose up to `top_n` deals of one category, returned best first.
-
-    1. every region that has a deal in this category gets at least one row;
-    2. then one row for every chain not shown yet (so the table compares
-       supermarkets instead of listing one chain ten times);
-    3. the remaining places go to the best deals left.
-    """
-    pool = sorted(pool, key=_rank_key)
-    picked: list[MeatPromo] = []
-
-    def _take(p: MeatPromo) -> None:
-        picked.append(p)
-        pool.remove(p)
-
-    for region in _REGION_ORDER:
-        if len(picked) >= top_n:
-            break
-        if any(region in p.regions for p in picked):
-            continue
-        best = next((p for p in pool if region in p.regions), None)
-        if best is not None:
-            _take(best)
-    for p in list(pool):
-        if len(picked) >= top_n:
-            break
-        if all(p.chain != q.chain for q in picked):
-            _take(p)
-    for p in list(pool):
-        if len(picked) >= top_n:
-            break
-        _take(p)
-    return sorted(picked, key=_rank_key)
+def _price_rank_key(p: MeatPromo) -> tuple:
+    """Cheapest promo price per kg first; ties: bigger discount, then by name."""
+    return (p.price_per_kg, -(p.savings_pct or Decimal("0")), p.chain, p.item_name)
 
 
 # ---- State persistence (so we can diff tomorrow if desired) ----
@@ -1296,6 +1792,8 @@ def _promo_to_dict(p: MeatPromo) -> dict:
         "discount_rate": str(p.discount_rate) if p.discount_rate is not None else None,
         "min_qty": str(p.min_qty) if p.min_qty is not None else None,
         "bundle_price": str(p.bundle_price) if p.bundle_price is not None else None,
+        "unit_kg": str(p.unit_kg) if p.unit_kg is not None else None,
+        "price_per_kg": str(p.price_per_kg) if p.price_per_kg is not None else None,
     }
 
 
@@ -1326,32 +1824,40 @@ def print_report(report: SupermarketReport) -> None:
         _print_chain_problems(report)
         return
     console.print(f"[dim]Chains scanned: {', '.join(report.chains_scanned)}[/dim]")
+    if report.cities:
+        console.print(f"[dim]Cities: {', '.join(report.cities)}[/dim]")
     _print_chain_problems(report)
+    if report.unpriced_count:
+        console.print(f"[dim]{report.unpriced_count} deals without a price per kg were not ranked.[/dim]")
+    if report.unranked_count:
+        console.print(
+            f"[dim]{report.unranked_count} deals in catch-all groups not shown: "
+            + ", ".join(f"{c} ({n})" for c, n in report.unranked_by_category.items()) + "[/dim]"
+        )
     if not report.promos:
         console.print("[dim]No meat promos found today.[/dim]")
         return
     table = Table(show_header=True, header_style="bold")
     table.add_column("Category", width=12)
     table.add_column("Chain", width=10)
-    table.add_column("Regions", width=12)
+    table.add_column("Stores", width=16)
     table.add_column("Item")
-    table.add_column("Was")
-    table.add_column("Now")
+    table.add_column("Now/kg")
+    table.add_column("Was/kg")
     table.add_column("Off")
-    table.add_column("Promo")
+    table.add_column("Deal")
     previous = None
     for p in report.promos:
         category = p.category or _categorize(p)
         if previous is not None and category != previous:
             table.add_section()
-        was = f"₪{p.regular_price}" if p.regular_price else "—"
-        now = f"₪{p.discounted_price}" if p.discounted_price else "—"
-        if p.deal_text:
-            now += f" ({p.deal_text})"
+        now = f"₪{p.price_per_kg}" if p.price_per_kg is not None else "—"
+        was = f"₪{p.regular_per_kg}" if p.regular_per_kg is not None else "—"
         off = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
+        deal = " · ".join(x for x in (p.deal_text, p.pack_text) if x)
         table.add_row(
-            category if category != previous else "", p.chain, ", ".join(p.regions),
-            p.item_name[:50], was, now, off, p.promotion_description[:40],
+            category if category != previous else "", p.chain, ", ".join(p.stores or p.cities),
+            p.item_name[:50], now, was, off, deal or p.promotion_description[:40],
         )
         previous = category
     console.print(table)

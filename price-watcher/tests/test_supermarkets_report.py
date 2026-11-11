@@ -87,7 +87,7 @@ def _meat(chain: str, pct_now: str = "70.00") -> sm.MeatPromo:
         regular_price=Decimal("89.90"), discounted_price=Decimal(pct_now), discount_rate=None,
         promotion_description="כתף בקר 2 ב-140", store_name="סניף", city="תל אביב",
         regions=["תל אביב"], cities=["תל אביב"], min_qty=Decimal("2"),
-        bundle_price=Decimal("140"),
+        bundle_price=Decimal("140"), unit_kg=Decimal("1"),
     )
 
 
@@ -104,8 +104,12 @@ def test_scan_and_report_lists_failed_and_empty_chains(monkeypatch):
             raise sm.ChainScanError("אין סניפים באזורים שנבחרו", failed=False)
         return [], [_store()]
 
+    def fake_bina(sub, name):
+        raise sm.ChainScanError("אין סניפים בערים שנבחרו", failed=False)
+
     monkeypatch.setattr(sm, "scan_shufersal", fake_shufersal)
     monkeypatch.setattr(sm, "scan_publishedprices_chain", fake_pp)
+    monkeypatch.setattr(sm, "scan_bina_chain", fake_bina)
     report = sm.scan_and_report()
 
     assert report.status == "ok"
@@ -116,6 +120,8 @@ def test_scan_and_report_lists_failed_and_empty_chains(monkeypatch):
     }
     assert report.chains_empty["סאלח דבאח"] == "אין סניפים באזורים שנבחרו"
     assert report.chains_empty["רמי לוי"] == "לא נמצאו מבצעי בשר"
+    # Bareket is scanned too, and a chain without a store in the cities is listed, not dropped
+    assert report.chains_empty["סופר ברקת"] == "אין סניפים בערים שנבחרו"
     assert "חצי חינם" not in report.chains_failed  # removed: lists no files on that host
 
     text = "\n".join(email_sender._supermarkets_section_text(report))
@@ -125,7 +131,7 @@ def test_scan_and_report_lists_failed_and_empty_chains(monkeypatch):
         assert "רשתות ללא מבצעים" in out and "רמי לוי" in out
     # per-unit price plus the deal
     assert "2 ב-₪140" in text and "₪70.00" in text
-    assert "2 ב-₪140" in html
+    assert "מבצע 2 ב-<span dir=\"ltr\">₪140</span>" in html
 
 
 def test_all_chains_failed_still_lists_them(monkeypatch):
@@ -134,9 +140,10 @@ def test_all_chains_failed_still_lists_them(monkeypatch):
 
     monkeypatch.setattr(sm, "scan_shufersal", boom)
     monkeypatch.setattr(sm, "scan_publishedprices_chain", boom)
+    monkeypatch.setattr(sm, "scan_bina_chain", boom)
     report = sm.scan_and_report()
     assert report.status == "fetch_failed"
-    assert len(report.chains_failed) == 1 + len(sm._PUBLISHEDPRICES_CHAINS)
+    assert len(report.chains_failed) == 1 + len(sm._PUBLISHEDPRICES_CHAINS) + len(sm._BINA_CHAINS)
     assert "ההתחברות לאתר המחירים נכשלה" in email_sender._supermarkets_section_html(report)
     assert "רשתות שנכשלו" in "\n".join(email_sender._supermarkets_section_text(report))
 
@@ -154,7 +161,7 @@ def test_unknown_percentage_is_not_rendered_as_minus_dash():
 
     p2 = _meat("רשת")
     report = sm.SupermarketReport(status="ok", chains_scanned=["רשת"], promos=[p2])
-    assert '<span dir="ltr">-22%</span>' in email_sender._supermarkets_section_html(report)
+    assert '>-22%</b>' in email_sender._supermarkets_section_html(report)
 
 
 def test_persist_writes_new_fields(tmp_path):
@@ -162,3 +169,4 @@ def test_persist_writes_new_fields(tmp_path):
     sm.persist(report)
     text = sm._state_file().read_text(encoding="utf-8")
     assert '"min_qty": "2"' in text and '"bundle_price": "140"' in text
+    assert '"unit_kg": "1"' in text and '"price_per_kg": "70.00"' in text
