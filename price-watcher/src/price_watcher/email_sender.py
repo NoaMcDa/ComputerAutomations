@@ -818,7 +818,10 @@ def _sims4_section_text(sims4) -> list[str]:
     if sims4.status != "ok":
         lines.append(f"  הסריקה נכשלה: {_status_he(sims4.status)}  {sims4.error or ''}")
         return lines
-    lines.append(f"  נסרקו {len(sims4.packs)} חבילות מהחנות של EA.")
+    scanned = f"  נסרקו {len(sims4.packs)} חבילות מהחנות של EA"
+    if getattr(sims4, "page_limited", False):
+        scanned += " (העמוד הראשון בלבד; חבילות נוספות אינן נסרקות)"
+    lines.append(scanned + ".")
     if sims4.newly_on_sale:
         lines.append("")
         lines.append(f"  חדש במבצע ({len(sims4.newly_on_sale)}):")
@@ -858,6 +861,11 @@ def _sims4_section_html(sims4) -> str:
         )
 
     html = ['<div style="margin:0 0 20px;text-align:right">']
+    note = " (העמוד הראשון בלבד)" if getattr(sims4, "page_limited", False) else ""
+    html.append(
+        f'<div style="margin:0 0 8px;color:#6b7280;font-size:12px">'
+        f'נסרקו {len(sims4.packs)} חבילות{note}</div>'
+    )
     if sims4.newly_on_sale:
         html.append(
             '<div style="margin:0 0 12px;padding:12px 16px;background:#ecfdf5;'
@@ -913,8 +921,7 @@ def _sims4_section_html(sims4) -> str:
         )
     elif not sims4.newly_on_sale and not sims4.discount_ended:
         html.append(
-            f'<div style="color:#888;font-style:italic">נסרקו {len(sims4.packs)} חבילות — '
-            f'אין כרגע חבילות במבצע.</div>'
+            '<div style="color:#888;font-style:italic">אין כרגע חבילות במבצע.</div>'
         )
     html.append('</div>')
     return "".join(html)
@@ -940,11 +947,20 @@ def _creatine_section_text(creatine) -> list[str]:
     elif creatine.changed:
         prev = creatine.previous_cheapest
         word = _DIRECTION_HE.get(creatine.direction or "changed", "השתנה")
-        lines.append(
-            f"  שינוי: המחיר {word} מ-{sym}{prev.price_per_100g} ל-{sym}{cur.price_per_100g} ל-100 גרם"
-        )
+        if creatine.direction == "changed" and prev.price_per_100g == cur.price_per_100g:
+            lines.append(
+                f"  שינוי: המוצר הזול ביותר התחלף (אותו מחיר: {sym}{cur.price_per_100g} ל-100 גרם)"
+            )
+        elif creatine.direction == "changed":
+            lines.append("  שינוי: המוצר הזול ביותר התחלף")
+        else:
+            lines.append(
+                f"  שינוי: המחיר {word} מ-{sym}{prev.price_per_100g} ל-{sym}{cur.price_per_100g} ל-100 גרם"
+            )
     else:
         lines.append("  ללא שינוי מאז הסריקה הקודמת.")
+    if getattr(creatine, "parsed", 0):
+        lines.append(f"  נבדקו {creatine.parsed} מוצרים, מהם {creatine.powders} אבקות.")
     lines.append("")
     lines.append("  5 הזולים ביותר ל-100 גרם:")
     for i, p in enumerate(creatine.products[:5], 1):
@@ -973,13 +989,24 @@ def _creatine_section_html(creatine) -> str:
         change_html = '<div style="margin-top:6px;color:#065f46">(תצפית ראשונה)</div>'
     elif creatine.changed:
         prev = creatine.previous_cheapest
-        arrow_color = "#065f46" if creatine.direction == "dropped" else "#991b1b"
+        arrow_color = {"dropped": "#065f46", "rose": "#991b1b"}.get(creatine.direction or "", "#374151")
         word = _DIRECTION_HE.get(creatine.direction or "changed", "השתנה")
-        change_html = (
-            f'<div style="margin-top:6px;color:{arrow_color}"><b>'
-            f'המחיר {word}: מ-<span dir="ltr">{escape(sym)}{prev.price_per_100g}</span> '
-            f'ל-{_per100(cur.price_per_100g)}</b></div>'
-        )
+        if creatine.direction == "changed" and prev.price_per_100g == cur.price_per_100g:
+            change_html = (
+                f'<div style="margin-top:6px;color:{arrow_color}"><b>'
+                f'המוצר הזול ביותר התחלף (אותו מחיר: {_per100(cur.price_per_100g)})</b></div>'
+            )
+        elif creatine.direction == "changed":
+            change_html = (
+                f'<div style="margin-top:6px;color:{arrow_color}"><b>'
+                f'המוצר הזול ביותר התחלף</b></div>'
+            )
+        else:
+            change_html = (
+                f'<div style="margin-top:6px;color:{arrow_color}"><b>'
+                f'המחיר {word}: מ-<span dir="ltr">{escape(sym)}{prev.price_per_100g}</span> '
+                f'ל-{_per100(cur.price_per_100g)}</b></div>'
+            )
         if creatine.direction == "rose":
             header_bg = "#fef2f2"
             header_border = "#fca5a5"
@@ -1023,9 +1050,12 @@ def build_daily_payload(report) -> EmailPayload | None:
     if report.creatine is not None and report.creatine.status == "ok" and report.creatine.changed:
         cur = report.creatine.cheapest
         word = _DIRECTION_HE.get(report.creatine.direction or "changed", "השתנה")
-        creatine_blurb = (
-            f"הקריאטין {word} ל-{_currency_symbol(cur.currency)}{cur.price_per_100g} ל-100 גרם"
-        )
+        if report.creatine.direction == "changed" and report.creatine.previous_cheapest is not None:
+            creatine_blurb = "המוצר הזול ביותר בקריאטין התחלף"
+        else:
+            creatine_blurb = (
+                f"הקריאטין {word} ל-{_currency_symbol(cur.currency)}{cur.price_per_100g} ל-100 גרם"
+            )
 
     sm = getattr(report, "supermarkets", None)
     meat_blurb = ""
@@ -1036,6 +1066,26 @@ def build_daily_payload(report) -> EmailPayload | None:
             + (f", עד {best}% הנחה" if best else "")
         )
 
+    sims4_report = getattr(report, "sims4", None)
+    sims_blurb = ""
+    if sims4_report is not None and sims4_report.status == "ok":
+        if sims4_report.newly_on_sale:
+            best_sims = max(p.discount_percent for p in sims4_report.newly_on_sale)
+            sims_blurb = f"{len(sims4_report.newly_on_sale)} חבילות סימס 4 חדשות במבצע, עד {best_sims}% הנחה"
+        elif sims4_report.on_sale_now:
+            sims_blurb = f"{len(sims4_report.on_sale_now)} חבילות סימס 4 במבצע"
+
+    # Sections whose scan failed must show in the subject, not only in the body.
+    failed: list[str] = []
+    if any(d.status in ("unreachable", "blocked") for d in site_digests):
+        failed.append("אתרים")
+    if report.creatine is not None and report.creatine.status != "ok":
+        failed.append("קריאטין")
+    if sims4_report is not None and sims4_report.status != "ok":
+        failed.append("סימס 4")
+    if sm is not None and sm.status != "ok":
+        failed.append("בשר")
+
     headline: list[str] = []
     if best_promo:
         headline.append(
@@ -1044,8 +1094,12 @@ def build_daily_payload(report) -> EmailPayload | None:
         )
     if creatine_blurb:
         headline.append(creatine_blurb)
+    if sims_blurb:
+        headline.append(sims_blurb)
     if meat_blurb:
         headline.append(meat_blurb)
+    if failed:
+        headline.append("סריקה נכשלה: " + ", ".join(failed))
     subject = "דוח יומי: " + (" · ".join(headline) if headline else "אין חדש היום")
 
     # ---- Plain text ----

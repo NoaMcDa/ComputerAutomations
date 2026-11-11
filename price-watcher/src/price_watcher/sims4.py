@@ -1,8 +1,15 @@
 """The Sims 4 expansion / game / stuff pack discount watcher.
 
 Scrapes EA's Sims 4 store page (public, no bot protection as of 2026-11-11)
-and extracts discount info from the embedded GraphQL JSON. Prices shown by
-EA to non-logged-in international users are in USD.
+and extracts discount info from the page's embedded Next.js data (parsed as
+JSON, not regexed). Prices shown by EA to non-logged-in international users
+are in USD.
+
+Only the first page of the store (50 packs) is in the HTML; the "Show more"
+button loads further pages client-side and there is no plain-HTTP cursor or
+page parameter (`?page=2` returns the same 50), so later packs are not seen.
+State is therefore merged, not replaced, so packs that merely fall off the
+first page are not announced again when they return.
 
 Daily cadence. Alerts on: packs newly on sale, packs whose discount ended,
 and (optionally) packs whose discount percentage changed.
@@ -41,17 +48,11 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-# The GraphQL JSON embedded in the HTML has escaped quotes (\"key\":value).
-# We walk back from each lowestPricePurchaseOption to the nearest id to use
-# the id slug as our pack identifier + human-readable name.
-_PACK_PAT = re.compile(
-    r'\\"id\\":\\"en-us_([a-z0-9-]+?)_[^"]*?\\".*?'
-    r'\\"lowestPricePurchaseOption\\":\{'
-    r'.*?\\"amount\\":([\d.]+)'
-    r'.*?\\"originalAmount\\":([\d.]+)'
-    r'.*?\\"discountPercentage\\":(-?\d+)',
-    re.DOTALL,
-)
+# EA's store is a Next.js app: pack data sits in `self.__next_f.push([1, "..."])`
+# script chunks whose strings hold "flight" rows (`<hex id>:<json>`).
+_PUSH_MARK = "self.__next_f.push("
+_PACK_URL_BASE = "https://www.ea.com/games/the-sims/the-sims-4/buy/addon/"
+_PAGE_SIZE = 50  # packs delivered in the HTML; more need the "Show more" button
 
 
 @dataclass
@@ -69,7 +70,9 @@ class Sims4Pack:
 
     @property
     def url(self) -> str:
-        return f"https://www.ea.com/games/the-sims/the-sims-4/store/{self.slug}"
+        # Verified 2026-11-11: HTTP 200 for e.g. .../buy/addon/the-sims-4-seasons.
+        # (.../store/<slug> and .../store/addons/<slug> are HTTP 404.)
+        return _PACK_URL_BASE + self.slug
 
 
 @dataclass
@@ -81,6 +84,7 @@ class Sims4Report:
     discount_ended: list[Sims4Pack] = field(default_factory=list)
     discount_changed: list[tuple[Sims4Pack, int]] = field(default_factory=list)  # (pack, old_pct)
     error: Optional[str] = None
+    page_limited: bool = False  # True when only the first store page could be read
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +104,96 @@ def _slug_to_name(slug: str) -> str:
     return f"The Sims 4: {titled}" if titled else slug
 
 
+_NAME_JUNK = re.compile(r"[™®�]")
+
+
+def _clean_title(title: str) -> str:
+    """Drop trademark signs / replacement chars and stray whitespace from a store title."""
+    return " ".join(_NAME_JUNK.sub("", title).split())
+
+
+def _flight_rows(html: str) -> list:
+    """Decode the Next.js flight data embedded in the page into JSON values."""
+    decoder = json.JSONDecoder()
+    text_parts: list[str] = []
+    pos = 0
+    while True:
+        i = html.find(_PUSH_MARK, pos)
+        if i < 0:
+            break
+        start = i + len(_PUSH_MARK)
+        pos = start
+        try:
+            arr, end = decoder.raw_decode(html, start)
+        except ValueError:
+            continue
+        pos = end
+        if isinstance(arr, list) and len(arr) == 2 and arr[0] == 1 and isinstance(arr[1], str):
+            text_parts.append(arr[1])
+    rows = []
+    for line in "".join(text_parts).split(chr(10)):
+        head, sep, payload = line.partition(":")
+        if not sep or not payload or payload[0] not in '[{':
+            continue
+        try:
+            rows.append(json.loads(payload))
+        except ValueError:
+            continue
+    return rows
+
+
+def _walk_packs(node, out: list[dict]) -> None:
+    if isinstance(node, dict):
+        if isinstance(node.get("slug"), str) and isinstance(node.get("lowestPriceGameProduct"), dict):
+            out.append(node)
+        for v in node.values():
+            _walk_packs(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_packs(v, out)
+
+
+def _pack_from_node(node: dict) -> Optional[Sims4Pack]:
+    slug = node["slug"]
+    info = node["lowestPriceGameProduct"].get("nonSubscriberPricingInfo")
+    if not isinstance(info, dict):
+        return None
+    opt = info.get("lowestPricePurchaseOption")
+    if not isinstance(opt, dict) or opt.get("amount") is None:
+        return None
+    try:
+        price = Decimal(str(opt["amount"]))
+        orig_raw = opt.get("originalAmount")
+        original = Decimal(str(orig_raw)) if orig_raw is not None else price
+    except (ValueError, ArithmeticError):
+        return None
+    try:
+        disc = int(opt.get("discountPercentage"))
+    except (TypeError, ValueError):
+        disc = int(round((1 - price / original) * 100)) if original > price else 0
+    title = node.get("title")
+    name = _clean_title(title) if isinstance(title, str) and title.strip() else _slug_to_name(slug)
+    return Sims4Pack(slug=slug, name=name, price=price, original_price=original, discount_percent=disc)
+
+
+def parse_packs(html: str) -> list[Sims4Pack]:
+    """Extract packs (non-subscriber price, real title) from the store page HTML."""
+    nodes: list[dict] = []
+    for row in _flight_rows(html):
+        _walk_packs(row, nodes)
+    packs: list[Sims4Pack] = []
+    seen: set[str] = set()
+    for node in nodes:
+        if node["slug"] in seen:
+            continue
+        pack = _pack_from_node(node)
+        if pack is None:
+            continue
+        seen.add(pack.slug)
+        packs.append(pack)
+    return packs
+
+
 def scan_ea() -> list[Sims4Pack]:
     """Fetch the EA Sims 4 all-packs page and extract pack info."""
     try:
@@ -111,28 +205,7 @@ def scan_ea() -> list[Sims4Pack]:
     if resp.status_code != 200:
         log.warning("EA returned HTTP %s", resp.status_code)
         return []
-
-    matches = _PACK_PAT.findall(resp.text)
-    seen: set[str] = set()
-    packs: list[Sims4Pack] = []
-    for slug, amount_s, orig_s, disc_s in matches:
-        if slug in seen:
-            continue
-        seen.add(slug)
-        try:
-            price = Decimal(amount_s)
-            original = Decimal(orig_s)
-            disc = int(disc_s)
-        except (ValueError, ArithmeticError):
-            continue
-        packs.append(Sims4Pack(
-            slug=slug,
-            name=_slug_to_name(slug),
-            price=price,
-            original_price=original,
-            discount_percent=disc,
-        ))
-    return packs
+    return parse_packs(resp.text)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +258,7 @@ def scan_and_report() -> Sims4Report:
     state = _load_state()
     stored = state.get("packs", {})
 
-    report = Sims4Report(status="ok", packs=packs)
+    report = Sims4Report(status="ok", packs=packs, page_limited=len(packs) >= _PAGE_SIZE)
     report.on_sale_now = [p for p in packs if p.is_on_sale]
 
     for pack in packs:
@@ -207,7 +280,11 @@ def persist(report: Sims4Report) -> None:
     if report.status != "ok":
         return
     state = _load_state()
-    state["packs"] = {p.slug: _pack_to_dict(p) for p in report.packs}
+    # Merge, don't replace: a pack that drops off the first store page keeps its
+    # last known state, so it is not re-announced when it comes back.
+    merged = dict(state.get("packs", {}))
+    merged.update({p.slug: _pack_to_dict(p) for p in report.packs})
+    state["packs"] = merged
     state["last_scanned_at"] = datetime.now().astimezone().isoformat()
     _save_state(state)
 
@@ -218,7 +295,8 @@ def print_report(report: Sims4Report) -> None:
         console.print(f"[red]Sims 4 scan failed: {report.status}[/red]  {report.error or ''}")
         return
 
-    console.print(f"[dim]Scanned {len(report.packs)} packs from EA[/dim]")
+    note = " (first store page only; later packs are not visible)" if report.page_limited else ""
+    console.print(f"[dim]Scanned {len(report.packs)} packs from EA{note}[/dim]")
 
     if report.newly_on_sale:
         console.print(f"\n[bold green]🆕 NEWLY ON SALE ({len(report.newly_on_sale)}):[/bold green]")
