@@ -496,6 +496,79 @@ def build_digest_payload(digests) -> EmailPayload | None:
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
 
+def _supermarkets_section_text(sm) -> list[str]:
+    lines = ["Supermarket meat discounts", "-" * 50, ""]
+    if sm is None:
+        lines.append("  (not scanned)")
+        return lines
+    if sm.status != "ok":
+        lines.append(f"  scan failed: {sm.status}  {sm.error or ''}")
+        return lines
+    chains = ", ".join(sm.chains_scanned) if sm.chains_scanned else "none"
+    lines.append(f"  Chains scanned: {chains}")
+    if not sm.promos:
+        lines.append("  No meat promos found today.")
+        return lines
+    lines.append(f"  Top {len(sm.promos)} by discount %:")
+    lines.append("")
+    for i, p in enumerate(sm.promos, 1):
+        pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
+        was = f"₪{p.regular_price}" if p.regular_price else "—"
+        now = f"₪{p.discounted_price}" if p.discounted_price else "—"
+        lines.append(f"  {i:>2}. [{p.chain}] -{pct}  {was} → {now}  {p.item_name[:60]}")
+        if p.promotion_description:
+            lines.append(f"      {p.promotion_description[:100]}")
+    return lines
+
+
+def _supermarkets_section_html(sm) -> str:
+    if sm is None:
+        return '<div style="color:#888;font-style:italic">(not scanned)</div>'
+    if sm.status != "ok":
+        return (
+            '<div style="padding:12px;border:1px solid #fecaca;border-radius:8px;'
+            'background:#fef2f2;color:#991b1b">'
+            f'<b>Supermarket scan failed:</b> {escape(sm.status)}'
+            + (f' — {escape(sm.error)}' if sm.error else '')
+            + '</div>'
+        )
+    chains = ", ".join(sm.chains_scanned) if sm.chains_scanned else "none"
+    html = [
+        f'<div style="color:#6b7280;font-size:13px;margin-bottom:10px">Chains scanned: {escape(chains)}</div>'
+    ]
+    if not sm.promos:
+        html.append('<div style="color:#888;font-style:italic">No meat promos found today.</div>')
+        return "".join(html)
+
+    rows = []
+    for p in sm.promos:
+        pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
+        was = f"₪{p.regular_price}" if p.regular_price else "—"
+        now = f"₪{p.discounted_price}" if p.discounted_price else "—"
+        rows.append(
+            f'<tr style="border-bottom:1px solid #eee">'
+            f'<td style="padding:6px 8px;font-size:12px;color:#666">{escape(p.chain)}</td>'
+            f'<td style="padding:6px 8px;font-weight:500">{escape(p.item_name[:55])}</td>'
+            f'<td style="padding:6px 8px;color:#dc2626;font-weight:600">-{pct}</td>'
+            f'<td style="padding:6px 8px;font-size:12px"><s style="color:#999">{was}</s> → <b>{now}</b></td>'
+            f'<td style="padding:6px 8px;font-size:11px;color:#666">{escape(p.promotion_description[:60])}</td>'
+            f'</tr>'
+        )
+    html.append(
+        '<table style="border-collapse:collapse;width:100%;font-size:13px">'
+        '<thead><tr style="background:#fafafa;text-align:left">'
+        '<th style="padding:6px 8px">Chain</th>'
+        '<th style="padding:6px 8px">Item</th>'
+        '<th style="padding:6px 8px">Off</th>'
+        '<th style="padding:6px 8px">Price</th>'
+        '<th style="padding:6px 8px">Promo</th>'
+        '</tr></thead><tbody>'
+        + "".join(rows)
+        + '</tbody></table>'
+    )
+    return "".join(html)
+
+
 def _sims4_section_text(sims4) -> list[str]:
     lines = ["The Sims 4 (EA)", "-" * 50, ""]
     if sims4 is None:
@@ -806,9 +879,16 @@ def build_daily_payload(report) -> EmailPayload | None:
     )
     html_parts.append(_sims4_section_html(getattr(report, "sims4", None)))
 
-    # Also append sims4 text lines
+    html_parts.append(
+        '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Supermarket meat discounts</h3>'
+    )
+    html_parts.append(_supermarkets_section_html(getattr(report, "supermarkets", None)))
+
+    # Also append sims4 + supermarkets text lines
     text_body_addendum = "\n".join(_sims4_section_text(getattr(report, "sims4", None)))
-    text_body = text_body + "\n" + text_body_addendum
+    text_body = text_body + "\n" + text_body_addendum + "\n" + "\n".join(
+        _supermarkets_section_text(getattr(report, "supermarkets", None))
+    )
 
     html_parts.append(
         '<p style="color:#999;font-size:12px;margin-top:24px">— Price Watcher</p>'
