@@ -397,65 +397,329 @@ def send_test_email() -> None:
 # ---------------------------------------------------------------------------
 
 def build_digest_payload(digests) -> EmailPayload | None:
-    """Build the daily digest email payload. Returns None if nothing to report."""
+    """Build the detailed daily digest email. Lists every promo per site with
+    code, percentage, condition, and raw source excerpt."""
     from price_watcher.digest import SiteDigest  # lazy to avoid circular import
     digests: list[SiteDigest] = list(digests)
     if not digests:
         return None
 
-    count_with_promo = sum(1 for d in digests if d.status == "ok" and d.promo and d.promo.discount_pct > 0)
-    if count_with_promo > 0:
-        subject = f"Daily sales digest: {count_with_promo} site{'s' if count_with_promo != 1 else ''} with active promos"
+    all_promos = [(d, p) for d in digests for p in d.promos]
+    if all_promos:
+        best = max(all_promos, key=lambda dp: dp[1].discount_pct)
+        best_site, best_promo = best
+        total = len(all_promos)
+        subject = (
+            f"Daily digest: {total} promo{'s' if total != 1 else ''} "
+            f"(top: {best_promo.discount_pct}% off at {best_site.display_name}"
+            + (f" with {best_promo.code}" if best_promo.code else "")
+            + ")"
+        )
     else:
-        subject = "Daily sales digest: no active promos today"
+        subject = "Daily sales digest: no site-wide promos today"
 
-    text_lines = ["Daily sales digest", "=" * 40, ""]
-    html_rows = []
+    # --- Plain text body ---
+    text_lines = ["Daily sales digest", "=" * 50, ""]
     for d in digests:
-        if d.status == "ok" and d.promo and d.promo.discount_pct > 0:
-            pct = d.promo.discount_pct
-            code_part = f" with code {d.promo.code}" if d.promo.code else ""
-            cond_part = f" ({d.promo.condition})" if d.promo.condition else ""
-            text_lines.append(f"• {d.display_name}: {pct}% off{code_part}{cond_part}")
-            html_rows.append(
-                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
-                f'<td style="padding:6px 12px">{pct}% off'
-                + (f' with code <code>{escape(d.promo.code)}</code>' if d.promo.code else '')
-                + (f'<br><span style="color:#666;font-size:13px">{escape(d.promo.condition or "")}</span>' if d.promo.condition else '')
-                + '</td></tr>'
+        text_lines.append(f"▼ {d.display_name}  ({d.host})")
+        text_lines.append(f"   {d.homepage_url}")
+        if d.status != "ok":
+            text_lines.append(f"   [{d.status}] {d.error or ''}")
+            text_lines.append("")
+            continue
+        if not d.promos:
+            text_lines.append("   (no site-wide promo detected)")
+            text_lines.append("")
+            continue
+        for i, p in enumerate(d.promos, 1):
+            code_part = f"code: {p.code}" if p.code else "no code"
+            text_lines.append(f"   {i}. {p.discount_pct}% off  —  {code_part}")
+            if p.condition:
+                text_lines.append(f"      context: {p.condition[:200]}")
+        text_lines.append("")
+    text_lines.append("— Price Watcher")
+    text_body = "\n".join(text_lines)
+
+    # --- HTML body ---
+    html_parts = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8"></head>',
+        '<body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
+        'padding:16px;max-width:680px;line-height:1.5">',
+        '<h2 style="margin:0 0 20px">Daily sales digest</h2>',
+    ]
+    for d in digests:
+        html_parts.append(
+            f'<div style="margin:0 0 24px;padding:14px 16px;border:1px solid #e5e7eb;'
+            f'border-radius:8px;background:#fafafa">'
+        )
+        html_parts.append(
+            f'<div style="font-size:16px;font-weight:600">{escape(d.display_name)}'
+            f' <a href="{escape(d.homepage_url)}" style="font-weight:normal;color:#2563eb;'
+            f'text-decoration:none;font-size:13px">({escape(d.host)})</a></div>'
+        )
+        if d.status != "ok":
+            html_parts.append(
+                f'<div style="margin-top:8px;color:#c33">'
+                f'<b>{escape(d.status)}:</b> {escape(d.error or "—")}</div>'
             )
-        elif d.status == "ok" and d.promo and d.promo.discount_pct == 0:
-            text_lines.append(f"• {d.display_name}: tiered promo ({d.promo.condition or 'up-to'})")
-            html_rows.append(
-                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
-                f'<td style="padding:6px 12px;color:#666">tiered promo (up-to, not computable)</td></tr>'
-            )
-        elif d.status == "no_banner":
-            text_lines.append(f"• {d.display_name}: no site-wide promo detected")
-            html_rows.append(
-                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
-                f'<td style="padding:6px 12px;color:#999">no site-wide promo detected</td></tr>'
+        elif not d.promos:
+            html_parts.append(
+                '<div style="margin-top:8px;color:#888;font-style:italic">'
+                'no site-wide promo detected</div>'
             )
         else:
-            text_lines.append(f"• {d.display_name}: {d.status} ({d.error or '—'})")
-            html_rows.append(
-                f'<tr><td style="padding:6px 12px"><b>{escape(d.display_name)}</b></td>'
-                f'<td style="padding:6px 12px;color:#c33">{escape(d.status)}: {escape(d.error or "—")}</td></tr>'
-            )
-
-    text_body = "\n".join(text_lines) + "\n\n— Price Watcher\n"
-    html_body = (
-        '<!DOCTYPE html><html><head><meta charset="utf-8"></head>'
-        '<body style="font-family:sans-serif;padding:16px;max-width:600px">'
-        '<h2>Daily sales digest</h2>'
-        '<table style="border-collapse:collapse;width:100%">'
-        + "".join(html_rows)
-        + '</table>'
+            for p in d.promos:
+                code_html = (
+                    f'<code style="background:#111;color:#fff;padding:2px 8px;'
+                    f'border-radius:4px;font-size:14px;font-weight:600">{escape(p.code)}</code>'
+                    if p.code
+                    else '<span style="color:#888;font-size:13px">(no code)</span>'
+                )
+                html_parts.append(
+                    f'<div style="margin:10px 0 0;padding-top:10px;border-top:1px solid #eee">'
+                    f'<div style="font-size:15px">'
+                    f'<b style="color:#dc2626">{p.discount_pct}% off</b>  &nbsp; {code_html}</div>'
+                )
+                if p.condition:
+                    html_parts.append(
+                        f'<div style="margin-top:4px;color:#555;font-size:13px">'
+                        f'{escape(p.condition[:300])}</div>'
+                    )
+                html_parts.append('</div>')
+        html_parts.append('</div>')
+    html_parts.append(
         '<p style="color:#999;font-size:12px;margin-top:24px">— Price Watcher</p>'
         '</body></html>'
     )
+    html_body = "".join(html_parts)
+
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
+
+def _creatine_section_text(creatine) -> list[str]:
+    """Plain-text lines for the creatine section of the daily report."""
+    lines = ["Creatine (iHerb)", "-" * 50, ""]
+    if creatine is None or creatine.status != "ok":
+        lines.append(f"  scan failed: {creatine.status if creatine else 'unavailable'}")
+        if creatine and creatine.error:
+            lines.append(f"  {creatine.error}")
+        return lines
+    cur = creatine.cheapest
+    sym = _currency_symbol(cur.currency)
+    lines.append(f"  Cheapest ₪/100g: {sym}{cur.price_per_100g}")
+    lines.append(f"    {cur.name}")
+    lines.append(f"    {sym}{cur.price}" + ("  (on sale)" if cur.on_sale else ""))
+    lines.append(f"    {cur.url}")
+    lines.append("")
+    if creatine.previous_cheapest is None:
+        lines.append("  (first observation)")
+    elif creatine.changed:
+        prev = creatine.previous_cheapest
+        lines.append(f"  Change: {sym}{prev.price_per_100g}/100g → {sym}{cur.price_per_100g}/100g  ({creatine.direction or 'changed'})")
+    else:
+        lines.append("  No change since last scan.")
+    lines.append("")
+    lines.append("  Top 5 by ₪/100g:")
+    for i, p in enumerate(creatine.products[:5], 1):
+        lines.append(f"    {i}. {sym}{p.price_per_100g}/100g — {p.name[:70]}")
+    return lines
+
+
+def _creatine_section_html(creatine) -> str:
+    """HTML section for the creatine part of the daily report."""
+    if creatine is None or creatine.status != "ok":
+        return (
+            '<div style="margin:0 0 24px;padding:14px 16px;border:1px solid #fecaca;'
+            'border-radius:8px;background:#fef2f2">'
+            f'<div style="color:#991b1b"><b>Creatine scan failed:</b> '
+            f'{escape(creatine.status if creatine else "unavailable")}'
+            + (f' — {escape(creatine.error)}' if (creatine and creatine.error) else '')
+            + '</div></div>'
+        )
+    cur = creatine.cheapest
+    sym = _currency_symbol(cur.currency)
+
+    header_bg = "#ecfdf5"
+    header_border = "#10b981"
+    change_html = ""
+    if creatine.previous_cheapest is None:
+        change_html = '<span style="color:#065f46">(first observation)</span>'
+    elif creatine.changed:
+        prev = creatine.previous_cheapest
+        arrow_color = "#065f46" if creatine.direction == "dropped" else "#991b1b"
+        change_html = (
+            f'<div style="margin-top:6px;color:{arrow_color}"><b>'
+            f'{sym}{prev.price_per_100g}/100g → {sym}{cur.price_per_100g}/100g '
+            f'({creatine.direction or "changed"})</b></div>'
+        )
+        if creatine.direction == "rose":
+            header_bg = "#fef2f2"
+            header_border = "#fca5a5"
+    else:
+        change_html = '<span style="color:#6b7280">No change since last scan.</span>'
+
+    rows_html = "".join(
+        f'<tr><td style="padding:4px 10px;color:#666">{i}.</td>'
+        f'<td style="padding:4px 10px"><b>{sym}{p.price_per_100g}</b>/100g</td>'
+        f'<td style="padding:4px 10px"><a href="{escape(p.url)}" style="color:#2563eb;text-decoration:none">{escape(p.name[:70])}</a></td></tr>'
+        for i, p in enumerate(creatine.products[:5], 1)
+    )
+
+    return (
+        f'<div style="margin:0 0 24px;padding:14px 16px;border:1px solid {header_border};'
+        f'border-radius:8px;background:{header_bg}">'
+        f'<div style="font-size:16px;font-weight:600">Creatine (iHerb) · cheapest '
+        f'<span style="color:#065f46">{sym}{cur.price_per_100g}/100g</span></div>'
+        f'<div style="margin-top:6px">{escape(cur.name)}'
+        + (' <span style="background:#dc2626;color:#fff;padding:1px 6px;border-radius:3px;font-size:11px">on sale</span>' if cur.on_sale else '')
+        + f'</div>'
+        f'<a href="{escape(cur.url)}" style="color:#2563eb;font-size:13px">open at iHerb</a>'
+        f'{change_html}'
+        f'<div style="margin-top:14px;font-size:13px;color:#555"><b>Top 5 by ₪/100g:</b>'
+        f'<table style="border-collapse:collapse;margin-top:4px;width:100%">{rows_html}</table></div>'
+        f'</div>'
+    )
+
+
+def build_daily_payload(report) -> EmailPayload | None:
+    """Combine sales digest + creatine (+ future daily features) into one email."""
+    # Headline figure out: biggest promo across sites + any creatine change
+    site_digests = report.site_digests
+    all_promos = [(d, p) for d in site_digests for p in d.promos]
+    best_promo_site, best_promo = (None, None)
+    if all_promos:
+        best_promo_site, best_promo = max(all_promos, key=lambda dp: dp[1].discount_pct)
+
+    creatine_blurb = ""
+    if report.creatine is not None and report.creatine.status == "ok" and report.creatine.changed:
+        cur = report.creatine.cheapest
+        creatine_blurb = f"creatine {report.creatine.direction or 'changed'} to {_currency_symbol(cur.currency)}{cur.price_per_100g}/100g"
+
+    if best_promo and creatine_blurb:
+        subject = (
+            f"Daily digest: top {best_promo.discount_pct}% off at {best_promo_site.display_name}"
+            + (f" ({best_promo.code})" if best_promo.code else "")
+            + f" · {creatine_blurb}"
+        )
+    elif best_promo:
+        subject = (
+            f"Daily digest: top {best_promo.discount_pct}% off at {best_promo_site.display_name}"
+            + (f" ({best_promo.code})" if best_promo.code else "")
+        )
+    elif creatine_blurb:
+        subject = f"Daily digest: {creatine_blurb}"
+    else:
+        subject = "Daily digest: nothing new today"
+
+    # ---- Plain text ----
+    text_lines = ["Daily digest", "=" * 50, ""]
+    text_lines.append("Sales (site-wide promos)")
+    text_lines.append("-" * 50)
+    text_lines.append("")
+    for d in site_digests:
+        text_lines.append(f"▼ {d.display_name}  ({d.host})")
+        text_lines.append(f"  {d.homepage_url}")
+        if d.status != "ok":
+            text_lines.append(f"  [{d.status}] {d.error or ''}")
+            text_lines.append("")
+            continue
+        if not d.promos:
+            text_lines.append("  (no site-wide promo detected)")
+            text_lines.append("")
+            continue
+        for i, p in enumerate(d.promos, 1):
+            code_part = f"code: {p.code}" if p.code else "no code"
+            text_lines.append(f"  {i}. {p.discount_pct}% off  —  {code_part}")
+            if p.condition:
+                text_lines.append(f"     {p.condition[:200]}")
+        text_lines.append("")
+    text_lines.extend(_creatine_section_text(report.creatine))
+    text_lines.append("")
+    text_lines.append("— Price Watcher")
+    text_body = "\n".join(text_lines)
+
+    # ---- HTML ----
+    html_parts = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8"></head>',
+        '<body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
+        'padding:16px;max-width:680px;line-height:1.5;color:#111">',
+        '<h2 style="margin:0 0 6px">Daily digest</h2>',
+        '<div style="color:#6b7280;font-size:13px;margin-bottom:24px">Sales + creatine</div>',
+
+        '<h3 style="margin:0 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Sales — site-wide promos</h3>',
+    ]
+    for d in site_digests:
+        html_parts.append(
+            f'<div style="margin:0 0 20px;padding:14px 16px;border:1px solid #e5e7eb;'
+            f'border-radius:8px;background:#fafafa">'
+            f'<div style="font-size:16px;font-weight:600">{escape(d.display_name)}'
+            f' <a href="{escape(d.homepage_url)}" style="font-weight:normal;color:#2563eb;'
+            f'text-decoration:none;font-size:13px">({escape(d.host)})</a></div>'
+        )
+        if d.status != "ok":
+            html_parts.append(
+                f'<div style="margin-top:8px;color:#c33">'
+                f'<b>{escape(d.status)}:</b> {escape(d.error or "—")}</div>'
+            )
+        elif not d.promos:
+            html_parts.append(
+                '<div style="margin-top:8px;color:#888;font-style:italic">'
+                'no site-wide promo detected</div>'
+            )
+        else:
+            for p in d.promos:
+                code_html = (
+                    f'<code style="background:#111;color:#fff;padding:2px 8px;'
+                    f'border-radius:4px;font-size:14px;font-weight:600">{escape(p.code)}</code>'
+                    if p.code
+                    else '<span style="color:#888;font-size:13px">(no code)</span>'
+                )
+                html_parts.append(
+                    f'<div style="margin:10px 0 0;padding-top:10px;border-top:1px solid #eee">'
+                    f'<div style="font-size:15px">'
+                    f'<b style="color:#dc2626">{p.discount_pct}% off</b>  &nbsp; {code_html}</div>'
+                )
+                if p.condition:
+                    html_parts.append(
+                        f'<div style="margin-top:4px;color:#555;font-size:13px">'
+                        f'{escape(p.condition[:300])}</div>'
+                    )
+                html_parts.append('</div>')
+        html_parts.append('</div>')
+
+    html_parts.append(
+        '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Creatine</h3>'
+    )
+    html_parts.append(_creatine_section_html(report.creatine))
+
+    html_parts.append(
+        '<p style="color:#999;font-size:12px;margin-top:24px">— Price Watcher</p>'
+        '</body></html>'
+    )
+    html_body = "".join(html_parts)
+
+    return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
+
+
+def send_daily_email(report) -> bool:
+    """Send the combined daily report email."""
+    payload = build_daily_payload(report)
+    if payload is None:
+        log.info("No daily report to send")
+        return True
+    cfg = _config_module.load().email
+    try:
+        _send_via_smtp(payload, cfg)
+        log.info("Daily email sent to %s", cfg.email_to)
+        return True
+    except (smtplib.SMTPException, OSError) as exc:
+        log.error("Daily email send failed: %s", type(exc).__name__)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Legacy digest-only payload (kept for backward compatibility, unused now)
+# ---------------------------------------------------------------------------
 
 def send_digest_email(digests) -> bool:
     """Send the daily digest email. Returns True on success, False on failure."""
