@@ -17,7 +17,18 @@ def _scan() -> dict[str, sm.MeatPromo]:
         (_FIX / "PriceFull_small.xml").read_bytes(),
         (_FIX / "PromoFull_small.xml").read_bytes(),
     )
-    return {p.item_code: p for p in promos}
+    return {p.item_code: p for p in promos if p.is_promo}
+
+
+def _scan_regular() -> dict[str, sm.MeatPromo]:
+    """Meat items of the same store that are listed at their regular price."""
+    store = sm.StoreInfo(1, "סניף בדיקה", "תל אביב", "תל אביב")
+    rows = sm._scan_store(
+        "רשת", store,
+        (_FIX / "PriceFull_small.xml").read_bytes(),
+        (_FIX / "PromoFull_small.xml").read_bytes(),
+    )
+    return {p.item_code: p for p in rows if not p.is_promo}
 
 
 def test_only_consistent_meat_promos_are_kept():
@@ -152,3 +163,21 @@ def test_scanned_promos_carry_their_price_per_kg():
     assert promos["1001"].price_per_kg == Decimal("10.00")  # weighed
     assert promos["1003"].unit_kg is None                   # packaged "יחידות", weight unknown
     assert promos["1003"].price_per_kg is None
+
+
+def test_items_without_a_usable_promo_are_listed_at_their_regular_price():
+    regular = _scan_regular()
+    # The promotions of these were rejected (unit mismatch, compensation credit,
+    # payment-method discount, no saving, club only, contradictory numbers):
+    # the items themselves are still on the shelf at the regular price.
+    assert {"1004", "1005", "1006", "1009", "1011", "1013"} <= set(regular)
+    # Non-meat items never appear, on sale or not (pet food, fish, noodles).
+    assert not {"1007", "1008", "1010"} & set(regular)
+    # An item with a usable promotion is not listed a second time.
+    assert not set(_scan()) & set(regular)
+    for p in regular.values():
+        assert p.discounted_price is None and p.savings_pct is None
+        assert p.regular_price > 0 and p.promotion_description == ""
+        assert p.stores == ["סניף בדיקה (תל אביב)"] or p.stores  # carries its branch
+    weighed = [p for p in regular.values() if p.is_weighted and p.unit_kg == 1]
+    assert weighed and all(p.price_per_kg == p.regular_price.quantize(Decimal("0.01")) for p in weighed)

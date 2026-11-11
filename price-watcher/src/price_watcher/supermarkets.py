@@ -945,12 +945,20 @@ class MeatPromo:
         return Decimal(1) if self.is_weighted else None
 
     @property
+    def is_promo(self) -> bool:
+        """False for an item listed at its regular price (not on sale)."""
+        return self.discounted_price is not None
+
+    @property
     def price_per_kg(self) -> Optional[Decimal]:
-        """Promo price per kg (the ranking key), None when it cannot be derived."""
+        """Price per kg the shopper pays (the ranking key): the promo price,
+        or the regular price for an item that is not on sale. None when it
+        cannot be derived."""
         kg = self.kg_per_unit
-        if kg is None or self.discounted_price is None:
+        price = self.discounted_price if self.discounted_price is not None else self.regular_price
+        if kg is None or price is None:
             return None
-        return (self.discounted_price / kg).quantize(Decimal("0.01"))
+        return (price / kg).quantize(Decimal("0.01"))
 
     @property
     def regular_per_kg(self) -> Optional[Decimal]:
@@ -1001,10 +1009,12 @@ class SupermarketReport:
     stores_scanned: list[str] = field(default_factory=list)  # "chain – store (city)"
     stores_by_region: dict[str, int] = field(default_factory=dict)
     promos_by_region: dict[str, int] = field(default_factory=dict)  # before the top-N cut
-    # Deals with a price per kg, per category, before the top-N cut.
+    # Items with a price per kg (on sale or at the regular price), per shown
+    # category, before the top-N cut.
     promos_by_category: dict[str, int] = field(default_factory=dict)
     # After the scan: grouped by category (in `_CATEGORIES` order), cheapest
-    # promo price per kg first inside each category.
+    # price per kg first inside each category. Rows are deals and, where they
+    # are cheaper, items at their regular price (`MeatPromo.is_promo`).
     promos: list[MeatPromo] = field(default_factory=list)
     error: Optional[str] = None
     # chain -> Hebrew reason. Failed = could not be scanned (login, files,
@@ -1209,7 +1219,14 @@ def _scan_store(
     except ET.ParseError as exc:
         raise _StoreFeedError(f"parse failed: {exc}") from exc
     item_index = _build_item_index(price_root)
-    promos = _extract_meat_promos(chain_name, f"{store.store_id:03d}", promo_root, item_index)
+    store_code = f"{store.store_id:03d}"
+    promos = _extract_meat_promos(chain_name, store_code, promo_root, item_index)
+    n_deals = len(promos)
+    # Items at their regular price compete with the deals in the ranking, so
+    # a table shows the cheapest price per kg whether or not it is a sale.
+    promos += _extract_regular_items(
+        chain_name, store_code, item_index, {p.item_code for p in promos},
+    )
     for p in promos:
         p.store_name = store.name
         p.city = store.city
@@ -1217,10 +1234,40 @@ def _scan_store(
         p.cities = [store.city]
         p.stores = [store.branch]
     log.info(
-        "%s / %s (%s, %s): %d items, %d meat promos",
-        chain_name, store.label, store.city, store.region, len(item_index), len(promos),
+        "%s / %s (%s, %s): %d items, %d meat promos, %d meat items at regular price",
+        chain_name, store.label, store.city, store.region, len(item_index),
+        n_deals, len(promos) - n_deals,
     )
     return promos
+
+
+def _extract_regular_items(
+    chain_name: str,
+    store_id: str,
+    item_index: dict[str, "_FeedItem"],
+    on_sale_codes: set[str],
+) -> list["MeatPromo"]:
+    """Meat items of one store that are not in a usable promotion, as rows
+    with `discounted_price=None` (their regular price is what you pay)."""
+    rows: list[MeatPromo] = []
+    for code, item in item_index.items():
+        if code in on_sale_codes or item.price is None or item.price <= 0:
+            continue
+        if not _is_meat_product(item.name, context="", item=item):
+            continue
+        rows.append(MeatPromo(
+            chain=chain_name,
+            store_id=store_id,
+            item_code=code,
+            item_name=item.name,
+            regular_price=item.price,
+            discounted_price=None,
+            discount_rate=None,
+            promotion_description="",
+            is_weighted=item.weighted,
+            unit_kg=_unit_kg(item, item.weighted),
+        ))
+    return rows
 
 
 def _scan_chain(
@@ -1697,8 +1744,8 @@ def scan_and_report() -> SupermarketReport:
                 report.chains_failed[name] = f"שגיאה: {type(exc).__name__}"
                 continue
             if not promos:
-                log.warning("%s: no meat promos returned", name)
-                report.chains_empty[name] = "לא נמצאו מבצעי בשר"
+                log.warning("%s: no meat items returned", name)
+                report.chains_empty[name] = "לא נמצאו מוצרי בשר"
                 continue
             report.promos.extend(promos)
             report.chains_scanned.append(name)
@@ -1729,20 +1776,26 @@ def scan_and_report() -> SupermarketReport:
 
 
 def _finalize_report(report: SupermarketReport) -> None:
-    """Dedupe, drop implausible rows and keep the cheapest deals of each category."""
+    """Dedupe, drop implausible rows and keep the cheapest items of each category."""
     # Dedupe: the same promotion runs in many stores of a chain and often
     # covers several item variants (different brands of the same cut). Keep
     # one row per (chain, promotion description, promo price per kg) — or,
     # without a price per kg, per rounded percent — and remember the regions /
-    # cities / branches behind it.
+    # cities / branches behind it. An item at its regular price is one row
+    # per (chain, item name, price per kg).
     seen: dict[tuple, MeatPromo] = {}
     seen_stores: dict[tuple, set[str]] = {}
     for p in report.promos:
-        pct = p.savings_pct
-        if pct is None or pct <= 0 or pct >= _MAX_SANE_DISCOUNT_PCT:
-            continue
         per_kg = p.price_per_kg
-        key = (p.chain, p.promotion_description, per_kg if per_kg is not None else f"{int(pct)}%")
+        if p.is_promo:
+            pct = p.savings_pct
+            if pct is None or pct <= 0 or pct >= _MAX_SANE_DISCOUNT_PCT:
+                continue
+            key = (p.chain, p.promotion_description, per_kg if per_kg is not None else f"{int(pct)}%")
+        else:
+            if per_kg is None:
+                continue  # cannot be compared, and it is not a deal worth counting
+            key = (p.chain, "", p.item_name, per_kg)
         kept = seen.get(key)
         if kept is None:
             seen[key] = kept = p
@@ -1768,6 +1821,8 @@ def _finalize_report(report: SupermarketReport) -> None:
         report.promos_by_region[region] = sum(1 for p in seen.values() if region in p.regions)
 
     # One block per category, in the fixed category order, cheapest first.
+    # A category is shown only when it has at least one deal; inside it the
+    # deals and the regular-priced items are ranked together by price per kg.
     by_category: dict[str, list[MeatPromo]] = {}
     for p in seen.values():
         by_category.setdefault(p.category, []).append(p)
@@ -1779,20 +1834,25 @@ def _finalize_report(report: SupermarketReport) -> None:
         pool = by_category.get(label)
         if not pool:
             continue
+        deals = [p for p in pool if p.is_promo]
+        if not deals:
+            continue  # nothing on sale here: no deal for a regular price to beat
         if _is_catch_all(label):
-            report.unranked_by_category[label] = len(pool)
+            report.unranked_by_category[label] = len(deals)
             continue
+        unpriced = sum(1 for p in deals if p.price_per_kg is None)
+        if unpriced:
+            report.unpriced_by_category[label] = unpriced
         priced = [p for p in pool if p.price_per_kg is not None]
-        if len(priced) < len(pool):
-            report.unpriced_by_category[label] = len(pool) - len(priced)
-        if priced:
+        if any(p.is_promo for p in priced):
             report.promos_by_category[label] = len(priced)
             ranked.extend(sorted(priced, key=_price_rank_key)[:top_n])
     report.promos = ranked
 
 
 def _price_rank_key(p: MeatPromo) -> tuple:
-    """Cheapest promo price per kg first; ties: bigger discount, then by name."""
+    """Cheapest price per kg first; ties: a deal before a regular price, the
+    bigger discount first, then by name."""
     return (p.price_per_kg, -(p.savings_pct or Decimal("0")), p.chain, p.item_name)
 
 

@@ -172,7 +172,7 @@ def test_email_has_one_table_per_category_cheapest_first_with_branch(monkeypatch
     # one region only: no region chips
     assert email_sender._region_chip_html(SHARON) not in html
     assert "אנטריקוט" in html and "כנפיים" in html
-    assert "הזולים ביותר לפי מחיר המבצע לק״ג" in html
+    assert "המוצרים הזולים ביותר לפי מחיר לק״ג" in html
 
     text = "\n".join(email_sender._supermarkets_section_text(report))
     assert "▼ אנטריקוט" in text and "▼ כנפיים עוף" in text
@@ -215,7 +215,7 @@ def test_catch_all_groups_are_counted_but_not_shown():
     html = email_sender._supermarkets_section_html(report)
     assert html.count("<table") == 1 and "כנפית עוף טרי" not in html
     assert "2 מבצעים בקבוצות כלליות" in html
-    assert "<b>3</b> מבצעי בשר" in html
+    assert "<b>3</b> מוצרי בשר" in html
 
 
 def test_fresh_and_frozen_cuts_get_separate_tables():
@@ -243,3 +243,80 @@ def test_red_meat_tables_come_before_poultry():
     assert labels.index("לשון בקר" + sm._FROZEN_SUFFIX) == labels.index("לשון בקר") + 1
     # and a real report follows the same order
     assert labels.index("אנטריקוט") < labels.index("כנפיים עוף") < labels.index("חזה הודו")
+
+
+def _regular(chain, name, price, *, branch="סניף", city="הרצליה", store="001", weighted=True, unit_kg=None):
+    """An item at its regular price (not on sale)."""
+    return sm.MeatPromo(
+        chain=chain, store_id=store, item_code=name, item_name=name,
+        regular_price=Decimal(price), discounted_price=None, discount_rate=None,
+        promotion_description="", regions=[SHARON], city=city, cities=[city],
+        stores=[f"{branch} ({city})"], is_weighted=weighted, unit_kg=unit_kg,
+    )
+
+
+def test_cheaper_regular_price_outranks_a_deal():
+    promos = [
+        _promo("רמי לוי", "אנטריקוט בקר טרי", "129.90", was="159.90"),
+        _regular("יוחננוף", "אנטריקוט בקר טרי", "119.90"),
+        _regular("שופרסל", "אנטריקוט בקר טרי", "149.90"),
+    ]
+    report = _report(promos)
+    rows = _by_category(report)["אנטריקוט"]
+    assert [(p.chain, p.is_promo) for p in rows] == [
+        ("יוחננוף", False), ("רמי לוי", True), ("שופרסל", False),
+    ]
+    assert [str(p.price_per_kg) for p in rows] == ["119.90", "129.90", "149.90"]
+    assert report.promos_by_category["אנטריקוט"] == 3
+
+    html = email_sender._supermarkets_section_html(report)
+    table = html[html.index("<table"):]
+    first_row = table[table.index("יוחננוף"):table.index("רמי לוי")]
+    assert "₪119.90" in first_row and "מחיר רגיל" in first_row
+    assert "<s dir" not in first_row and "%" not in first_row  # no fake discount on a regular price
+    deal_row = table[table.index("רמי לוי"):table.index("שופרסל")]
+    assert "-19%" in deal_row and "מחיר רגיל" not in deal_row
+
+    text = "\n".join(email_sender._supermarkets_section_text(report))
+    assert "מחיר רגיל (לא במבצע)" in text
+
+
+def test_tie_between_a_deal_and_a_regular_price_lists_the_deal_first():
+    promos = [
+        _regular("יוחננוף", "אנטריקוט בקר טרי", "129.90"),
+        _promo("רמי לוי", "אנטריקוט בקר טרי", "129.90", was="159.90"),
+    ]
+    rows = _by_category(_report(promos))["אנטריקוט"]
+    assert [p.chain for p in rows] == ["רמי לוי", "יוחננוף"]
+
+
+def test_category_without_any_deal_gets_no_table():
+    promos = [
+        _promo("רמי לוי", "אנטריקוט בקר טרי", "129.90", was="159.90"),
+        _regular("יוחננוף", "כנפיים עוף טרי", "9.90"),   # cheap, but nothing on sale in this cut
+    ]
+    report = _report(promos)
+    assert list(_by_category(report)) == ["אנטריקוט"]
+    assert "כנפיים עוף" not in report.promos_by_category
+
+
+def test_same_regular_item_in_two_branches_of_a_chain_is_one_row():
+    promos = [
+        _promo("רמי לוי", "אנטריקוט בקר טרי", "129.90", was="159.90"),
+        _regular("שופרסל", "אנטריקוט בקר טרי", "139.90", branch="שלי הרצליה", store="051"),
+        _regular("שופרסל", "אנטריקוט בקר טרי", "139.90", branch="דיל רמת השרון", city="רמת השרון", store="057"),
+        _regular("שופרסל", "אנטריקוט בקר טרי", "145.00", branch="אקספרס", store="660"),
+    ]
+    rows = [p for p in _by_category(_report(promos))["אנטריקוט"] if p.chain == "שופרסל"]
+    assert [str(p.price_per_kg) for p in rows] == ["139.90", "145.00"]
+    assert rows[0].store_count == 2 and len(rows[0].stores) == 2
+
+
+def test_regular_item_without_a_price_per_kg_is_ignored():
+    promos = [
+        _promo("רמי לוי", "אנטריקוט בקר טרי", "129.90", was="159.90"),
+        _regular("יוחננוף", "אנטריקוט בקר ארוז", "39.90", weighted=False, unit_kg=None),
+    ]
+    report = _report(promos)
+    assert [p.chain for p in _by_category(report)["אנטריקוט"]] == ["רמי לוי"]
+    assert report.unpriced_by_category == {}  # only deals are counted as "left out"

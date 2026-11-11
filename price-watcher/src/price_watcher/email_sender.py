@@ -802,9 +802,34 @@ def _usd(value: object) -> str:
     return f'<span dir="ltr">${value}</span>'
 
 
+# Styles of the meat tables. They live in one <style> block in the email's
+# <head> (see build_daily_payload) instead of on every cell: with ~200 rows
+# the inline version pushed the email over Gmail's ~102 KB clipping limit.
+# Without the block (a client that strips <style>) the tables degrade to
+# plain black-on-white rows, still readable.
+_MEAT_CSS = (
+    f".mt{{border-collapse:collapse;width:100%;margin:0 0 16px;border:1px solid {_COLOR_BORDER};"
+    f"font-size:13px;color:{_COLOR_TEXT};font-family:{_FONT_STACK}}}"
+    f".mt td{{padding:6px;vertical-align:top;border-top:1px solid {_COLOR_BORDER}}}"
+    f".mt small{{color:{_COLOR_MUTED}}}"
+    f".mt td.h{{background:{_COLOR_TEXT};color:#fff;padding:8px 10px}}"
+    ".mt td.h b{font-size:15px}"
+    ".mt td.h small{color:#d1d5db}"
+    ".mt tr.f{background:#ecfdf5}"
+    f".mt b.c{{color:{_COLOR_LINK}}}"
+    ".mt b.p{font-size:15px}"
+    f".mt b.d{{color:{_COLOR_DANGER}}}"
+)
+
+
+def _meat_style_tag() -> str:
+    return f"<style>{_MEAT_CSS}</style>"
+
+
 def _price_compact_html(p) -> str:
-    """Promo price per kg in bold, then the regular price per kg struck
-    through with the discount, then the multi-buy deal / pack size."""
+    """Price per kg in bold; for a deal, the regular price per kg struck
+    through with the discount and the multi-buy deal; for an item that is not
+    on sale, a "regular price" note; then the pack size."""
     # Kept lean on purpose: this is repeated on every row of every table.
     # The table header says the prices are per kg.
     per_kg = getattr(p, "price_per_kg", None)
@@ -816,12 +841,15 @@ def _price_compact_html(p) -> str:
         unit = " לק״ג" if getattr(p, "is_weighted", False) else " ליח׳"
     lines = []
     if per_kg:
-        lines.append(f'<b dir="ltr" style="font-size:15px">₪{per_kg}</b>' + (f'<small>{unit}</small>' if unit else ''))
-    # "-30%" when known; a bare dash (not "-—") when it is not.
-    pct_txt = f"-{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
-    pct = f'<b dir="ltr" style="color:{_COLOR_DANGER}">{pct_txt}</b>'
-    was = f'<s dir="ltr">₪{was_kg}</s> ' if was_kg else ""
-    lines.append(f'<small>{was}{pct}</small>')
+        lines.append(f'<b class="p" dir="ltr">₪{per_kg}</b>' + (f'<small>{unit}</small>' if unit else ''))
+    if getattr(p, "is_promo", True):
+        # "-30%" when known; a bare dash (not "-—") when it is not.
+        pct_txt = f"-{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
+        pct = f'<b class="d" dir="ltr">{pct_txt}</b>'
+        was = f'<s dir="ltr">₪{was_kg}</s> ' if was_kg else ""
+        lines.append(f'<small>{was}{pct}</small>')
+    else:
+        lines.append('<small>מחיר רגיל</small>')
     # One short line each, so the (unwrapped) price column stays narrow on phones.
     if getattr(p, "deal_text", ""):
         # "2 ב-₪90" with the amount isolated, or the bidi order scrambles it.
@@ -870,8 +898,10 @@ def _ranking_note(sm) -> str:
     """One sentence explaining how the tables are ranked (both text and HTML)."""
     from price_watcher.supermarkets import _top_per_category
     note = (
-        f"בכל קטגוריה {_top_per_category()} המבצעים הזולים ביותר לפי מחיר המבצע לק״ג, "
-        "מהזול ליקר (במוצרים ארוזים המחיר מחושב לפי משקל המארז)."
+        f"בכל קטגוריה {_top_per_category()} המוצרים הזולים ביותר לפי מחיר לק״ג, מהזול ליקר: "
+        "מחיר המבצע, או המחיר הרגיל כשמוצר שאינו במבצע זול יותר "
+        "(במוצרים ארוזים המחיר מחושב לפי משקל המארז). "
+        "מוצגות קטגוריות שיש בהן לפחות מבצע אחד."
     )
     unpriced = sum((getattr(sm, "unpriced_by_category", None) or {}).values())
     if unpriced:
@@ -924,7 +954,7 @@ def _supermarkets_section_text(sm) -> list[str]:
         total = promos_by_category.get(category, len(items))
         shown = f"{len(items)} מתוך {total}" if total > len(items) else f"{len(items)}"
         lines.append("")
-        lines.append(f"  ▼ {category}  ({shown} מבצעים)")
+        lines.append(f"  ▼ {category}  ({shown} מוצרים)")
         for i, p in enumerate(items, 1):
             per_kg = getattr(p, "price_per_kg", None)
             was_kg = getattr(p, "regular_per_kg", None)
@@ -940,9 +970,12 @@ def _supermarkets_section_text(sm) -> list[str]:
                 x for x in (getattr(p, "deal_text", ""), getattr(p, "pack_text", "")) if x
             )
             lines.append(f"    {i}. {now} · {p.chain} · {p.item_name[:50]}")
-            lines.append(
-                f"       מחיר רגיל {was} · הנחה {pct}" + (f" · {extra}" if extra else "")
-            )
+            if getattr(p, "is_promo", True):
+                lines.append(
+                    f"       מחיר רגיל {was} · הנחה {pct}" + (f" · {extra}" if extra else "")
+                )
+            else:
+                lines.append("       מחיר רגיל (לא במבצע)" + (f" · {extra}" if extra else ""))
             if p.promotion_description:
                 lines.append(f"       {p.promotion_description[:90]}")
             where = _where_label(p, limit=6)
@@ -1009,7 +1042,7 @@ def _supermarkets_section_html(sm) -> str:
         f'<div style="font-size:15px;margin-top:4px">'
         f'<b>{len(chains_scanned)}</b> רשתות · '
         f'<b>{len(stores_scanned)}</b> סניפים · '
-        f'<b>{total_deals}</b> מבצעי בשר · '
+        f'<b>{total_deals}</b> מוצרי בשר · '
         f'<b>{len(grouped)}</b> קטגוריות</div>'
         f'<div style="font-size:12px;margin-top:6px">{scope_html}</div>'
         f'<div style="font-size:12px;{muted};margin-top:4px">'
@@ -1039,7 +1072,6 @@ def _supermarkets_section_html(sm) -> str:
     # One table per category, cheapest first. Kept lean on purpose (Gmail
     # clips mails above ~102 KB): no per-row badges or zebra shading, the
     # muted colour and the cell alignment are the only styles repeated.
-    muted_small = f'<small style="{muted}">'
     for category, items in grouped.items():
         rows_html = []
         for i, p in enumerate(items):
@@ -1048,17 +1080,17 @@ def _supermarkets_section_html(sm) -> str:
             below = "<br>".join(x for x in (chips, escape(where)) if x)
             desc = (p.promotion_description or "").strip()
             rows_html.append(
-                f'<tr valign="top" style="border-top:1px solid {_COLOR_BORDER}'
-                + (';background:#ecfdf5">' if i == 0 else '">')
+                # The cheapest row is highlighted (class f).
+                ('<tr class="f">' if i == 0 else '<tr>')
                 # Supermarket, then its branch(es) with the city. One column,
                 # so the table still fits a phone screen.
                 + ('<td width="34%">' if i == 0 else '<td>')
-                + f'<b style="color:{_COLOR_LINK}">{escape(p.chain)}</b>'
-                + (f'<br>{muted_small}{below}</small>' if below else '')
+                + f'<b class="c">{escape(p.chain)}</b>'
+                + (f'<br><small>{below}</small>' if below else '')
                 + '</td>'
                 # Item
                 f'<td>{escape(p.item_name[:60])}'
-                + (f'<br>{muted_small}{escape(desc[:60])}</small>' if desc and desc != p.item_name else '')
+                + (f'<br><small>{escape(desc[:60])}</small>' if desc and desc != p.item_name else '')
                 + '</td>'
                 # Price per kg (now / was), discount, deal
                 f'<td align="left" nowrap>{_price_compact_html(p)}</td>'
@@ -1069,21 +1101,21 @@ def _supermarkets_section_html(sm) -> str:
         if total > len(items):
             shown_txt = f'{len(items)} הזולים מתוך {total}'
         elif len(items) == 1:
-            shown_txt = 'מבצע אחד'
+            shown_txt = 'מוצר אחד'
         else:
-            shown_txt = f'{len(items)} מבצעים'
+            shown_txt = f'{len(items)} מוצרים'
         chains_in_table = len({p.chain for p in items})
         chains_txt = 'רשת אחת' if chains_in_table == 1 else f'{chains_in_table} רשתות'
         unpriced = unpriced_by_category.get(category, 0)
         unpriced_txt = f' · עוד {unpriced} בלי מחיר לק״ג' if unpriced else ''
         html.append(
-            f'<table dir="rtl" cellpadding="6" cellspacing="0" width="100%" style="border-collapse:collapse;'
-            f'margin:0 0 16px;border:1px solid {_COLOR_BORDER};font-size:13px;color:{_COLOR_TEXT};'
-            f'font-family:{_FONT_STACK}">'
+            # cellpadding / width repeat what the stylesheet says, for clients
+            # that drop <style>.
+            '<table class="mt" dir="rtl" cellpadding="6" cellspacing="0" width="100%">'
             # Header strip: category, counts, and the unit of the price column
-            f'<tr><td colspan="3" style="background:{_COLOR_TEXT};color:#fff;padding:8px 10px">'
-            f'<b style="font-size:15px">{_category_icon(category)} {escape(category)}</b> '
-            f'<small style="color:#d1d5db">{shown_txt} · {chains_txt}{unpriced_txt} · מחיר לק״ג</small>'
+            '<tr><td class="h" colspan="3">'
+            f'<b>{_category_icon(category)} {escape(category)}</b> '
+            f'<small>{shown_txt} · {chains_txt}{unpriced_txt} · מחיר לק״ג</small>'
             '</td></tr>'
             + "".join(rows_html)
             + '</table>'
@@ -1424,6 +1456,7 @@ def build_daily_payload(report) -> EmailPayload | None:
     html_parts = [
         '<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        _meat_style_tag(),
         '</head>',
         f'<body dir="rtl" style="margin:0;padding:0;background:#f3f4f6;font-family:{_F};color:{_COLOR_TEXT}">',
         f'<table role="presentation" dir="rtl" style="width:100%;background:#f3f4f6;border-collapse:collapse">',

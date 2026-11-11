@@ -119,7 +119,7 @@ def test_scan_and_report_lists_failed_and_empty_chains(monkeypatch):
         "קשת טעמים": "שגיאה: RuntimeError",
     }
     assert report.chains_empty["סאלח דבאח"] == "אין סניפים באזורים שנבחרו"
-    assert report.chains_empty["רמי לוי"] == "לא נמצאו מבצעי בשר"
+    assert report.chains_empty["רמי לוי"] == "לא נמצאו מוצרי בשר"
     # Bareket is scanned too, and a chain without a store in the cities is listed, not dropped
     assert report.chains_empty["סופר ברקת"] == "אין סניפים בערים שנבחרו"
     assert "חצי חינם" not in report.chains_failed  # removed: lists no files on that host
