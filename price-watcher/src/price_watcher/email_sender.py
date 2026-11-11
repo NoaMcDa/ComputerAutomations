@@ -503,7 +503,6 @@ def _group_meat_by_category(sm):
     for p in sm.promos:
         cat = _categorize(p)
         groups.setdefault(cat, []).append(p)
-    # Order: follow _CATEGORIES declaration order, then any extras at the end.
     ordered = {}
     for cat_name, _ in _CATEGORIES:
         if cat_name in groups:
@@ -511,6 +510,53 @@ def _group_meat_by_category(sm):
     for cat_name, items in groups.items():
         ordered[cat_name] = items
     return ordered
+
+
+# ---- Design tokens for email HTML ----
+_COLOR_TEXT = "#111827"
+_COLOR_MUTED = "#6b7280"
+_COLOR_BORDER = "#e5e7eb"
+_COLOR_BG_SOFT = "#f9fafb"
+_COLOR_ACCENT = "#059669"       # success green (best deal)
+_COLOR_DANGER = "#dc2626"       # discount red
+_COLOR_LINK = "#2563eb"
+_FONT_STACK = ("-apple-system,BlinkMacSystemFont,'Segoe UI',"
+               "Roboto,Oxygen,Ubuntu,Helvetica,sans-serif")
+
+_CATEGORY_ICON = {
+    "Entrecote": "🥩", "Steak": "🥩", "Picanha": "🥩", "Sirloin": "🥩",
+    "T-bone": "🥩", "Chuck": "🥩", "Flank": "🥩", "Asado": "🥩",
+    "Brisket": "🥩", "Osso buco": "🥩", "Goulash": "🥩", "Shoulder": "🥩",
+    "Shank": "🥩", "Ribs": "🥩", "Fillet": "🥩", "Filet": "🥩",
+    "Ground beef": "🥩", "Beef roast": "🥩", "Beef liver": "🥩",
+    "Beef tongue": "👅", "Brain": "🧠", "Neck": "🥩",
+    "Giblets": "🫀", "Baby beef": "🐄", "Veal": "🐄", "Lamb": "🐑",
+    "Chicken breast": "🍗", "Chicken wings": "🍗", "Chicken thighs": "🍗",
+    "Chicken drumsticks": "🍗", "Chicken liver": "🍗", "Drumsticks": "🍗",
+    "Cornish hen": "🍗", "Turkey": "🦃",
+    "Chicken": "🍗", "Beef": "🥩", "Other": "•",
+}
+
+
+def _category_icon(cat_name: str) -> str:
+    for key, icon in _CATEGORY_ICON.items():
+        if key in cat_name:
+            return icon
+    return "•"
+
+
+def _price_cell_html(p) -> str:
+    """Render the before/after price cell: strike-through old, bold new."""
+    if p.regular_price and p.discounted_price:
+        return (
+            f'<span style="color:{_COLOR_MUTED};text-decoration:line-through">₪{p.regular_price}</span>'
+            f'<br><b style="color:{_COLOR_TEXT}">₪{p.discounted_price}</b>'
+        )
+    if p.discounted_price:
+        return f'<b>₪{p.discounted_price}</b>'
+    if p.regular_price:
+        return f'<span style="color:{_COLOR_MUTED}">₪{p.regular_price}</span>'
+    return "—"
 
 
 def _supermarkets_section_text(sm) -> list[str]:
@@ -543,52 +589,134 @@ def _supermarkets_section_text(sm) -> list[str]:
 
 
 def _supermarkets_section_html(sm) -> str:
+    """Redesigned meat section: one card per category, proper table with
+    header row, best-deal highlighting, side-by-side chain comparison."""
     if sm is None:
         return '<div style="color:#888;font-style:italic">(not scanned)</div>'
     if sm.status != "ok":
         return (
-            '<div style="padding:12px;border:1px solid #fecaca;border-radius:8px;'
-            'background:#fef2f2;color:#991b1b">'
+            f'<div style="padding:14px 16px;border:1px solid #fecaca;'
+            f'border-radius:10px;background:#fef2f2;color:#991b1b;'
+            f'font-family:{_FONT_STACK}">'
             f'<b>Supermarket scan failed:</b> {escape(sm.status)}'
             + (f' — {escape(sm.error)}' if sm.error else '')
             + '</div>'
         )
-    chains = ", ".join(sm.chains_scanned) if sm.chains_scanned else "none"
-    html = [
-        f'<div style="color:#6b7280;font-size:13px;margin-bottom:10px">'
-        f'Chains scanned: {escape(chains)}  '
-        f'<span style="color:#9ca3af">· {len(sm.promos)} total promos</span></div>'
-    ]
+
+    # Summary card
+    chains_scanned = sm.chains_scanned or []
+    total = len(sm.promos)
+    grouped = _group_meat_by_category(sm)
+    categories_hit = len(grouped)
+
+    html = []
+    html.append(
+        f'<div style="padding:14px 16px;background:{_COLOR_BG_SOFT};'
+        f'border:1px solid {_COLOR_BORDER};border-radius:10px;margin-bottom:18px;'
+        f'font-family:{_FONT_STACK};color:{_COLOR_TEXT}">'
+        f'<div style="font-size:13px;color:{_COLOR_MUTED}">Today\'s scan</div>'
+        f'<div style="font-size:15px;margin-top:4px">'
+        f'<b>{len(chains_scanned)}</b> chains · '
+        f'<b>{total}</b> meat promos · '
+        f'<b>{categories_hit}</b> categories</div>'
+        f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
+        + " · ".join(escape(c) for c in chains_scanned)
+        + '</div></div>'
+    )
+
     if not sm.promos:
-        html.append('<div style="color:#888;font-style:italic">No meat promos found today.</div>')
+        html.append(
+            '<div style="color:#888;font-style:italic;'
+            f'font-family:{_FONT_STACK}">No meat promos found today.</div>'
+        )
         return "".join(html)
 
-    grouped = _group_meat_by_category(sm)
+    # One card per category
     for category, items in grouped.items():
-        items_sorted = sorted(items, key=lambda p: -(float(p.savings_pct) if p.savings_pct is not None else 0))
-        rows = []
-        for p in items_sorted:
-            pct = f"{p.savings_pct}%" if p.savings_pct is not None else "—"
-            was = f"₪{p.regular_price}" if p.regular_price else "—"
-            now = f"₪{p.discounted_price}" if p.discounted_price else "—"
-            rows.append(
-                f'<tr style="border-bottom:1px solid #f3f4f6">'
-                f'<td style="padding:4px 8px;font-size:11px;color:#1e40af;white-space:nowrap">'
-                f'<b>{escape(p.chain)}</b></td>'
-                f'<td style="padding:4px 8px">{escape(p.item_name[:55])}</td>'
-                f'<td style="padding:4px 8px;color:#dc2626;font-weight:600;white-space:nowrap">-{pct}</td>'
-                f'<td style="padding:4px 8px;font-size:12px;white-space:nowrap">'
-                f'<s style="color:#999">{was}</s> → <b>{now}</b></td>'
-                f'<td style="padding:4px 8px;font-size:11px;color:#6b7280">'
-                f'{escape(p.promotion_description[:55])}</td>'
+        items_sorted = sorted(
+            items,
+            key=lambda p: -(float(p.savings_pct) if p.savings_pct is not None else 0),
+        )
+        icon = _category_icon(category)
+        best_pct = max(
+            (float(p.savings_pct) if p.savings_pct is not None else 0 for p in items_sorted),
+            default=0,
+        )
+
+        # Build rows
+        rows_html = []
+        for i, p in enumerate(items_sorted):
+            is_best = (
+                p.savings_pct is not None
+                and float(p.savings_pct) == best_pct
+                and best_pct > 0
+                and i == 0
+            )
+            row_bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else _COLOR_BG_SOFT)
+            pct_txt = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
+            best_badge = (
+                f'<span style="display:inline-block;background:{_COLOR_ACCENT};'
+                f'color:#fff;font-size:10px;font-weight:700;padding:2px 6px;'
+                f'border-radius:4px;margin-right:6px;letter-spacing:0.5px">BEST</span>'
+                if is_best else ""
+            )
+            rows_html.append(
+                f'<tr style="background:{row_bg}">'
+                # Chain column
+                f'<td style="padding:8px 10px;font-size:12px;color:{_COLOR_LINK};'
+                f'font-weight:600;white-space:nowrap;border-top:1px solid {_COLOR_BORDER};'
+                f'vertical-align:top">{best_badge}{escape(p.chain)}</td>'
+                # Item name
+                f'<td style="padding:8px 10px;font-size:13px;color:{_COLOR_TEXT};'
+                f'border-top:1px solid {_COLOR_BORDER};vertical-align:top">'
+                f'{escape(p.item_name[:60])}'
+                + (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
+                   f'{escape(p.promotion_description[:70])}</div>'
+                   if p.promotion_description else '')
+                + '</td>'
+                # Price (was / now)
+                f'<td style="padding:8px 10px;font-size:12px;text-align:right;'
+                f'white-space:nowrap;border-top:1px solid {_COLOR_BORDER};'
+                f'vertical-align:top">{_price_cell_html(p)}</td>'
+                # Discount %
+                f'<td style="padding:8px 10px;font-size:14px;font-weight:700;'
+                f'color:{_COLOR_DANGER};text-align:right;white-space:nowrap;'
+                f'border-top:1px solid {_COLOR_BORDER};vertical-align:top">'
+                f'-{pct_txt}</td>'
                 f'</tr>'
             )
+
+        # Category card
         html.append(
-            f'<div style="margin:0 0 18px"><div style="font-size:15px;font-weight:600;'
-            f'margin:8px 0 4px;color:#111;background:#f9fafb;padding:6px 10px;'
-            f'border-left:3px solid #10b981">{escape(category)}  '
-            f'<span style="color:#6b7280;font-weight:400;font-size:12px">· {len(items)} promo{"s" if len(items) != 1 else ""}</span></div>'
-            f'<table style="border-collapse:collapse;width:100%;font-size:12px">{"".join(rows)}</table></div>'
+            f'<div style="margin:0 0 20px;background:#ffffff;border:1px solid {_COLOR_BORDER};'
+            f'border-radius:10px;overflow:hidden;font-family:{_FONT_STACK}">'
+            # Header strip
+            f'<div style="padding:10px 14px;background:{_COLOR_BG_SOFT};'
+            f'border-bottom:1px solid {_COLOR_BORDER}">'
+            f'<div style="font-size:15px;font-weight:700;color:{_COLOR_TEXT}">'
+            f'{icon} {escape(category)}</div>'
+            f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
+            f'{len(items)} promo{"s" if len(items) != 1 else ""} across chains'
+            f'</div></div>'
+            # Table header + body
+            '<table style="border-collapse:collapse;width:100%">'
+            '<thead><tr>'
+            f'<th style="padding:6px 10px;text-align:left;font-size:11px;'
+            f'font-weight:600;color:{_COLOR_MUTED};text-transform:uppercase;'
+            f'letter-spacing:0.5px">Chain</th>'
+            f'<th style="padding:6px 10px;text-align:left;font-size:11px;'
+            f'font-weight:600;color:{_COLOR_MUTED};text-transform:uppercase;'
+            f'letter-spacing:0.5px">Item</th>'
+            f'<th style="padding:6px 10px;text-align:right;font-size:11px;'
+            f'font-weight:600;color:{_COLOR_MUTED};text-transform:uppercase;'
+            f'letter-spacing:0.5px">Price</th>'
+            f'<th style="padding:6px 10px;text-align:right;font-size:11px;'
+            f'font-weight:600;color:{_COLOR_MUTED};text-transform:uppercase;'
+            f'letter-spacing:0.5px">Off</th>'
+            '</tr></thead>'
+            '<tbody>' + "".join(rows_html) + '</tbody>'
+            '</table>'
+            '</div>'
         )
     return "".join(html)
 
@@ -845,14 +973,25 @@ def build_daily_payload(report) -> EmailPayload | None:
     text_body = "\n".join(text_lines)
 
     # ---- HTML ----
+    _F = _FONT_STACK
     html_parts = [
-        '<!DOCTYPE html><html><head><meta charset="utf-8"></head>',
-        '<body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
-        'padding:16px;max-width:680px;line-height:1.5;color:#111">',
-        '<h2 style="margin:0 0 6px">Daily digest</h2>',
-        '<div style="color:#6b7280;font-size:13px;margin-bottom:24px">Sales + creatine</div>',
-
-        '<h3 style="margin:0 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Sales — site-wide promos</h3>',
+        '<!DOCTYPE html><html><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        '</head>',
+        f'<body style="margin:0;padding:0;background:#f3f4f6;font-family:{_F};color:{_COLOR_TEXT}">',
+        f'<table role="presentation" style="width:100%;background:#f3f4f6;border-collapse:collapse">',
+        f'<tr><td style="padding:24px 12px">',
+        f'<table role="presentation" style="max-width:720px;margin:0 auto;width:100%;'
+        f'background:#ffffff;border-radius:14px;border:1px solid {_COLOR_BORDER};'
+        f'border-collapse:separate;overflow:hidden">',
+        f'<tr><td style="padding:24px 24px 8px">',
+        f'<div style="font-size:22px;font-weight:700;color:{_COLOR_TEXT};'
+        f'margin-bottom:4px">Daily digest</div>',
+        f'<div style="font-size:13px;color:{_COLOR_MUTED}">Sales · creatine · Sims 4 · supermarket meat</div>',
+        f'</td></tr>',
+        f'<tr><td style="padding:16px 24px">',
+        f'<h3 style="margin:0 0 12px;font-size:16px;color:{_COLOR_TEXT};'
+        f'padding:6px 0 4px;border-bottom:2px solid {_COLOR_TEXT}">Sales — site-wide promos</h3>',
     ]
     for d in site_digests:
         html_parts.append(
@@ -894,29 +1033,35 @@ def build_daily_payload(report) -> EmailPayload | None:
         html_parts.append('</div>')
 
     html_parts.append(
-        '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Creatine</h3>'
+        f'<h3 style="margin:28px 0 12px;font-size:16px;color:{_COLOR_TEXT};'
+        f'padding:6px 0 4px;border-bottom:2px solid {_COLOR_TEXT}">Creatine</h3>'
     )
     html_parts.append(_creatine_section_html(report.creatine))
 
     html_parts.append(
-        '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">The Sims 4</h3>'
+        f'<h3 style="margin:28px 0 12px;font-size:16px;color:{_COLOR_TEXT};'
+        f'padding:6px 0 4px;border-bottom:2px solid {_COLOR_TEXT}">The Sims 4</h3>'
     )
     html_parts.append(_sims4_section_html(getattr(report, "sims4", None)))
 
     html_parts.append(
-        '<h3 style="margin:24px 0 12px;color:#111;border-bottom:2px solid #111;padding-bottom:4px">Supermarket meat discounts</h3>'
+        f'<h3 style="margin:28px 0 12px;font-size:16px;color:{_COLOR_TEXT};'
+        f'padding:6px 0 4px;border-bottom:2px solid {_COLOR_TEXT}">Supermarket meat discounts</h3>'
     )
     html_parts.append(_supermarkets_section_html(getattr(report, "supermarkets", None)))
 
-    # Also append sims4 + supermarkets text lines
+    # Append sims4 + supermarkets text lines
     text_body_addendum = "\n".join(_sims4_section_text(getattr(report, "sims4", None)))
     text_body = text_body + "\n" + text_body_addendum + "\n" + "\n".join(
         _supermarkets_section_text(getattr(report, "supermarkets", None))
     )
 
     html_parts.append(
-        '<p style="color:#999;font-size:12px;margin-top:24px">— Price Watcher</p>'
-        '</body></html>'
+        f'</td></tr>'
+        f'<tr><td style="padding:16px 24px 24px;border-top:1px solid {_COLOR_BORDER};'
+        f'background:{_COLOR_BG_SOFT};color:{_COLOR_MUTED};font-size:11px;'
+        f'text-align:center">— Price Watcher · daily report</td></tr>'
+        f'</table></td></tr></table></body></html>'
     )
     html_body = "".join(html_parts)
 
