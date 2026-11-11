@@ -11,6 +11,10 @@ Extraction ladder (stops at first price found):
   4. Microdata              (via extruct)
   5. CSS selector           (if `selector` arg provided)
   6. Playwright fallback    (reruns 2-5 on rendered HTML)
+
+Blocked responses (403 / 429 / challenge page) skip the ladder: the Shopify
+JSON (step 1) and then the Playwright fallback are tried, and the result is
+used only if it is a definite answer; otherwise the status is BLOCKED.
 """
 
 from __future__ import annotations
@@ -54,6 +58,24 @@ _DEFAULT_HEADERS = {
 
 _RETRY_DELAYS = (1, 2, 4)  # seconds
 
+# HTTP 429 handling: at most one retry per URL, and only when the server asks
+# for a Retry-After of at most this many seconds. A host that is still
+# rate-limiting after that is remembered for _RATE_LIMIT_MEMORY_SEC and later
+# URLs on it get no 429 retry at all, so one host cannot stall a whole run.
+_MAX_429_WAIT_SEC = 15.0
+_RATE_LIMIT_MEMORY_SEC = 15 * 60
+_rate_limited_hosts: dict[str, float] = {}  # host -> time.monotonic() expiry
+
+
+def _host_is_rate_limited(host: str) -> bool:
+    expiry = _rate_limited_hosts.get(host)
+    if expiry is None:
+        return False
+    if time.monotonic() >= expiry:
+        _rate_limited_hosts.pop(host, None)
+        return False
+    return True
+
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     """Parse a Retry-After header. Returns seconds (float) or None if unparseable.
@@ -91,6 +113,23 @@ def fetch(
 
     Never raises; always returns a FetchResult.
     """
+    try:
+        return _fetch(url, selector, use_browser_fallback=use_browser_fallback)
+    except Exception as exc:  # last-resort guard: one bad URL must not kill a run
+        log.exception("Unexpected error while fetching %s", url)
+        return FetchResult(
+            status=FetchStatus.UNREACHABLE,
+            final_url=url,
+            error_message=f"Unexpected error: {type(exc).__name__}: {exc}",
+        )
+
+
+def _fetch(
+    url: str,
+    selector: Optional[str],
+    *,
+    use_browser_fallback: bool,
+) -> FetchResult:
     # --- HTTP fetch with retries ---
     response, error_msg, http_status, final_url = _http_get(url)
 
@@ -114,12 +153,25 @@ def fetch(
 
     # Check for block / captcha
     if http_status in (403, 429) or (http_status == 200 and _is_challenge_page(html)):
-        return FetchResult(
+        blocked = FetchResult(
             status=FetchStatus.BLOCKED,
             final_url=final_url,
             http_status=http_status,
             error_message=f"Blocked (HTTP {http_status})",
         )
+        # The Shopify product JSON is a different endpoint and is sometimes
+        # served when the HTML page is not.
+        shopify = _try_shopify(url, final_url, None, None, None)
+        if shopify is not None:
+            return shopify
+        # A real browser often gets past bot checks; only accept it if it
+        # actually yields a price, otherwise report the original block.
+        if use_browser_fallback:
+            log.info("Blocked (HTTP %s); trying Playwright fallback for %s", http_status, url)
+            rendered = _playwright_fallback(url, selector, http_status, None, blocked)
+            if rendered.status == FetchStatus.OK:
+                return rendered
+        return blocked
 
     # Save raw HTML for debugging
     raw_path = _save_raw(url, html)
@@ -157,6 +209,11 @@ def _http_get(
     """
     last_error: Optional[str] = None
     final_url = url
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        host = ""
+    retried_429 = False
 
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
@@ -173,19 +230,38 @@ def _http_get(
             if status >= 500:
                 last_error = f"HTTP {status}"
                 log.warning("HTTP %s on attempt %d for %s", status, attempt + 1, url)
-            elif status == 429 and attempt < len(_RETRY_DELAYS):
+            elif status == 429:
                 retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                if retry_after is not None and retry_after <= 60:
+                if (
+                    not retried_429
+                    and attempt < len(_RETRY_DELAYS)
+                    and not _host_is_rate_limited(host)
+                    and retry_after is not None
+                    and retry_after <= _MAX_429_WAIT_SEC
+                ):
                     log.warning("HTTP 429 on %s; honouring Retry-After=%ss", url, retry_after)
+                    retried_429 = True
                     time.sleep(retry_after)
                     continue
+                if host:
+                    _rate_limited_hosts[host] = time.monotonic() + _RATE_LIMIT_MEMORY_SEC
                 return response, None, status, final_url
             else:
                 return response, None, status, final_url
 
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError) as exc:
-            last_error = str(exc)
+        except httpx.UnsupportedProtocol as exc:  # a TransportError, but permanent
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.warning("HTTP error for %s: %s", url, last_error)
+            return None, last_error, None, final_url
+        except httpx.TransportError as exc:  # timeouts, connection/network/protocol errors
+            last_error = str(exc) or type(exc).__name__
             log.warning("Network error on attempt %d for %s: %s", attempt + 1, url, exc)
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            # Not transient (too many redirects, undecodable body, bad URL...):
+            # retrying would not help.
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.warning("HTTP error for %s: %s", url, last_error)
+            return None, last_error, None, final_url
 
         # Sleep before next retry (delay is None on the last sentinel iteration)
         if delay is not None:
@@ -335,6 +411,37 @@ def _extract_from_html(
 # Step 1: Shopify
 # ---------------------------------------------------------------------------
 
+_LOCALE_SEGMENT = re.compile(r"^[a-z]{2}(?:-[a-z]{2,4})?$", re.IGNORECASE)
+
+
+def _shopify_js_url(url: str) -> Optional[str]:
+    """Return the Shopify product-JSON URL for a product page URL, else None.
+
+    Recognises ``/products/<handle>``, ``/collections/<c>/products/<handle>``
+    and an optional leading locale segment (``/en-us/products/<handle>``);
+    the locale prefix is kept so the JSON uses the same market/currency.
+    """
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if "products" not in parts:
+        return None
+    idx = parts.index("products")
+    if idx + 1 >= len(parts):
+        return None
+    handle = parts[idx + 1]
+    prefix = parts[:idx]
+    locale: list[str] = []
+    if prefix and _LOCALE_SEGMENT.match(prefix[0]):
+        locale, prefix = prefix[:1], prefix[1:]
+    # Only bare, collection-scoped or locale-prefixed product paths qualify.
+    if prefix and not (len(prefix) == 2 and prefix[0] == "collections"):
+        return None
+    if handle.endswith((".js", ".json")) or not parsed.netloc:
+        return None
+    base = "/".join([*locale, "products", handle])
+    return f"{parsed.scheme}://{parsed.netloc}/{base}.js"
+
+
 def _try_shopify(
     url: str,
     final_url: str,
@@ -342,14 +449,10 @@ def _try_shopify(
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> Optional[FetchResult]:
-    parsed = urlparse(url)
-    path_parts = parsed.path.strip("/").split("/")
-    if len(path_parts) < 2 or path_parts[0] != "products":
+    js_url = _shopify_js_url(url)
+    if js_url is None:
         return None
-
-    handle = path_parts[1]
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    js_url = f"{origin}/products/{handle}.js"
+    parsed = urlparse(url)
 
     # Check for variant in query string
     qs = parse_qs(parsed.query)
@@ -376,20 +479,31 @@ def _try_shopify(
     except Exception:
         return None
 
-    variants = data.get("variants", [])
+    if not isinstance(data, dict):
+        return None
+    variants = [v for v in (data.get("variants") or []) if isinstance(v, dict)]
     if not variants:
         return None
 
-    variant = None
-    if variant_id:
-        for v in variants:
-            if str(v.get("id")) == str(variant_id):
-                variant = v
-                break
+    if http_status is None:  # called without a usable HTML response
+        http_status = resp.status_code
 
-    if variant is None:
-        # Pick first available, or first overall
-        variant = next((v for v in variants if v.get("available")), variants[0])
+    if variant_id:
+        variant = next((v for v in variants if str(v.get("id")) == str(variant_id)), None)
+        if variant is None:
+            # Never silently track a different variant than the one in the URL.
+            return FetchResult(
+                status=FetchStatus.NOT_FOUND,
+                final_url=final_url,
+                title=data.get("title") or title,
+                http_status=http_status,
+                error_message=f"Shopify variant {variant_id} not found in product",
+                raw_html_path=raw_path,
+            )
+    else:
+        # No pinned variant: always the first (default) variant, with its own
+        # availability, so the tracked item never changes between runs.
+        variant = variants[0]
 
     price_cents = variant.get("price")
     if price_cents is None:
@@ -435,79 +549,144 @@ def _try_jsonld(
         log.debug("extruct json-ld failed for %s: %s", url, exc)
         return None
 
-    items = data.get("json-ld", [])
+    items = data.get("json-ld", []) if isinstance(data, dict) else []
     if not items:
         return None
 
-    # Flatten @graph entries
-    flat: list[dict] = []
-    for item in items:
-        if item.get("@type") == "Graph" or "@graph" in item:
-            flat.extend(item.get("@graph", []))
-        else:
-            flat.append(item)
-
-    # Find Product
-    product: Optional[dict] = None
-    for item in flat:
-        t = item.get("@type", "")
-        if t == "Product" or (isinstance(t, list) and "Product" in t):
-            product = item
-            break
-
-    if product is None:
+    candidates = _jsonld_candidates(items)
+    if not candidates:
         return None
 
-    offers_raw = product.get("offers")
-    if offers_raw is None:
-        return None
+    # Prefer the offer for the variant named in the watched URL; otherwise
+    # the lowest price across all offers (previous behaviour).
+    wanted = _jsonld_wanted_ids(url)
+    matching = [c for c in candidates if wanted and _jsonld_matches(c, wanted)]
+    pool = matching or candidates
+    best = min(pool, key=lambda c: c[0])  # min() keeps the first of equal prices
+    price, currency, availability, product, group = best
 
-    # Normalise offers to a list
-    if isinstance(offers_raw, dict):
-        offers = [offers_raw]
-    elif isinstance(offers_raw, list):
-        offers = offers_raw
-    else:
-        return None
-
-    # Pick lowest price among valid offers
-    best_price: Optional[Decimal] = None
-    best_currency: Optional[str] = None
     in_stock: Optional[bool] = None
+    if "OutOfStock" in availability or "SoldOut" in availability:
+        in_stock = False
+    elif "InStock" in availability:
+        in_stock = True
 
-    for offer in offers:
-        raw_price = offer.get("price")
-        if raw_price is None:
-            continue
-        try:
-            p, _ = _parse_price(str(raw_price))
-        except Exception:
-            continue
-
-        if best_price is None or p < best_price:
-            best_price = p
-            best_currency = offer.get("priceCurrency")
-            availability = offer.get("availability", "")
-            if "OutOfStock" in availability:
-                in_stock = False
-            elif "InStock" in availability:
-                in_stock = True
-
-    if best_price is None:
-        return None
-
-    prod_title = product.get("name") or title
+    # A specific variant keeps its own name; otherwise name the product group.
+    name = product.get("name") if (matching or group is None) else group.get("name")
+    prod_title = (name if isinstance(name, str) and name else None) or title
 
     return FetchResult(
         status=FetchStatus.OK,
         final_url=final_url,
         title=prod_title,
-        price=best_price,
-        currency=best_currency,
+        price=price,
+        currency=currency,
         in_stock=in_stock,
         http_status=http_status,
         raw_html_path=raw_path,
     )
+
+
+def _jsonld_has_type(node: dict, *names: str) -> bool:
+    t = node.get("@type")
+    types = t if isinstance(t, list) else [t]
+    return any(isinstance(x, str) and x.split("/")[-1] in names for x in types)
+
+
+def _as_list(value: object) -> list:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+# (price, currency, availability, product node, product-group node or None)
+_JsonLdCandidate = tuple[Decimal, Optional[str], str, dict, Optional[dict]]
+
+
+def _jsonld_candidates(items: list) -> list[_JsonLdCandidate]:
+    """Collect every priced offer of every Product / ProductGroup variant.
+
+    Walks nested ``@graph`` lists and ``ProductGroup.hasVariant``; accepts
+    ``Offer.price`` and ``AggregateOffer.lowPrice`` (and offers nested inside
+    an AggregateOffer). Anything that is not a dict is skipped.
+    """
+    products: list[tuple[dict, Optional[dict]]] = []
+
+    def _walk(node: object, group: Optional[dict], depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(node, list):
+            for child in node:
+                _walk(child, group, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        if "@graph" in node:
+            _walk(node.get("@graph"), group, depth + 1)
+        if _jsonld_has_type(node, "ProductGroup"):
+            products.append((node, None))
+            _walk(node.get("hasVariant"), node, depth + 1)
+        elif _jsonld_has_type(node, "Product"):
+            products.append((node, group))
+
+    _walk(items, None)
+
+    candidates: list[_JsonLdCandidate] = []
+
+    def _add_offers(offers: object, product: dict, group: Optional[dict], depth: int = 0) -> None:
+        for offer in _as_list(offers):
+            if not isinstance(offer, dict) or depth > 3:
+                continue
+            raw_price = offer.get("price")
+            if raw_price is None or raw_price == "":
+                raw_price = offer.get("lowPrice")
+            if raw_price is not None and not isinstance(raw_price, (dict, list, bool)):
+                try:
+                    p, _ = _parse_price(str(raw_price), machine_readable=True)
+                except Exception:
+                    p = None
+                if p is not None:
+                    currency = offer.get("priceCurrency")
+                    availability = offer.get("availability")
+                    candidates.append((
+                        p,
+                        currency if isinstance(currency, str) and currency else None,
+                        availability if isinstance(availability, str) else "",
+                        product,
+                        group,
+                    ))
+            # AggregateOffer may carry the individual offers as well
+            if "offers" in offer:
+                _add_offers(offer.get("offers"), product, group, depth + 1)
+
+    for product, group in products:
+        _add_offers(product.get("offers"), product, group)
+    return candidates
+
+
+def _jsonld_wanted_ids(url: str) -> set[str]:
+    """Variant / SKU identifiers named in the watched URL's query string."""
+    qs = parse_qs(urlparse(url).query)
+    return {
+        v.strip()
+        for key in ("variation", "variant", "sku")
+        for v in qs.get(key, [])
+        if v.strip()
+    }
+
+
+def _jsonld_matches(candidate: _JsonLdCandidate, wanted: set[str]) -> bool:
+    _, _, _, product, _ = candidate
+    for node in (product, *[o for o in _as_list(product.get("offers")) if isinstance(o, dict)]):
+        for key in ("sku", "productID", "@id"):
+            value = node.get(key)
+            if isinstance(value, (str, int)) and str(value) in wanted:
+                return True
+        offer_url = node.get("url")
+        if isinstance(offer_url, str) and offer_url:
+            if wanted & _jsonld_wanted_ids(offer_url):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +719,7 @@ def _try_meta(
         return None
 
     try:
-        price, detected_currency = _parse_price(amount_str)
+        price, detected_currency = _parse_price(amount_str, machine_readable=True)
     except Exception:
         return None
 
@@ -737,19 +916,36 @@ _CURRENCY_MAP: dict[str, str] = {
     "¥": "JPY",
     "NIS": "ILS",
     "ILS": "ILS",
+    'ש"ח': "ILS",
+    "ש״ח": "ILS",  # with a gershayim (U+05F4)
+    "ש''ח": "ILS",
     "USD": "USD",
+    "US$": "USD",
     "EUR": "EUR",
     "GBP": "GBP",
+    "JPY": "JPY",
+    "A$": "AUD",
+    "AU$": "AUD",
+    "AUD": "AUD",
+    "C$": "CAD",
+    "CA$": "CAD",
+    "CAD": "CAD",
+    "CHF": "CHF",
 }
 
 # Ordered longest-first so "NIS" matches before "N"
 _CURRENCY_TOKENS = sorted(_CURRENCY_MAP.keys(), key=len, reverse=True)
 
 
-def _parse_price(text: str) -> tuple[Decimal, Optional[str]]:
+def _parse_price(text: str, *, machine_readable: bool = False) -> tuple[Decimal, Optional[str]]:
     """Parse a price string into (Decimal, currency_code | None).
 
     Handles both US/UK style (1,299.90) and EU style (1.299,90).
+    With a single kind of separator occurring once, it is the decimal point
+    unless exactly three digits follow (``1,299`` / ``1.299``), which reads as
+    a thousands group -- except for a ``0`` integer part, and except for a dot
+    when *machine_readable* is set (JSON-LD / meta values such as ``19.990``
+    use a dot as decimal point by definition).
     Raises ValueError if no valid number can be extracted.
     """
     text = text.strip()
@@ -762,38 +958,41 @@ def _parse_price(text: str) -> tuple[Decimal, Optional[str]]:
             text = text.replace(token, "")
             break
 
+    # Scientific notation ("1e3") is not a price; stripping the "e" would
+    # silently turn it into 13.
+    if re.search(r"\d[eE][+\-]?\d", text):
+        raise ValueError(f"Not a plain price: {text!r}")
+
     # Remove leftover whitespace and miscellaneous non-numeric chars except . , -
     text = re.sub(r"[^\d.,\-]", "", text).strip()
 
     if not text:
         raise ValueError("No numeric content after stripping currency")
 
-    # Determine decimal separator: whichever separator appears LAST
-    # and has 1 or 2 digits after it is the decimal separator.
     dot_pos = text.rfind(".")
     comma_pos = text.rfind(",")
 
-    after_dot = len(text) - dot_pos - 1 if dot_pos != -1 else -1
-    after_comma = len(text) - comma_pos - 1 if comma_pos != -1 else -1
-
-    dot_is_decimal = dot_pos != -1 and 1 <= after_dot <= 2
-    comma_is_decimal = comma_pos != -1 and 1 <= after_comma <= 2
-
-    if dot_is_decimal and comma_is_decimal:
-        # Both qualify — the one that appears LAST is the decimal separator
+    if dot_pos != -1 and comma_pos != -1:
+        # Both present — the one that appears LAST is the decimal separator
         if dot_pos > comma_pos:
             # dot is decimal, comma is thousands
             normalised = text.replace(",", "")
         else:
             # comma is decimal, dot is thousands
             normalised = text.replace(".", "").replace(",", ".")
-    elif dot_is_decimal:
-        normalised = text.replace(",", "")
-    elif comma_is_decimal:
-        normalised = text.replace(".", "").replace(",", ".")
+    elif dot_pos != -1 or comma_pos != -1:
+        sep, pos = (".", dot_pos) if dot_pos != -1 else (",", comma_pos)
+        digits_after = len(text) - pos - 1
+        int_part = text[:pos].lstrip("-")
+        if text.count(sep) > 1 or digits_after == 0:
+            is_decimal = False  # "1.299.000" / "1,299,000" / "10."
+        elif digits_after != 3:
+            is_decimal = True  # "89.9", "89.90", "89.9000"
+        else:  # exactly 3 digits: thousands group or 3-decimal price?
+            is_decimal = int_part in ("", "0") or (sep == "." and machine_readable)
+        normalised = text.replace(sep, ".") if is_decimal else text.replace(sep, "")
     else:
-        # Neither qualifies as decimal separator — treat as integer
-        normalised = text.replace(",", "").replace(".", "")
+        normalised = text
 
     try:
         return Decimal(normalised), detected_currency
