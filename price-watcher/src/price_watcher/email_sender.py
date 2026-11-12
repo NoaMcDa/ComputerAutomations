@@ -1640,7 +1640,8 @@ def _unmapped_note(vac) -> str:
 
 # Category marks on the deal tables: (label, badge colour, row tint, meaning).
 _BADGE_CHEAPEST = ("הכי זול לאדם", "#059669", "#ecfdf5", "המחיר הנמוך ביותר לאדם")
-_BADGE_VALUE = ("הכי משתלם", "#2563eb", "#eff6ff", "המחיר הנמוך ביותר לאדם ללילה")
+_BADGE_VALUE = ("הכי משתלם", "#2563eb", "#eff6ff",
+                "המחיר הנמוך ביותר לאדם ללילה מבין החבילות שכוללות כבודה (טרולי או מזוודה)")
 _BADGE_PACKAGE = ("החבילה הכי זולה", "#7c3aed", "#f5f3ff", "מחיר החבילה הכולל הנמוך ביותר")
 _BADGE_LONGEST = ("הכי ארוך", "#d97706", "#fffbeb", "הכי הרבה לילות")
 _BADGE_SHORTEST = ("הכי קצר", "#0891b2", "#ecfeff", "הכי מעט לילות")
@@ -1699,6 +1700,28 @@ def _per_night(d) -> Decimal | None:
     return d.price / nights if nights else None
 
 
+def _luggage_line(d) -> str:
+    """'כבודה: טרולי כלול' / 'ללא כבודה (…)' / 'כבודה: לא צוין באתר'."""
+    from price_watcher import vacations as _v
+    state = getattr(d, "luggage", _v.LUGGAGE_UNKNOWN)
+    if state == _v.LUGGAGE_SUITCASE:
+        return "כבודה: מזוודה כלולה"
+    if state == _v.LUGGAGE_CARRY_ON:
+        return "כבודה: טרולי כלול"
+    if state == _v.LUGGAGE_NONE:
+        extra = getattr(d, "luggage_extra", "")
+        return "ללא כבודה" + (f" ({extra})" if extra else "")
+    return "כבודה: לא צוין באתר"
+
+
+_NO_VALUE_NOTE = 'אין כאן "הכי משתלם": אף חבילה ביבשת הזו לא כוללת כבודה'
+
+
+def _value_badge_given(deals: list) -> bool:
+    """'הכי משתלם' needs at least one row with luggage included."""
+    return any(getattr(d, "has_luggage", False) for d in deals)
+
+
 def _deal_badges(deals: list, is_packages: bool) -> dict[int, list[tuple[str, str, str, str]]]:
     """Row index -> category marks, judged among the rows shown in the table.
 
@@ -1723,7 +1746,10 @@ def _deal_badges(deals: list, is_packages: bool) -> dict[int, list[tuple[str, st
 
     _mark(_BADGE_CHEAPEST, _money(lambda d: d.price))
     if is_packages:
-        _mark(_BADGE_VALUE, _money(_per_night))
+        # Best value only among rows that include luggage (a carry-on is
+        # enough); a row that is cheap because it has no luggage can't win.
+        _mark(_BADGE_VALUE, _money(
+            lambda d: _per_night(d) if getattr(d, "has_luggage", False) else None))
         _mark(_BADGE_PACKAGE, _money(lambda d: d.total))
     lengths = {d.nights_or_computed for d in deals if d.nights_or_computed}
     if len(lengths) > 1:  # no "longest"/"shortest" when every row is the same length
@@ -1785,6 +1811,8 @@ def _vacations_section_text(vac) -> list[str]:
             note = _missing_note(g)
             if note:
                 lines.append(f"      ({note})")
+            if is_packages and g.deals and not _value_badge_given(g.deals):
+                lines.append(f"      ({_NO_VALUE_NOTE})")
             badges = _deal_badges(g.deals, is_packages)
             for i, d in enumerate(g.deals, 1):
                 nights = d.nights_or_computed
@@ -1802,6 +1830,7 @@ def _vacations_section_text(vac) -> list[str]:
                     details = _deal_details(d)
                     if details:
                         lines.append(f"         {details[:110]}")
+                lines.append(f"         {_luggage_line(d)}")
                 lines.append(f"         {d.url}")
         if empty:
             lines.append(f"    אין היום דילים ל: {', '.join(empty)}")
@@ -1860,6 +1889,8 @@ def _vacations_section_html(vac) -> str:
             note = _missing_note(g)
             if note:
                 rows.append(f'<tr><td class="m" colspan="{ncols}">{escape(note)}</td></tr>')
+            if is_packages and g.deals and not _value_badge_given(g.deals):
+                rows.append(f'<tr><td class="m" colspan="{ncols}">{escape(_NO_VALUE_NOTE)}</td></tr>')
             rows.extend(_vacation_rows_html(g.deals, is_packages))
         if empty:
             rows.append(
@@ -1932,13 +1963,14 @@ def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
             f'<td class="w">{_ltr(_deal_dates(d) or "—")}'
             + (f'<small>{nights} לילות</small>' if nights else '') + '</td>',
         ]
-        if is_packages:  # what the package includes
+        luggage = f'<b>• {escape(_luggage_line(d))}</b>'
+        if is_packages:  # what the package includes, luggage last
             cells.append(
                 '<td class="i">'
-                + ("<br>".join(f'• {escape(x[:80])}' for x in d.includes) or "—") + '</td>'
+                + "<br>".join([f'• {escape(x[:80])}' for x in d.includes] + [luggage]) + '</td>'
             )
         else:
-            cells.append(f'<td class="s">{source_link}</td>')
+            cells.append(f'<td class="s">{source_link}<small>{escape(_luggage_line(d))}</small></td>')
         # Price per person
         cells.append(
             f'<td class="p">{_ltr(_deal_price(d))}'
