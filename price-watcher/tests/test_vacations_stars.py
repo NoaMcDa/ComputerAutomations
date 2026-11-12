@@ -5,6 +5,7 @@ Every scanner is fed a canned response through httpx.MockTransport. No network.
 from __future__ import annotations
 
 import json
+from datetime import date, timedelta
 from decimal import Decimal
 
 import httpx
@@ -36,14 +37,19 @@ def _serve(monkeypatch, routes: dict[str, object]) -> None:
     monkeypatch.setattr(vac, "_client", client)
 
 
+# Dated inside the Europe window: scan_and_report drops undated deals (#53).
+_SOON = date.today() + timedelta(days=10)
+
+
 def _pkg(stars, source="src", destination="Athens", price="300") -> vac.VacationDeal:
     return vac.VacationDeal(source=source, kind=vac.KIND_PACKAGE, destination=destination,
-                            price=D(price), url="https://example.invalid/", stars=stars)
+                            price=D(price), url="https://example.invalid/", stars=stars,
+                            date_from=_SOON)
 
 
 def _flight(source="src", destination="Rome", price="150") -> vac.VacationDeal:
     return vac.VacationDeal(source=source, kind=vac.KIND_FLIGHT, destination=destination,
-                            price=D(price), url="https://example.invalid/")
+                            price=D(price), url="https://example.invalid/", date_from=_SOON)
 
 
 # --------------------------------------------------------------------------- parsing

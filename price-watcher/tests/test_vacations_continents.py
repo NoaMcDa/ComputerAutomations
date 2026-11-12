@@ -34,6 +34,8 @@ def _deal(destination: str, days: int | None, price: int, *, kind: str = V.KIND_
         url="https://example.invalid/deal", country=country,
         date_from=None if days is None else TODAY + timedelta(days=days),
         date_to=None if days is None else TODAY + timedelta(days=days + 5),
+        # Packages need a 4–5★ hotel to pass the #52 filter.
+        stars=Decimal(4) if kind == V.KIND_PACKAGE else None,
     )
 
 
