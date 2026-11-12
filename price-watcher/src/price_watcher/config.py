@@ -44,6 +44,8 @@ class EmailConfig:
     smtp_password: str
     email_from: str
     email_to: str
+    # Extra recipients who get ONLY the vacation-deals email (never the daily report).
+    deals_email_to: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,11 @@ def load() -> AppConfig:
             smtp_password=_get("PW_SMTP_PASSWORD"),
             email_from=_get("PW_EMAIL_FROM"),
             email_to=_get("PW_EMAIL_TO"),
+            deals_email_to=tuple(
+                addr.strip()
+                for addr in os.environ.get("PW_DEALS_EMAIL_TO", "").split(",")
+                if addr.strip()
+            ),
         ),
         check=CheckConfig(
             failure_threshold=_get_int("PW_FAILURE_THRESHOLD", 6),

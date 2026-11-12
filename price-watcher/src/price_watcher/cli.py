@@ -93,10 +93,22 @@ def status() -> None:
 @app.command()
 def digest(
     dry_run: bool = typer.Option(False, "--dry-run", help="Collect + print, but do not email"),
+    test: bool = typer.Option(False, "--test", help="Email only PW_EMAIL_TO (skip the deals-only recipients) and save nothing"),
 ) -> None:
-    """Send the daily sales digest: for each watched site, current promo banner (if any)."""
+    """Send the daily report (site promos, creatine, Sims 4, meat, vacation deals)."""
     from price_watcher.digest import run_digest
-    run_digest(dry_run=dry_run)
+    run_digest(dry_run=dry_run, test=test)
+
+
+@app.command()
+def deals(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Collect + print, but do not email"),
+    test: bool = typer.Option(False, "--test", help="Send the deals-only email to PW_EMAIL_TO instead of PW_DEALS_EMAIL_TO"),
+    days: int = typer.Option(None, "--days", help="Only deals departing within this many days (overrides PW_DEALS_DAYS; 0 = no limit)"),
+) -> None:
+    """Scan vacation deals and send the deals-only email to PW_DEALS_EMAIL_TO."""
+    from price_watcher.digest import run_deals
+    raise typer.Exit(run_deals(dry_run=dry_run, test=test, days=days))
 
 
 @app.command(name="install-digest-schedule")
