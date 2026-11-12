@@ -14,9 +14,11 @@ import smtplib
 from decimal import Decimal
 from email.message import EmailMessage
 from html import escape
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from price_watcher import config as _config_module
+from price_watcher import continents as _continents
 from price_watcher.contracts import (
     NOTIFIABLE_TYPES,
     ChangeEvent,
@@ -1559,11 +1561,77 @@ def _party_he(d) -> str:
     return " + ".join(parts)
 
 
-def _vacation_groups(vac) -> list[tuple[str, str, list]]:
+def _continent_sections(groups, flat: list) -> list:
+    """The continent groups of one kind. A report without groups (older
+    callers) shows its flat list as one untitled section."""
+    if groups is None:
+        return [SimpleNamespace(continent="", title_he="", deals=list(flat), limit=len(flat),
+                                window_days=0, missing_required=[])] if flat else []
+    return list(groups)
+
+
+def _vacation_groups(vac) -> list[tuple[str, str, bool, list]]:
+    """(icon, title, is_packages, continent sections) for packages, then flights."""
     return [
-        ("🏖️", "חבילות נופש (טיסה + מלון)", list(vac.packages)),
-        ("✈️", "טיסות", list(vac.flights)),
+        ("🏖️", "חבילות נופש (טיסה + מלון)", True,
+         _continent_sections(getattr(vac, "package_groups", None), vac.packages)),
+        ("✈️", "טיסות", False,
+         _continent_sections(getattr(vac, "flight_groups", None), vac.flights)),
     ]
+
+
+def _shown_sections(sections: list) -> tuple[list, list[str]]:
+    """(sections to render, Hebrew names of continents with nothing to show).
+
+    A continent with no deals is only rendered when it has a note to carry
+    (a required Asia country with no deal); otherwise it goes on one short
+    "no deals" line instead of an empty table."""
+    shown, empty = [], []
+    for g in sections:
+        if g.deals or g.missing_required:
+            shown.append(g)
+        elif g.title_he:
+            empty.append(g.title_he)
+    return shown, empty
+
+
+def _missing_note(g) -> str:
+    """'לא נמצא היום דיל לתאילנד ביציאה ב-365 הימים הקרובים' ('' when none missing)."""
+    if not g.missing_required:
+        return ""
+    names = [_continents.country_name_he(n) or n for n in g.missing_required]
+    words = "לא נמצא היום דיל" if len(names) == 1 else "לא נמצאו היום דילים"
+    return (f"{words} ל" + " ול".join(names)
+            + f" ביציאה ב-{g.window_days} הימים הקרובים")
+
+
+def _section_caption(g) -> str:
+    """'15 דילים · יציאה ב-50 הימים הקרובים'."""
+    count = "דיל אחד" if len(g.deals) == 1 else f"{len(g.deals)} דילים"
+    return count + (f" · יציאה ב-{g.window_days} הימים הקרובים" if g.window_days else "")
+
+
+def _windows_summary(vac) -> str:
+    """'אירופה: עד 15 דילים, יציאה ב-50 הימים הקרובים · שאר היבשות: ...' ('' without groups)."""
+    groups = list(getattr(vac, "package_groups", None) or []) + list(
+        getattr(vac, "flight_groups", None) or [])
+    europe = next((g for g in groups if g.continent == _continents.EUROPE), None)
+    other = next((g for g in groups if g.continent != _continents.EUROPE), None)
+    parts = []
+    if europe is not None:
+        parts.append(f"אירופה: עד {europe.limit} דילים, יציאה ב-{europe.window_days} הימים הקרובים")
+    if other is not None:
+        parts.append(f"שאר היבשות: עד {other.limit} דילים לכל יבשת, "
+                     f"יציאה ב-{other.window_days} הימים הקרובים")
+    return " · ".join(parts)
+
+
+def _unmapped_note(vac) -> str:
+    n = len(getattr(vac, "unmapped", None) or [])
+    if not n:
+        return ""
+    return "דיל אחד ליעד שלא זוהתה היבשת שלו לא מוצג" if n == 1 else (
+        f"{n} דילים ליעדים שלא זוהתה היבשת שלהם לא מוצגים")
 
 
 # Category marks on the deal tables: (label, badge colour, row tint, meaning).
@@ -1572,6 +1640,46 @@ _BADGE_VALUE = ("הכי משתלם", "#2563eb", "#eff6ff", "המחיר הנמו�
 _BADGE_PACKAGE = ("החבילה הכי זולה", "#7c3aed", "#f5f3ff", "מחיר החבילה הכולל הנמוך ביותר")
 _BADGE_LONGEST = ("הכי ארוך", "#d97706", "#fffbeb", "הכי הרבה לילות")
 _BADGE_SHORTEST = ("הכי קצר", "#0891b2", "#ecfeff", "הכי מעט לילות")
+_BADGES = (_BADGE_CHEAPEST, _BADGE_VALUE, _BADGE_PACKAGE, _BADGE_LONGEST, _BADGE_SHORTEST)
+
+
+def _badge_class(badge) -> int:
+    return _BADGES.index(badge)
+
+
+# Styles of the vacation tables, in one <style> block in the email's <head>
+# (like _MEAT_CSS): the per-continent tables hold ~70 rows, and inline styles
+# on every cell would push the daily email further past Gmail's ~102 KB
+# clipping limit. Without the block the tables degrade to plain rows.
+_VAC_CSS = (
+    f".vt{{border-collapse:collapse;width:100%;font-family:{_FONT_STACK};color:{_COLOR_TEXT}}}"
+    f".vt th{{padding:6px;font-size:11px;font-weight:600;color:{_COLOR_MUTED};text-align:right}}"
+    ".vt th.l{text-align:left}.vt th.c{text-align:center}"
+    f".vt td{{padding:8px 6px;border-top:1px solid {_COLOR_BORDER};vertical-align:top;"
+    "text-align:right;font-size:13px}"
+    f".vt td.n{{padding:8px 4px 8px 0;font-size:12px;color:{_COLOR_MUTED};text-align:center}}"
+    ".vt td.w{font-size:12px;white-space:nowrap}"
+    ".vt td.i{font-size:11px;line-height:1.5}"
+    ".vt td.s{font-size:12px}"
+    ".vt td.p,.vt td.t{font-size:14px;font-weight:700;text-align:left;white-space:nowrap}"
+    f".vt td.t{{color:{_COLOR_ACCENT};white-space:normal}}"
+    f".vt td.h{{background:{_COLOR_BG_SOFT};border-top:2px solid {_COLOR_BORDER};"
+    "font-size:14px;font-weight:700;padding:10px 8px 6px}"
+    f".vt td.h small,.vt td.m{{color:{_COLOR_MUTED};font-size:11px;font-weight:400}}"
+    ".vt td.m{font-style:italic;padding:4px 8px}"
+    f".vt small{{display:block;font-size:11px;font-weight:400;color:{_COLOR_MUTED};margin-top:2px}}"
+    ".vt td.h small{display:inline}"
+    f".vt a{{color:{_COLOR_LINK};font-weight:600;text-decoration:none}}"
+    f".vt tr.z{{background:{_COLOR_BG_SOFT}}}"
+    ".vk{display:inline-block;color:#fff;font-size:10px;font-weight:700;padding:2px 6px;"
+    "border-radius:4px;margin-top:3px;white-space:nowrap}"
+    + "".join(f".vk.k{i}{{background:{b[1]}}}.vt tr.r{i}{{background:{b[2]}}}"
+              for i, b in enumerate(_BADGES))
+)
+
+
+def _vacation_style_tag() -> str:
+    return f"<style>{_VAC_CSS}</style>"
 
 
 def _vacation_badge_set(is_packages: bool) -> list[tuple[str, str, str, str]]:
@@ -1624,11 +1732,14 @@ def _vacation_blurb(vac) -> str:
     """Short 'from $X' summary used in subjects."""
     if vac is None or vac.status != "ok":
         return ""
+    def _cheapest(deals):  # lists are in continent order, not price order
+        return min(deals, key=lambda d: (d.currency != "USD", d.price))
+
     parts = []
     if vac.packages:
-        parts.append(f"חבילות מ-{_deal_price(vac.packages[0])}")
+        parts.append(f"חבילות מ-{_deal_price(_cheapest(vac.packages))}")
     if vac.flights:
-        parts.append(f"טיסות מ-{_deal_price(vac.flights[0])}")
+        parts.append(f"טיסות מ-{_deal_price(_cheapest(vac.flights))}")
     return " · ".join(parts)
 
 
@@ -1647,39 +1758,56 @@ def _vacations_section_text(vac) -> list[str]:
         lines.append(f"  לא זמינים היום: {', '.join(failed)}")
     if getattr(vac, "days_ahead", 0):
         lines.append(f"  רק יציאות ב-{vac.days_ahead} הימים הקרובים.")
+    windows = _windows_summary(vac)
+    if windows:
+        lines.append(f"  לפי יבשת. {windows}.")
     lines.append(
         f"  נמצאו {vac.total_found} דילים. מחיר לאדם = לכל החופשה (לא ללילה); "
         f"מחיר החבילה = הסכום לכל הנוסעים שהאתר תמחר."
     )
-    for _icon, title, deals in _vacation_groups(vac):
+    unmapped = _unmapped_note(vac)
+    if unmapped:
+        lines.append(f"  {unmapped}.")
+    for _icon, title, is_packages, sections in _vacation_groups(vac):
         lines.append("")
         lines.append(f"  ▼ {title}")
-        if not deals:
+        shown, empty = _shown_sections(sections)
+        if not shown:
             lines.append("    לא נמצאו היום.")
             continue
-        badges = _deal_badges(deals, is_packages=title.startswith("חבילות"))
-        for i, d in enumerate(deals, 1):
-            nights = d.nights_or_computed
-            when = _deal_dates(d) + (f" ({nights} לילות)" if nights else "")
-            tags = " · ".join(b[0] for b in badges.get(i - 1, []))
-            lines.append(
-                f"    {i}. {_deal_price(d)} לאדם · {_deal_where(d)} · {when} · {d.source}"
-                + (f"  [{tags}]" if tags else "")
-            )
-            if d.total is not None:
-                lines.append(f"       מחיר החבילה: {_deal_total(d)} {_party_he(d)}".rstrip())
-            if d.includes:
-                lines.append(f"       כולל: {' · '.join(d.includes)[:200]}")
-            else:
-                details = _deal_details(d)
-                if details:
-                    lines.append(f"       {details[:110]}")
-            lines.append(f"       {d.url}")
+        for g in shown:
+            if g.title_he:
+                lines.append(f"    ■ {g.title_he} — {_section_caption(g)}")
+            note = _missing_note(g)
+            if note:
+                lines.append(f"      ({note})")
+            badges = _deal_badges(g.deals, is_packages)
+            for i, d in enumerate(g.deals, 1):
+                nights = d.nights_or_computed
+                when = _deal_dates(d) + (f" ({nights} לילות)" if nights else "")
+                tags = " · ".join(b[0] for b in badges.get(i - 1, []))
+                lines.append(
+                    f"      {i}. {_deal_price(d)} לאדם · {_deal_where(d)} · {when} · {d.source}"
+                    + (f"  [{tags}]" if tags else "")
+                )
+                if d.total is not None:
+                    lines.append(f"         מחיר החבילה: {_deal_total(d)} {_party_he(d)}".rstrip())
+                if d.includes:
+                    lines.append(f"         כולל: {' · '.join(d.includes)[:200]}")
+                else:
+                    details = _deal_details(d)
+                    if details:
+                        lines.append(f"         {details[:110]}")
+                lines.append(f"         {d.url}")
+        if empty:
+            lines.append(f"    אין היום דילים ל: {', '.join(empty)}")
     return lines
 
 
 def _vacations_section_html(vac) -> str:
-    """Vacation deals: one card for packages, one for flights, cheapest first. RTL."""
+    """Vacation deals: one card for packages, one for flights, each split by
+    continent (cheapest first within a continent). RTL. Needs _VAC_CSS in the
+    email's <head>."""
     if vac is None:
         return '<div style="color:#888;font-style:italic;text-align:right">(לא נסרק)</div>'
     if vac.status != "ok":
@@ -1702,117 +1830,54 @@ def _vacations_section_html(vac) -> str:
         + (f'<div style="font-size:12px;color:#991b1b;margin-top:2px">'
            f'לא זמינים היום: ' + " · ".join(escape(n) for n in failed) + '</div>'
            if failed else '')
+        + (f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
+           f'לפי יבשת. {escape(_windows_summary(vac))}.</div>'
+           if _windows_summary(vac) else '')
         + f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
-        f'מוצגים הדילים הזולים ביותר, מהזול ליקר. "מחיר לאדם" הוא לכל החופשה (לא ללילה), '
+        f'בכל יבשת מהזול ליקר. "מחיר לאדם" הוא לכל החופשה (לא ללילה), '
         f'כפי שמופיע באתר. "מחיר החבילה" הוא הסכום לכל הנוסעים שהאתר תמחר. '
         f'"מה כלול" מציג רק את מה שהאתר מפרט.'
-        f'</div></div>'
+        f'</div>'
+        + (f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
+           f'{escape(_unmapped_note(vac))}.</div>' if _unmapped_note(vac) else '')
+        + '</div>'
     ]
 
-    th_style = (
-        f'padding:6px 10px;font-size:11px;font-weight:600;color:{_COLOR_MUTED};'
-        f'letter-spacing:0.5px'
-    )
-    cell = f'border-top:1px solid {_COLOR_BORDER};vertical-align:top'
-
-    for icon, title, deals in _vacation_groups(vac):
-        is_packages = deals is not None and title.startswith("חבילות")
-        if not deals:
+    for icon, title, is_packages, sections in _vacation_groups(vac):
+        shown, empty = _shown_sections(sections)
+        ncols = 6 if is_packages else 5
+        rows: list[str] = []
+        for g in shown:
+            if g.title_he:
+                rows.append(
+                    f'<tr><td class="h" colspan="{ncols}">{escape(g.title_he)} '
+                    f'<small>· {escape(_section_caption(g))}</small></td></tr>'
+                )
+            note = _missing_note(g)
+            if note:
+                rows.append(f'<tr><td class="m" colspan="{ncols}">{escape(note)}</td></tr>')
+            rows.extend(_vacation_rows_html(g.deals, is_packages))
+        if empty:
+            rows.append(
+                f'<tr><td class="m" colspan="{ncols}">'
+                f'אין היום דילים ל: {escape(", ".join(empty))}</td></tr>'
+            )
+        if not shown:
             body = (
                 f'<div style="padding:12px 14px;color:#888;font-style:italic;'
                 f'text-align:right">לא נמצאו היום.</div>'
             )
         else:
-            rows = []
-            badges = _deal_badges(deals, is_packages)
-            for i, d in enumerate(deals):
-                row_badges = badges.get(i, [])
-                row_bg = (
-                    row_badges[0][2] if row_badges
-                    else ("#ffffff" if i % 2 == 0 else _COLOR_BG_SOFT)
-                )
-                nights = d.nights_or_computed
-                details = _deal_details(d)
-                best_badge = "".join(
-                    f'<div><span style="display:inline-block;background:{color};'
-                    f'color:#fff;font-size:10px;font-weight:700;padding:2px 6px;'
-                    f'border-radius:4px;margin-top:3px">{escape(label)}</span></div>'
-                    for label, color, _tint, _meaning in row_badges
-                )
-                per_night = _per_night(d) if is_packages else None
-                pad = "padding:8px 6px"
-                source_link = (
-                    f'<a href="{escape(d.url)}" style="color:{_COLOR_LINK};font-weight:600;'
-                    f'text-decoration:none">{escape(d.source)}</a>'
-                )
-                cells = [
-                    f'<td style="padding:8px 4px 8px 0;font-size:12px;color:{_COLOR_MUTED};'
-                    f'text-align:center;{cell}">{i + 1}</td>',
-                    # Destination. Packages: site link underneath. Flights: details underneath.
-                    f'<td style="{pad};font-size:13px;color:{_COLOR_TEXT};'
-                    f'{cell};text-align:right"><b>{escape(_deal_where(d))}</b>'
-                    + (f'<div style="font-size:12px;margin-top:2px">{source_link}</div>'
-                       if is_packages else
-                       (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-                        f'{escape(details[:90])}</div>' if details else ''))
-                    + best_badge + '</td>',
-                    # Dates
-                    f'<td style="{pad};font-size:12px;color:{_COLOR_TEXT};'
-                    f'white-space:nowrap;{cell};text-align:right">{_ltr(_deal_dates(d) or "—")}'
-                    + (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-                       f'{nights} לילות</div>' if nights else '')
-                    + '</td>',
-                ]
-                if is_packages:
-                    # What the package includes
-                    cells.append(
-                        f'<td style="{pad};font-size:11px;line-height:1.5;'
-                        f'color:{_COLOR_TEXT};{cell};text-align:right">'
-                        + ("".join(f'<div>• {escape(x[:80])}</div>' for x in d.includes) or "—")
-                        + '</td>'
-                    )
-                else:
-                    cells.append(
-                        f'<td style="{pad};font-size:12px;{cell};text-align:right">'
-                        f'{source_link}</td>'
-                    )
-                # Price per person
-                cells.append(
-                    f'<td style="{pad};font-size:14px;font-weight:700;'
-                    f'color:{_COLOR_TEXT};text-align:left;white-space:nowrap;{cell}">'
-                    f'{_ltr(_deal_price(d))}'
-                    + (f'<div style="font-size:11px;font-weight:400;color:{_COLOR_MUTED};'
-                       f'margin-top:2px">{_ltr(f"{_currency_symbol(d.currency)}{per_night:,.0f}")}'
-                       f' ללילה</div>' if per_night is not None else '')
-                    + '</td>'
-                )
-                if is_packages:
-                    # Whole-package price for the party the site priced
-                    cells.append(
-                        f'<td style="{pad};font-size:14px;font-weight:700;'
-                        f'color:{_COLOR_ACCENT};text-align:left;{cell}">'
-                        + (f'{_ltr(_deal_total(d))}'
-                           f'<div style="font-size:11px;font-weight:400;color:{_COLOR_MUTED};'
-                           f'margin-top:2px">{escape(_party_he(d))}</div>'
-                           if d.total is not None else "—")
-                        + '</td>'
-                    )
-                rows.append(f'<tr style="background:{row_bg}">' + "".join(cells) + '</tr>')
-            th = th_style.replace("padding:6px 10px", "padding:6px")
-            headers = [
-                f'<th style="{th};text-align:center">#</th>',
-                f'<th style="{th};text-align:right">יעד</th>',
-                f'<th style="{th};text-align:right">תאריכים</th>',
-                f'<th style="{th};text-align:right">{"מה כלול" if is_packages else "אתר"}</th>',
-                f'<th style="{th};text-align:left">מחיר לאדם</th>',
-            ]
-            if is_packages:
-                headers.append(f'<th style="{th};text-align:left">מחיר החבילה</th>')
-            body = (
-                '<table dir="rtl" style="border-collapse:collapse;width:100%">'
-                '<thead><tr>' + "".join(headers) + '</tr></thead>'
-                '<tbody>' + "".join(rows) + '</tbody></table>'
+            headers = (
+                '<th class="c">#</th><th>יעד</th><th>תאריכים</th>'
+                f'<th>{"מה כלול" if is_packages else "אתר"}</th><th class="l">מחיר לאדם</th>'
+                + ('<th class="l">מחיר החבילה</th>' if is_packages else '')
             )
+            body = (
+                '<table class="vt" dir="rtl" cellpadding="6" cellspacing="0" width="100%">'
+                f'<thead><tr>{headers}</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+            )
+        count = sum(len(g.deals) for g in shown)
         html.append(
             f'<div style="margin:0 0 20px;background:#ffffff;border:1px solid {_COLOR_BORDER};'
             f'border-radius:10px;overflow:hidden;font-family:{_FONT_STACK}">'
@@ -1821,22 +1886,71 @@ def _vacations_section_html(vac) -> str:
             f'<div style="font-size:15px;font-weight:700;color:{_COLOR_TEXT}">'
             f'{icon} {escape(title)}</div>'
             f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-            f'{len(deals)} הדילים הזולים ביותר</div>'
+            f'{count} דילים, לפי יבשת</div>'
             # Legend for the coloured category marks
             + (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:6px;line-height:2">'
                + " &nbsp; ".join(
-                   f'<span style="display:inline-block;white-space:nowrap;'
-                   f'background:{color};color:#fff;font-size:10px;font-weight:700;'
-                   f'padding:1px 6px;border-radius:4px">{escape(label)}</span> '
-                   f'{escape(meaning)}'
-                   for label, color, _tint, meaning in _vacation_badge_set(is_packages)
+                   f'<span class="vk k{_badge_class(b)}">{escape(b[0])}</span> {escape(b[3])}'
+                   for b in _vacation_badge_set(is_packages)
                )
-               + '<div style="line-height:1.4">הסימונים נבחרים מתוך השורות שבטבלה.</div></div>'
-               if deals else '')
+               + '<div style="line-height:1.4">הסימונים נבחרים בכל יבשת בנפרד.</div></div>'
+               if count else '')
             + '</div>'
             + body + '</div>'
         )
     return "".join(html)
+
+
+def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
+    """Table rows of one continent. Styling comes from _VAC_CSS classes."""
+    rows = []
+    badges = _deal_badges(deals, is_packages)
+    for i, d in enumerate(deals):
+        row_badges = badges.get(i, [])
+        row_class = (f' class="r{_badge_class(row_badges[0])}"' if row_badges
+                     else (' class="z"' if i % 2 else ''))
+        nights = d.nights_or_computed
+        details = _deal_details(d)
+        marks = "".join(
+            f'<div><span class="vk k{_badge_class(b)}">{escape(b[0])}</span></div>'
+            for b in row_badges
+        )
+        per_night = _per_night(d) if is_packages else None
+        source_link = f'<a href="{escape(d.url)}">{escape(d.source)}</a>'
+        cells = [
+            f'<td class="n">{i + 1}</td>',
+            # Destination. Packages: site link underneath. Flights: details underneath.
+            f'<td><b>{escape(_deal_where(d))}</b>'
+            + (f'<small>{source_link}</small>' if is_packages
+               else (f'<small>{escape(details[:90])}</small>' if details else ''))
+            + marks + '</td>',
+            # Dates
+            f'<td class="w">{_ltr(_deal_dates(d) or "—")}'
+            + (f'<small>{nights} לילות</small>' if nights else '') + '</td>',
+        ]
+        if is_packages:  # what the package includes
+            cells.append(
+                '<td class="i">'
+                + ("<br>".join(f'• {escape(x[:80])}' for x in d.includes) or "—") + '</td>'
+            )
+        else:
+            cells.append(f'<td class="s">{source_link}</td>')
+        # Price per person
+        cells.append(
+            f'<td class="p">{_ltr(_deal_price(d))}'
+            + (f'<small>{_ltr(f"{_currency_symbol(d.currency)}{per_night:,.0f}")} ללילה</small>'
+               if per_night is not None else '')
+            + '</td>'
+        )
+        if is_packages:  # whole-package price for the party the site priced
+            cells.append(
+                '<td class="t">'
+                + (f'{_ltr(_deal_total(d))}<small>{escape(_party_he(d))}</small>'
+                   if d.total is not None else "—")
+                + '</td>'
+            )
+        rows.append(f'<tr{row_class}>' + "".join(cells) + '</tr>')
+    return rows
 
 
 def build_deals_payload(vac) -> EmailPayload | None:
@@ -1851,7 +1965,8 @@ def build_deals_payload(vac) -> EmailPayload | None:
     _F = _FONT_STACK
     html_body = "".join([
         '<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8">',
-        '<meta name="viewport" content="width=device-width,initial-scale=1"></head>',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        _vacation_style_tag(), '</head>',
         f'<body dir="rtl" style="margin:0;padding:0;background:#f3f4f6;font-family:{_F};color:{_COLOR_TEXT}">',
         '<table role="presentation" dir="rtl" style="width:100%;background:#f3f4f6;border-collapse:collapse">',
         '<tr><td style="padding:16px 4px">',
@@ -2013,6 +2128,7 @@ def build_daily_payload(report) -> EmailPayload | None:
         '<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
         _meat_style_tag(),
+        _vacation_style_tag() if vac is not None and vac.status == "ok" else "",
         _marketplace.style_tag() if mp_report is not None else "",
         '</head>',
         f'<body dir="rtl" style="margin:0;padding:0;background:#f3f4f6;font-family:{_F};color:{_COLOR_TEXT}">',

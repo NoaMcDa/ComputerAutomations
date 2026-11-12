@@ -8,16 +8,37 @@ pages and merges them into one ranked list:
   השטיח המעופף     flying.co.il home-page package feed
   גוליבר           gulliver.co.il home-page hot deals
   חוליו            hulyo.co.il catalogue files
-  לאסט מינט        lastminute.co.il deal feed
   טרווליסט         travelist.co.il flight-deal file
   טיסות סודיות     secretflights.co.il deal feed
 
 Every source is plain HTTP, runs independently, and a failing source never
 sinks the others. Prices are per person as each site states them.
 
-The report keeps, for packages and for flights separately, the cheapest
-`PW_DEALS_TOP` deals (default 15): one deal per source and destination, and
-at most `_MAX_PER_DESTINATION` rows for the same destination.
+For packages and for flights separately, the report groups the deals by
+continent (see `continents.py`) in this order: Europe, Asia, North America,
+South America, Africa, Oceania. Within a continent it ranks cheapest first,
+one deal per source and destination and at most `_MAX_PER_DESTINATION` rows
+for the same destination, and keeps:
+
+  Europe       departures today .. today + PW_DEALS_EUROPE_DAYS (50),
+               up to PW_DEALS_TOP deals (15)
+  elsewhere    departures today .. today + PW_DEALS_OTHER_DAYS (365),
+               PW_DEALS_OTHER_TOP deals per continent (4)
+  Asia         its deals include the cheapest Japan and the cheapest
+               Thailand deal whenever one exists in the window; a missing
+               one is recorded on the group so the email can say so.
+
+Packages need a hotel rated 3 to 5 stars; unrated packages are left out.
+3★ hotels are limited to a third of the rows: at most one of a
+destination's (up to) three rows, and at most a third of each continent's
+package rows. The other rows are 4–5★.
+
+Lastminute (lastminute.co.il) was dropped as a source on the owner's
+request: its packages carry no star rating and its reviews are poor.
+
+Undated deals can't be placed in a window and are left out, as are deals
+whose destination can't be placed on a continent (logged and counted).
+PW_DEALS_DAYS, when set, caps every window.
 """
 
 from __future__ import annotations
@@ -37,6 +58,7 @@ from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.table import Table
 
+from price_watcher import continents as _continents
 from price_watcher import logging_setup
 from price_watcher.http_headers import USER_AGENT
 
@@ -58,19 +80,53 @@ _MAX_PER_DESTINATION = 3
 _CURRENCY_CODES = {"$": "USD", "₪": "ILS", "€": "EUR", "£": "GBP"}
 
 
-def _window_days() -> int:
-    """Only keep deals departing within this many days. 0 (default) = no limit."""
+def _env_int(name: str, default: int, minimum: int) -> int:
     try:
-        return max(0, int(os.environ.get("PW_DEALS_DAYS", "0")))
+        return max(minimum, int(os.environ.get(name, str(default))))
     except ValueError:
-        return 0
+        return default
+
+
+def _window_days() -> int:
+    """Global cap on the departure window (PW_DEALS_DAYS). 0 (default) = none."""
+    return _env_int("PW_DEALS_DAYS", 0, 0)
 
 
 def _top_n() -> int:
-    try:
-        return max(1, int(os.environ.get("PW_DEALS_TOP", "15")))
-    except ValueError:
-        return 15
+    """How many Europe deals to keep per list (PW_DEALS_TOP)."""
+    return _env_int("PW_DEALS_TOP", 15, 1)
+
+
+def _other_top() -> int:
+    """How many deals to keep per non-Europe continent (PW_DEALS_OTHER_TOP)."""
+    return _env_int("PW_DEALS_OTHER_TOP", 4, 1)
+
+
+def _capped(days: int) -> int:
+    cap = _window_days()
+    return min(days, cap) if cap else days
+
+
+def _europe_days() -> int:
+    """Europe departure window in days (PW_DEALS_EUROPE_DAYS), capped by PW_DEALS_DAYS."""
+    return _capped(_env_int("PW_DEALS_EUROPE_DAYS", 50, 0))
+
+
+def _other_days() -> int:
+    """Departure window of every other continent (PW_DEALS_OTHER_DAYS), capped by PW_DEALS_DAYS."""
+    return _capped(_env_int("PW_DEALS_OTHER_DAYS", 365, 0))
+
+
+def _continent_days(continent: str) -> int:
+    return _europe_days() if continent == _continents.EUROPE else _other_days()
+
+
+def _continent_limit(continent: str) -> int:
+    return _top_n() if continent == _continents.EUROPE else _other_top()
+
+
+# Asia must show at least one deal for each of these (ISO-2) when one exists.
+_ASIA_REQUIRED = ("JP", "TH")
 
 
 # ---- Data model ----
@@ -93,6 +149,10 @@ class VacationDeal:
     adults: int = 0                 # party the site priced the deal for (0 = not stated)
     children: int = 0
     total_price: Optional[Decimal] = None  # whole-party price when the site gives it
+    continent: str = ""             # continents.EUROPE / ASIA / ... (set by scan_and_report)
+
+    # Hotel star rating as the site states it (4, 4.5, 5…); None when not given (#52).
+    stars: Optional[Decimal] = None
 
     @property
     def party_size(self) -> int:
@@ -125,18 +185,42 @@ class SourceStatus:
 
 
 @dataclass
+class ContinentGroup:
+    """The deals of one kind (packages or flights) shown for one continent."""
+    continent: str                  # continents.EUROPE / ASIA / ...
+    deals: list[VacationDeal] = field(default_factory=list)
+    limit: int = 0                  # most deals this continent may show
+    window_days: int = 0            # departures from today to today + window_days
+    missing_required: list[str] = field(default_factory=list)  # e.g. ["Thailand"]: none in the window
+
+    @property
+    def title_he(self) -> str:
+        return _continents.CONTINENT_HE.get(self.continent, self.continent)
+
+
+@dataclass
 class VacationReport:
     status: str = "ok"              # "ok" / "fetch_failed"
-    packages: list[VacationDeal] = field(default_factory=list)
-    flights: list[VacationDeal] = field(default_factory=list)
+    packages: list[VacationDeal] = field(default_factory=list)  # every package shown, in display order
+    flights: list[VacationDeal] = field(default_factory=list)   # every flight shown, in display order
     sources: list[SourceStatus] = field(default_factory=list)
     total_found: int = 0            # before dedupe / top-N cut
-    days_ahead: int = 0             # departure window applied (0 = none)
+    days_ahead: int = 0             # global departure cap PW_DEALS_DAYS (0 = none)
     error: Optional[str] = None
+    package_groups: list[ContinentGroup] = field(default_factory=list)  # by continent, display order
+    flight_groups: list[ContinentGroup] = field(default_factory=list)
+    unmapped: list[str] = field(default_factory=list)  # "source: destination (country)" left out
+
+    # Packages dropped because the hotel isn't a verified 3–5★ (#52).
+    dropped_low_star: int = 0
 
     @property
     def deals(self) -> list[VacationDeal]:
         return self.packages + self.flights
+
+    @property
+    def unmapped_count(self) -> int:
+        return len(self.unmapped)
 
 
 # ---- Small parsing helpers ----
@@ -196,12 +280,69 @@ def _int(value: object) -> int:
 _FLIGHT_INCLUDED = "טיסה הלוך ושוב"
 
 
-def _hotel_line(name: object, stars: object = 0) -> str:
+def _stars(value: object) -> Optional[Decimal]:
+    """Hotel star rating as a Decimal: 4, '4.5', '4,5', '5★', '4 כוכבים'.
+
+    None when the value is missing, zero (= "not rated" on these sites) or not
+    a number, so an unknown rating can never pass as a good one.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        raw = str(value)
+    elif isinstance(value, str):
+        tokens = value.replace("★", " ").replace("*", " ").replace(",", ".").split()
+        raw = tokens[0] if tokens else ""
+    else:
+        return None
+    try:
+        d = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    if not d.is_finite() or d <= 0:
+        return None
+    return d.normalize()  # '4.50' -> 4.5, '5.0' -> 5
+
+
+def _star_label(stars: Optional[Decimal]) -> str:
+    """' (4★)' / ' (4.5★)', or '' when the rating is unknown."""
+    return f" ({stars:f}★)" if stars else ""
+
+
+_MIN_STARS = Decimal("3")
+_MAX_STARS = Decimal("5")
+_UPPER_TIER_STARS = Decimal("4")  # 4–5★; 3–3.5★ is the capped lower tier
+
+
+def _hotel_qualifies(deal: VacationDeal) -> bool:
+    """Packages need a verified 3–5★ hotel (3, 3.5 … 5 pass); flights always pass.
+
+    A missing or unreadable rating fails: an unknown hotel is never shown.
+    """
+    if deal.kind != KIND_PACKAGE:
+        return True
+    stars = _stars(deal.stars)
+    return stars is not None and _MIN_STARS <= stars <= _MAX_STARS
+
+
+def _is_three_star(deal: VacationDeal) -> bool:
+    """A package whose hotel is in the 3★ tier (3 or 3.5 stars)."""
+    if deal.kind != KIND_PACKAGE:
+        return False
+    stars = _stars(deal.stars)
+    return stars is not None and stars < _UPPER_TIER_STARS
+
+
+def _three_star_cap(rows: int) -> int:
+    """How many of `rows` may be 3★: a third, rounded down."""
+    return rows // 3
+
+
+def _hotel_line(name: object, stars: object = None) -> str:
     name = _clean(name)
     if not name:
         return ""
-    n = _int(stars)
-    return f"מלון {name}" + (f" ({n}★)" if n else "")
+    return f"מלון {name}" + _star_label(_stars(stars))
 
 
 def _includes(*parts: object) -> list[str]:
@@ -252,6 +393,9 @@ def _scan_issta() -> list[VacationDeal]:
         inner = parse_qs(urlparse(href.replace("/loader?url=", "", 1)).query)
         desc_el = card.select_one('[itemprop="description"]')
         prefix_el = price_box.select_one(".deal-PricePrefix span")
+        # The card shows no rating; the package link carries the hotel star
+        # level the deal was priced at ("…&stars=3"). Organised tours have none.
+        stars = None if is_flight else _stars((inner.get("stars") or [None])[0])
         out.append(VacationDeal(
             source="איסתא", kind=KIND_FLIGHT if is_flight else KIND_PACKAGE,
             destination=destination, price=price,
@@ -263,10 +407,11 @@ def _scan_issta() -> list[VacationDeal]:
             note=_clean(prefix_el.get_text() if prefix_el else "").rstrip(":"),
             includes=[] if is_flight else _includes(
                 _FLIGHT_INCLUDED,
-                ("מלון: " + _clean(desc_el.get_text())) if desc_el else "מלון",
+                ("מלון: " + _clean(desc_el.get_text()) if desc_el else "מלון") + _star_label(stars),
             ),
             adults=_int((inner.get("adt1") or inner.get("padt") or [0])[0]),
             children=_int((inner.get("chd1") or inner.get("pchd") or [0])[0]),
+            stars=stars,
         ))
     return out
 
@@ -288,7 +433,7 @@ def _scan_eshet() -> list[VacationDeal]:
             destination = _clean(p.get("DestinationName"))
             if price is None or not destination:
                 continue
-            stars = p.get("Stars") or 0
+            stars = _stars(p.get("Stars"))
             hotel = _clean(p.get("HotelName") or p.get("SubTitle"))
             capacity = p.get("Capacity") or {}
             out.append(VacationDeal(
@@ -297,7 +442,7 @@ def _scan_eshet() -> list[VacationDeal]:
                 url=_abs_url(base, p.get("PromoLink")),
                 date_from=_date(p.get("StartDate")), date_to=_date(p.get("EndDate")),
                 nights=(p.get("Conditions") or {}).get("TotalNights") or None,
-                hotel=hotel + (f" ({stars}★)" if hotel and stars else ""),
+                hotel=hotel + (_star_label(stars) if hotel else ""),
                 note=_clean(p.get("BoardHebrew")),
                 includes=_includes(
                     _FLIGHT_INCLUDED, _hotel_line(hotel, stars), p.get("BoardHebrew"),
@@ -305,6 +450,7 @@ def _scan_eshet() -> list[VacationDeal]:
                 ),
                 adults=_int(capacity.get("Adults")), children=_int(capacity.get("Children")),
                 total_price=_dec(price_info.get("PriceAfterDiscount")),
+                stars=stars,
             ))
     return out
 
@@ -339,7 +485,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
         destination = _he(d.get("destinationName"))
         if price is None or not destination:
             continue
-        stars = d.get("stars") or 0
+        stars = _stars(d.get("stars"))
         hotel = _he(d.get("hotelName"))
         transfers = _clean(d.get("transfers"))
         if transfers:
@@ -361,7 +507,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             country=_he(d.get("destinationCountryName")).title(),
             date_from=_date(d.get("departureDate")), date_to=_date(d.get("arrivalDate")),
             nights=d.get("nights") or None,
-            hotel=hotel + (f" ({stars}★)" if hotel and stars else ""),
+            hotel=hotel + (_star_label(stars) if hotel else ""),
             note=_clean(d.get("priceRemark")),
             includes=_includes(
                 _FLIGHT_INCLUDED, _hotel_line(hotel, stars), _he(d.get("boardBasisName")),
@@ -369,6 +515,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             ),
             adults=_int(d.get("adult")), children=_int(d.get("child")),
             total_price=_dec((d.get("discountedPrice") or {}).get("price")),
+            stars=stars,
         ))
     return out
 
@@ -397,8 +544,9 @@ def _scan_gulliver() -> list[VacationDeal]:
                 continue
             destination, _, country = title.partition(",")
             deal_type = _clean(d.get("DealTypeTitle"))
+            stars = _stars(d.get("HotelStars"))  # charter flights send the string "0"
             is_package = bool(
-                d.get("HotelId") or d.get("HotelStars")
+                d.get("HotelId") or stars
                 or "חביל" in deal_type or "מלון" in deal_type
             )
             d_from, d_to = _date_range(d.get("DatesTitle"))
@@ -418,6 +566,7 @@ def _scan_gulliver() -> list[VacationDeal]:
                     d.get("BoardDescription"),
                 ) if is_package else [],
                 adults=_int(d.get("NumOfAdults")), children=_int(d.get("NumOfChildren")),
+                stars=stars if is_package else None,
             ))
     return out
 
@@ -475,62 +624,8 @@ def _scan_hulyo() -> list[VacationDeal]:
                     ) if kind == KIND_PACKAGE else [],
                     adults=pax.count("A") if kind == KIND_PACKAGE else 0,
                     children=pax.count("C") if kind == KIND_PACKAGE else 0,
+                    stars=_stars(hotel.get("rating")) if kind == KIND_PACKAGE else None,
                 ))
-    return out
-
-
-_LASTMINUTE_EUROPE = [
-    "BER", "MAD", "BCN", "BUS", "ZRH", "VCE", "SOF", "GVA", "ROM", "CHQ", "SKG", "ZTH",
-    "JTR", "AMS", "ATH", "CFU", "KGS", "HER", "JMK", "RHO", "PRG", "PAR", "DXB", "LON",
-    "LCA", "LIS", "TBS", "TIV", "BOJ", "BAK", "PAS", "PFO", "VIE", "MIL", "OTP", "WAW",
-    "BUD", "SEZ",
-]
-
-
-def _scan_lastminute() -> list[VacationDeal]:
-    base = "https://www.lastminute.co.il/"
-    today = date.today()
-    window = {
-        "FromDate": f"{today.isoformat()}T00:00:00",
-        "MaxFromDate": f"{(today + timedelta(days=_window_days() or 240)).isoformat()}T00:00:00",
-    }
-    common = {
-        "DealBoxType": 1, "MinPrice": 0, "DynamicDate": 0, "MaxNumberOfDeals": 30,
-        "DepartureCodes": ["TLV"], "ArrivalCodes": _LASTMINUTE_EUROPE,
-        "FlightDirectType": 1, "AirlineCodes": [], "FlightCabin": [], **window,
-    }
-    request = {
-        "flight": [{**common, "Title": "טיסות", "MaxPrice": 600, "ProductType": 0, "DataSorce": 0}],
-        "dynamic": [{**common, "Title": "חופשות", "MaxPrice": 900, "ProductType": 1,
-                     "DataSorce": 1, "StarsRating": 0, "MinNights": 2, "MaxNights": 30,
-                     "HotelName": ""}],
-        "flightToAnywhere": [],
-    }
-    with _client(Accept="application/json", Referer=base) as c:
-        r = c.get(f"{base}api/Deals/GetDeals",
-                  params={"request": json.dumps(request, ensure_ascii=False)})
-    r.raise_for_status()
-    out: list[VacationDeal] = []
-    for group in r.json() or []:
-        for d in group.get("Deals") or []:
-            price = _dec(d.get("PriceActual"))
-            title = _clean(d.get("Title"))
-            if price is None or price <= 0 or not title:
-                continue
-            is_package = d.get("ProductType") == 1
-            destination = re.sub(r"^(?:טיסות|טיסה\s*\+\s*מלון)\s+ל", "", title, count=1) or title
-            out.append(VacationDeal(
-                source="לאסט מינט", kind=KIND_PACKAGE if is_package else KIND_FLIGHT,
-                destination=destination, price=price.quantize(Decimal("1")),
-                currency=_currency(d.get("Currency")), url=_abs_url(base, d.get("Url")),
-                date_from=_date(d.get("DateFrom")), date_to=_date(d.get("DateTo")),
-                note=" · ".join(x for x in (
-                    _clean(d.get("SubTitle")), _clean(d.get("PricePrefix")),
-                ) if x),
-                includes=_includes(_FLIGHT_INCLUDED, "מלון", d.get("SubTitle")) if is_package else [],
-                adults=_int(d.get("Adults")) if is_package else 0,
-                children=(_int(d.get("Childs")) + _int(d.get("Youth"))) if is_package else 0,
-            ))
     return out
 
 
@@ -589,7 +684,6 @@ _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
     ("השטיח המעופף", _scan_flying_carpet),
     ("גוליבר", _scan_gulliver),
     ("חוליו", _scan_hulyo),
-    ("לאסט מינט", _scan_lastminute),
     ("טרווליסט", _scan_travelist),
     ("טיסות סודיות", _scan_secret_flights),
 )
@@ -597,20 +691,37 @@ _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
 
 # ---- Orchestrator ----
 
-def _rank(deals: list[VacationDeal], top_n: int) -> list[VacationDeal]:
-    """Cheapest first: one row per (source, destination), max 3 per destination."""
-    cheapest: dict[tuple[str, str], VacationDeal] = {}
+def _rank(deals: list[VacationDeal], top_n: int,
+          max_three_star: Optional[int] = None) -> list[VacationDeal]:
+    """Cheapest first: one row per (source, destination, hotel tier), max 3 per destination.
+
+    3★ packages are held to a third: at most one of a destination's three
+    rows, and at most `max_three_star` rows overall (default: a third of
+    `top_n`). A skipped 3★ row leaves its place to the next 4–5★ one.
+    """
+    if max_three_star is None:
+        max_three_star = _three_star_cap(top_n)
+    cheapest: dict[tuple[str, str, bool], VacationDeal] = {}
     for d in deals:
-        key = (d.source, d.destination)
+        key = (d.source, d.destination, _is_three_star(d))
         if key not in cheapest or d.price < cheapest[key].price:
             cheapest[key] = d
     # Non-dollar prices can't be compared without a rate, so they sort last.
     ordered = sorted(cheapest.values(), key=lambda d: (d.currency != "USD", d.price))
     per_destination: dict[str, int] = {}
+    three_per_destination: dict[str, int] = {}
+    three_total = 0
     out: list[VacationDeal] = []
     for d in ordered:
         if per_destination.get(d.destination, 0) >= _MAX_PER_DESTINATION:
             continue
+        if _is_three_star(d):
+            if (three_total >= max_three_star
+                    or three_per_destination.get(d.destination, 0)
+                    >= _three_star_cap(_MAX_PER_DESTINATION)):
+                continue
+            three_total += 1
+            three_per_destination[d.destination] = three_per_destination.get(d.destination, 0) + 1
         per_destination[d.destination] = per_destination.get(d.destination, 0) + 1
         out.append(d)
         if len(out) >= top_n:
@@ -618,18 +729,103 @@ def _rank(deals: list[VacationDeal], top_n: int) -> list[VacationDeal]:
     return out
 
 
+def _deal_label(d: VacationDeal) -> str:
+    return f"{d.source}: {d.destination}" + (f" ({d.country})" if d.country else "")
+
+
+def _country_code(d: VacationDeal) -> str:
+    hit = _continents.classify(d.destination, d.country)
+    return hit[0] if hit else ""
+
+
+def _classify(deals: list[VacationDeal]) -> tuple[list[VacationDeal], list[str]]:
+    """Set each deal's continent. Returns (placed deals, labels of unplaced deals).
+
+    Domestic deals (Israel, e.g. a flight to Eilat) are not trips abroad and
+    are dropped without counting as unplaced.
+    """
+    placed: list[VacationDeal] = []
+    unmapped: list[str] = []
+    for d in deals:
+        hit = _continents.classify(d.destination, d.country)
+        if hit is None:
+            unmapped.append(_deal_label(d))
+            log.warning("Vacation scan: no continent for %s", _deal_label(d))
+            continue
+        if hit[1] == _continents.DOMESTIC:
+            log.info("Vacation scan: domestic deal left out: %s", _deal_label(d))
+            continue
+        d.continent = hit[1]
+        placed.append(d)
+    return placed, unmapped
+
+
+def _select_asia(ranked: list[VacationDeal], limit: int) -> tuple[list[VacationDeal], list[str]]:
+    """Up to `limit` deals from `ranked` (already in display order), reserving a
+    slot for the cheapest Japan and the cheapest Thailand deal. Returns
+    (chosen, English names of required countries with no deal)."""
+    chosen: list[VacationDeal] = []
+    missing: list[str] = []
+    three_cap = _three_star_cap(limit)
+
+    def _fits(d: VacationDeal) -> bool:
+        """False for a 3★ row once a third of the list is already 3★."""
+        return not _is_three_star(d) or sum(map(_is_three_star, chosen)) < three_cap
+
+    for code in _ASIA_REQUIRED:
+        in_country = [d for d in ranked if _country_code(d) == code]
+        if not in_country:
+            missing.append(_continents.country_name(code))
+            continue
+        # Prefer one that keeps 3★ within a third; if the country only has
+        # 3★ left, the Japan/Thailand rule wins over the 3★ share.
+        pick = next((d for d in in_country if _fits(d)), in_country[0])
+        if len(chosen) < limit:
+            chosen.append(pick)
+    for d in ranked:
+        if len(chosen) >= limit:
+            break
+        if not any(c is d for c in chosen) and _fits(d):
+            chosen.append(d)
+    order = {id(d): i for i, d in enumerate(ranked)}
+    return sorted(chosen, key=lambda d: order[id(d)]), missing
+
+
+def _continent_groups(deals: list[VacationDeal], today: date) -> list[ContinentGroup]:
+    """One kind's deals (continent already set) -> a group per continent, in order."""
+    groups: list[ContinentGroup] = []
+    for continent in _continents.CONTINENT_ORDER:
+        days = _continent_days(continent)
+        limit = _continent_limit(continent)
+        last_day = today + timedelta(days=days)
+        candidates = [
+            d for d in deals
+            if d.continent == continent and d.date_from is not None
+            and today <= d.date_from <= last_day
+        ]
+        group = ContinentGroup(continent=continent, limit=limit, window_days=days)
+        if continent == _continents.ASIA:
+            # Rank everything; _select_asia applies the 3★ share to its 4 rows.
+            ranked = _rank(candidates, len(candidates) or 1, max_three_star=len(candidates))
+            group.deals, group.missing_required = _select_asia(ranked, limit)
+        else:
+            group.deals = _rank(candidates, limit)
+        groups.append(group)
+    return groups
+
+
 def scan_and_report() -> VacationReport:
-    """Scan every source in parallel and return the ranked report."""
+    """Scan every source in parallel and return the report, grouped by continent."""
     log.info("Running vacation deal scan across %d sites", len(_SOURCES))
     today = date.today()
     days = _window_days()
-    last_day = today + timedelta(days=days) if days else None
+    # The longest continent window (each is already capped by PW_DEALS_DAYS).
+    last_day = today + timedelta(days=max(_europe_days(), _other_days()))
     report = VacationReport(days_ahead=days)
 
     def _in_window(d: VacationDeal) -> bool:
-        if d.date_from is None:
-            return last_day is None  # undated deals can't be placed in a window
-        return d.date_from >= today and (last_day is None or d.date_from <= last_day)
+        # Undated deals can't be placed in a window.
+        return d.date_from is not None and today <= d.date_from <= last_day
 
     def _one(source: tuple[str, Callable[[], list[VacationDeal]]]):
         name, fn = source
@@ -642,6 +838,13 @@ def scan_and_report() -> VacationReport:
     with ThreadPoolExecutor(max_workers=len(_SOURCES)) as pool:
         for name, deals, error in pool.map(_one, _SOURCES):
             live = [d for d in deals if d.price > 0 and _in_window(d)]
+            kept = [d for d in live if _hotel_qualifies(d)]
+            if len(kept) < len(live):
+                log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 3–5★)",
+                         name, len(live) - len(kept),
+                         sum(1 for d in live if d.kind == KIND_PACKAGE))
+                report.dropped_low_star += len(live) - len(kept)
+            live = kept
             if error:
                 log.warning("Vacation scan: %s failed: %s", name, error)
             else:
@@ -650,9 +853,13 @@ def scan_and_report() -> VacationReport:
             found.extend(live)
 
     report.total_found = len(found)
-    top_n = _top_n()
-    report.packages = _rank([d for d in found if d.kind == KIND_PACKAGE], top_n)
-    report.flights = _rank([d for d in found if d.kind == KIND_FLIGHT], top_n)
+    placed, report.unmapped = _classify(found)
+    if report.unmapped:
+        log.warning("Vacation scan: %d deal(s) with no continent left out", len(report.unmapped))
+    report.package_groups = _continent_groups([d for d in placed if d.kind == KIND_PACKAGE], today)
+    report.flight_groups = _continent_groups([d for d in placed if d.kind == KIND_FLIGHT], today)
+    report.packages = [d for g in report.package_groups for d in g.deals]
+    report.flights = [d for g in report.flight_groups for d in g.deals]
     if not found:
         report.status = "fetch_failed"
         report.error = "לא נמצאו דילים באף אתר" + (f" ל-{days} הימים הקרובים" if days else "")
@@ -668,19 +875,30 @@ def print_report(report: VacationReport) -> None:
     if report.status != "ok":
         console.print(f"[red]Vacation scan failed:[/red] {report.error or ''}")
         return
-    for title, deals in (("Packages", report.packages), ("Flights", report.flights)):
-        table = Table(title=title, show_header=True, header_style="bold")
-        for col in ("#", "Price", "Destination", "Dates", "Nights", "Source", "Hotel / note"):
-            table.add_column(col)
-        for i, d in enumerate(deals, 1):
-            dates = (
-                f"{d.date_from:%d/%m}" + (f"-{d.date_to:%d/%m}" if d.date_to else "")
-                if d.date_from else "—"
-            )
-            table.add_row(
-                str(i), f"{d.price} {d.currency}",
-                d.destination + (f", {d.country}" if d.country else ""),
-                dates, str(d.nights_or_computed or "—"), d.source,
-                " · ".join(x for x in (d.hotel, d.note) if x)[:60],
-            )
-        console.print(table)
+    if report.unmapped:
+        console.print(f"  [yellow]{len(report.unmapped)} deal(s) with no continent left out:[/yellow] "
+                      + "; ".join(report.unmapped[:10]))
+    for kind, groups in (("Packages", report.package_groups), ("Flights", report.flight_groups)):
+        for g in groups:
+            title = (f"{kind} — {g.continent} ({len(g.deals)}/{g.limit}, "
+                     f"departing within {g.window_days} days)")
+            if g.missing_required:
+                title += f" — no {' / '.join(g.missing_required)} deal"
+            if not g.deals:
+                console.print(f"[dim]{title}: none[/dim]")
+                continue
+            table = Table(title=title, show_header=True, header_style="bold")
+            for col in ("#", "Price", "Destination", "Dates", "Nights", "Source", "Hotel / note"):
+                table.add_column(col)
+            for i, d in enumerate(g.deals, 1):
+                dates = (
+                    f"{d.date_from:%d/%m}" + (f"-{d.date_to:%d/%m}" if d.date_to else "")
+                    if d.date_from else "—"
+                )
+                table.add_row(
+                    str(i), f"{d.price} {d.currency}",
+                    d.destination + (f", {d.country}" if d.country else ""),
+                    dates, str(d.nights_or_computed or "—"), d.source,
+                    " · ".join(x for x in (d.hotel, d.note) if x)[:60],
+                )
+            console.print(table)

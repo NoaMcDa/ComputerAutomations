@@ -121,7 +121,7 @@ When you `add` a URL, tracking parameters (`utm_*`, `gclid`, `fbclid`, `ref`, �
 | Creatine | iHerb search (Israel store) | iHerb usually blocks plain requests, so this section needs Chromium. Powders only; first results page only. |
 | The Sims 4 | EA "all packs" store page | Only the first 50 packs the page serves are read; the email says so. |
 | Supermarket meat deals | Government-mandated price feeds: Shufersal, the chains on url.publishedprices.co.il, and Super Bareket (superbareket.binaprojects.com) | Stores in the enabled cities only — Herzliya and Ramat HaSharon by default (`PW_MEAT_CITIES`, or the `ON`/`OFF` column of `_REGIONS` in `supermarkets.py`). One table per category — one cut of one animal, fresh and frozen apart (e.g. "כנפיים עוף", "לשון בקר – קפוא") — with the `PW_TOP_PER_CATEGORY` cheapest deals (default 5), ranked by promo price per kg; each row shows the chain and its branches. Packaged items are converted by pack weight; deals whose weight is unknown, and catch-all groups such as "בשר – אחר", are counted but not ranked. A chain with no branch in the cities is listed as such. Each deal shows its end date. |
-| Vacation deals | Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Lastminute, Travelist, Secret Flights | See "Daily report and vacation deals". |
+| Vacation deals | Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Travelist, Secret Flights | See "Daily report and vacation deals". |
 | Facebook Marketplace | Marketplace search pages for `PW_FB_QUERIES` | Off (no section) while `PW_FB_QUERIES` is empty. Reports new listings and price drops of at least `PW_FB_MIN_DROP_ILS` ₪ and `PW_FB_MIN_DROP_PCT` %. Facebook often shows logged-out visitors a login wall; that is reported inside the section. Unverified against the live site; see `docs/facebook-marketplace.md`. |
 
 If a section's scan fails, the email says which one and why, and the subject line names the failed sections.
@@ -134,7 +134,21 @@ python -m price_watcher deals  [--dry-run] [--test]   # vacation deals only
 python -m price_watcher install-digest-schedule       # run `digest` daily at 09:00
 ```
 
-The daily report (`digest`) goes to `PW_EMAIL_TO` and ends with a vacation-deals section: the cheapest packages and flights from Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Lastminute, Travelist and Secret Flights (`src/price_watcher/vacations.py`).
+The daily report (`digest`) goes to `PW_EMAIL_TO` and ends with a vacation-deals section: the cheapest packages and flights from Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Travelist and Secret Flights (`src/price_watcher/vacations.py`). Packages need a 3–5★ hotel; 3★ hotels are at most one of each destination's rows and at most a third of each continent's rows.
+
+Packages and flights are each split by continent, in this order: Europe, Asia, North America, South America, Africa, Oceania. Within a continent the deals go cheapest first, with one deal per site and destination and at most 3 for the same destination.
+
+| Continent | Departures | Deals shown |
+|---|---|---|
+| Europe | today to today + `PW_DEALS_EUROPE_DAYS` (50) | up to `PW_DEALS_TOP` (15) |
+| Every other continent | today to today + `PW_DEALS_OTHER_DAYS` (365) | `PW_DEALS_OTHER_TOP` (4) each |
+
+- Asia's deals always include the cheapest Japan deal and the cheapest Thailand deal when one is on offer in the window. If there is none, the email says so in one line.
+- Georgia, Armenia, Azerbaijan, Cyprus and Turkey count as Europe. The UAE and Uzbekistan count as Asia. Egypt (Sinai included) counts as Africa.
+- Deals with no departure date are left out, since they can't be placed in a window. Domestic deals (e.g. a flight to Eilat) are left out as well.
+- The continent comes from the destination city or the country the site gives, in Hebrew or English (`src/price_watcher/continents.py`). A deal whose destination isn't in that table is left out, logged, and counted in the email; add the city to `_PLACES` to bring it in.
+- `PW_DEALS_DAYS` (default 0 = off) caps every window. `deals --days N` sets it for one run.
+- A continent with no deals gets one line ("no deals today for …") instead of an empty table.
 
 Addresses in `PW_DEALS_EMAIL_TO` (comma-separated) get a separate email with **only** the vacation deals each time `digest` runs. They never get the rest of the report.
 
