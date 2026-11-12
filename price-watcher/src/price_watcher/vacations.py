@@ -94,6 +94,9 @@ class VacationDeal:
     children: int = 0
     total_price: Optional[Decimal] = None  # whole-party price when the site gives it
 
+    # Hotel star rating as the site states it (4, 4.5, 5…); None when not given (#52).
+    stars: Optional[Decimal] = None
+
     @property
     def party_size(self) -> int:
         return self.adults + self.children
@@ -133,6 +136,9 @@ class VacationReport:
     total_found: int = 0            # before dedupe / top-N cut
     days_ahead: int = 0             # departure window applied (0 = none)
     error: Optional[str] = None
+
+    # Packages dropped because the hotel isn't a verified 4–5★ (#52).
+    dropped_low_star: int = 0
 
     @property
     def deals(self) -> list[VacationDeal]:
@@ -196,12 +202,55 @@ def _int(value: object) -> int:
 _FLIGHT_INCLUDED = "טיסה הלוך ושוב"
 
 
-def _hotel_line(name: object, stars: object = 0) -> str:
+def _stars(value: object) -> Optional[Decimal]:
+    """Hotel star rating as a Decimal: 4, '4.5', '4,5', '5★', '4 כוכבים'.
+
+    None when the value is missing, zero (= "not rated" on these sites) or not
+    a number, so an unknown rating can never pass as a good one.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        raw = str(value)
+    elif isinstance(value, str):
+        tokens = value.replace("★", " ").replace("*", " ").replace(",", ".").split()
+        raw = tokens[0] if tokens else ""
+    else:
+        return None
+    try:
+        d = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    if not d.is_finite() or d <= 0:
+        return None
+    return d.normalize()  # '4.50' -> 4.5, '5.0' -> 5
+
+
+def _star_label(stars: Optional[Decimal]) -> str:
+    """' (4★)' / ' (4.5★)', or '' when the rating is unknown."""
+    return f" ({stars:f}★)" if stars else ""
+
+
+_MIN_STARS = Decimal("4")
+_MAX_STARS = Decimal("5")
+
+
+def _hotel_qualifies(deal: VacationDeal) -> bool:
+    """Packages need a verified 4–5★ hotel (4, 4.5 and 5 pass); flights always pass.
+
+    A missing or unreadable rating fails: there's no fallback to lower-tier hotels.
+    """
+    if deal.kind != KIND_PACKAGE:
+        return True
+    stars = _stars(deal.stars)
+    return stars is not None and _MIN_STARS <= stars <= _MAX_STARS
+
+
+def _hotel_line(name: object, stars: object = None) -> str:
     name = _clean(name)
     if not name:
         return ""
-    n = _int(stars)
-    return f"מלון {name}" + (f" ({n}★)" if n else "")
+    return f"מלון {name}" + _star_label(_stars(stars))
 
 
 def _includes(*parts: object) -> list[str]:
@@ -252,6 +301,9 @@ def _scan_issta() -> list[VacationDeal]:
         inner = parse_qs(urlparse(href.replace("/loader?url=", "", 1)).query)
         desc_el = card.select_one('[itemprop="description"]')
         prefix_el = price_box.select_one(".deal-PricePrefix span")
+        # The card shows no rating; the package link carries the hotel star
+        # level the deal was priced at ("…&stars=3"). Organised tours have none.
+        stars = None if is_flight else _stars((inner.get("stars") or [None])[0])
         out.append(VacationDeal(
             source="איסתא", kind=KIND_FLIGHT if is_flight else KIND_PACKAGE,
             destination=destination, price=price,
@@ -263,10 +315,11 @@ def _scan_issta() -> list[VacationDeal]:
             note=_clean(prefix_el.get_text() if prefix_el else "").rstrip(":"),
             includes=[] if is_flight else _includes(
                 _FLIGHT_INCLUDED,
-                ("מלון: " + _clean(desc_el.get_text())) if desc_el else "מלון",
+                ("מלון: " + _clean(desc_el.get_text()) if desc_el else "מלון") + _star_label(stars),
             ),
             adults=_int((inner.get("adt1") or inner.get("padt") or [0])[0]),
             children=_int((inner.get("chd1") or inner.get("pchd") or [0])[0]),
+            stars=stars,
         ))
     return out
 
@@ -288,7 +341,7 @@ def _scan_eshet() -> list[VacationDeal]:
             destination = _clean(p.get("DestinationName"))
             if price is None or not destination:
                 continue
-            stars = p.get("Stars") or 0
+            stars = _stars(p.get("Stars"))
             hotel = _clean(p.get("HotelName") or p.get("SubTitle"))
             capacity = p.get("Capacity") or {}
             out.append(VacationDeal(
@@ -297,7 +350,7 @@ def _scan_eshet() -> list[VacationDeal]:
                 url=_abs_url(base, p.get("PromoLink")),
                 date_from=_date(p.get("StartDate")), date_to=_date(p.get("EndDate")),
                 nights=(p.get("Conditions") or {}).get("TotalNights") or None,
-                hotel=hotel + (f" ({stars}★)" if hotel and stars else ""),
+                hotel=hotel + (_star_label(stars) if hotel else ""),
                 note=_clean(p.get("BoardHebrew")),
                 includes=_includes(
                     _FLIGHT_INCLUDED, _hotel_line(hotel, stars), p.get("BoardHebrew"),
@@ -305,6 +358,7 @@ def _scan_eshet() -> list[VacationDeal]:
                 ),
                 adults=_int(capacity.get("Adults")), children=_int(capacity.get("Children")),
                 total_price=_dec(price_info.get("PriceAfterDiscount")),
+                stars=stars,
             ))
     return out
 
@@ -339,7 +393,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
         destination = _he(d.get("destinationName"))
         if price is None or not destination:
             continue
-        stars = d.get("stars") or 0
+        stars = _stars(d.get("stars"))
         hotel = _he(d.get("hotelName"))
         transfers = _clean(d.get("transfers"))
         if transfers:
@@ -361,7 +415,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             country=_he(d.get("destinationCountryName")).title(),
             date_from=_date(d.get("departureDate")), date_to=_date(d.get("arrivalDate")),
             nights=d.get("nights") or None,
-            hotel=hotel + (f" ({stars}★)" if hotel and stars else ""),
+            hotel=hotel + (_star_label(stars) if hotel else ""),
             note=_clean(d.get("priceRemark")),
             includes=_includes(
                 _FLIGHT_INCLUDED, _hotel_line(hotel, stars), _he(d.get("boardBasisName")),
@@ -369,6 +423,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             ),
             adults=_int(d.get("adult")), children=_int(d.get("child")),
             total_price=_dec((d.get("discountedPrice") or {}).get("price")),
+            stars=stars,
         ))
     return out
 
@@ -397,8 +452,9 @@ def _scan_gulliver() -> list[VacationDeal]:
                 continue
             destination, _, country = title.partition(",")
             deal_type = _clean(d.get("DealTypeTitle"))
+            stars = _stars(d.get("HotelStars"))  # charter flights send the string "0"
             is_package = bool(
-                d.get("HotelId") or d.get("HotelStars")
+                d.get("HotelId") or stars
                 or "חביל" in deal_type or "מלון" in deal_type
             )
             d_from, d_to = _date_range(d.get("DatesTitle"))
@@ -418,6 +474,7 @@ def _scan_gulliver() -> list[VacationDeal]:
                     d.get("BoardDescription"),
                 ) if is_package else [],
                 adults=_int(d.get("NumOfAdults")), children=_int(d.get("NumOfChildren")),
+                stars=stars if is_package else None,
             ))
     return out
 
@@ -475,6 +532,7 @@ def _scan_hulyo() -> list[VacationDeal]:
                     ) if kind == KIND_PACKAGE else [],
                     adults=pax.count("A") if kind == KIND_PACKAGE else 0,
                     children=pax.count("C") if kind == KIND_PACKAGE else 0,
+                    stars=_stars(hotel.get("rating")) if kind == KIND_PACKAGE else None,
                 ))
     return out
 
@@ -518,6 +576,9 @@ def _scan_lastminute() -> list[VacationDeal]:
             if price is None or price <= 0 or not title:
                 continue
             is_package = d.get("ProductType") == 1
+            # No star rating in the deal data and the link is a search-results
+            # page, not one hotel, so `stars` stays unknown and the 4–5★ filter
+            # drops these packages rather than guessing (#52).
             destination = re.sub(r"^(?:טיסות|טיסה\s*\+\s*מלון)\s+ל", "", title, count=1) or title
             out.append(VacationDeal(
                 source="לאסט מינט", kind=KIND_PACKAGE if is_package else KIND_FLIGHT,
@@ -642,6 +703,13 @@ def scan_and_report() -> VacationReport:
     with ThreadPoolExecutor(max_workers=len(_SOURCES)) as pool:
         for name, deals, error in pool.map(_one, _SOURCES):
             live = [d for d in deals if d.price > 0 and _in_window(d)]
+            kept = [d for d in live if _hotel_qualifies(d)]
+            if len(kept) < len(live):
+                log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 4–5★)",
+                         name, len(live) - len(kept),
+                         sum(1 for d in live if d.kind == KIND_PACKAGE))
+                report.dropped_low_star += len(live) - len(kept)
+            live = kept
             if error:
                 log.warning("Vacation scan: %s failed: %s", name, error)
             else:
