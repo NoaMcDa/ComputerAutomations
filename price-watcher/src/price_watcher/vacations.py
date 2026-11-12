@@ -162,6 +162,12 @@ _ASIA_REQUIRED = ("JP", "TH")
 
 # ---- Data model ----
 
+# Luggage states of a deal (VacationDeal.luggage).
+LUGGAGE_SUITCASE = "suitcase"   # checked suitcase included (a carry-on may be too)
+LUGGAGE_CARRY_ON = "carry_on"   # only a carry-on / trolley included
+LUGGAGE_NONE = "none"           # the site says no luggage is included
+LUGGAGE_UNKNOWN = "unknown"     # the site doesn't say
+
 @dataclass
 class VacationDeal:
     source: str                     # site display name (Hebrew)
@@ -184,6 +190,18 @@ class VacationDeal:
 
     # Hotel star rating as the site states it (4, 4.5, 5…); None when not given (#52).
     stars: Optional[Decimal] = None
+
+    # Luggage as the site states it: LUGGAGE_SUITCASE / LUGGAGE_CARRY_ON /
+    # LUGGAGE_NONE, or LUGGAGE_UNKNOWN when the site doesn't say.
+    luggage: str = LUGGAGE_UNKNOWN
+    # Add-on price per person the site quotes when luggage is not included
+    # (e.g. "trolley $25 per leg"), as free text; "" when not given.
+    luggage_extra: str = ""
+
+    @property
+    def has_luggage(self) -> bool:
+        """True when at least a carry-on is included (a trolley is enough)."""
+        return self.luggage in (LUGGAGE_SUITCASE, LUGGAGE_CARRY_ON)
 
     @property
     def party_size(self) -> int:
