@@ -222,3 +222,30 @@ def test_sites_without_luggage_data_stay_unknown(monkeypatch):
         for d in deals:
             assert (d.luggage, d.luggage_extra) == (UNKNOWN, ""), scan.__name__
             assert not d.has_luggage
+
+
+# ---- Flying Carpet deal link (the API's selectedPackageUrl opens an empty page)
+
+def test_flying_deal_url_uses_the_site_card_format():
+    from urllib.parse import parse_qs, urlparse
+    from price_watcher import vacations as V
+    d = {"categoryId": "vacation_pack", "departureDate": "2026-11-16", "arrivalDate": "2026-11-19",
+         "flightDestinationCode": "BUD", "hotelId": 53968, "packageId": 235512,
+         "id": "6af137ae3458d82ee1211448", "adult": 2, "child": 1, "infant": 0,
+         "selectedPackageUrl": "/product-page?packId=235512&laId=53968"}
+    url = V._flying_deal_url("https://www.flying.co.il", d)
+    parts = urlparse(url)
+    assert parts.path == "/product-page"
+    q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    assert q == {"packCateg": "vacation_pack", "packageDates": "2026-11-16,2026-11-19",
+                 "hotelSupplier": "FlyingCarpet", "flightDestCode": "BUD", "hotelCode": "53968",
+                 "paxByRoom": "2,1,0", "packageIds": "235512",
+                 "dealId": "6af137ae3458d82ee1211448"}
+    assert "packId=" not in url
+
+
+def test_flying_deal_url_falls_back_when_fields_missing():
+    from price_watcher import vacations as V
+    d = {"selectedPackageUrl": "/product-page?packId=1&laId=2", "departureDate": "2026-11-16"}
+    assert V._flying_deal_url("https://www.flying.co.il", d) == \
+        "https://www.flying.co.il/product-page?packId=1&laId=2"

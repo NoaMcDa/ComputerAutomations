@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -676,7 +676,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
         out.append(VacationDeal(
             source="השטיח המעופף", kind=KIND_PACKAGE, destination=destination, price=price,
             currency=_currency(d.get("currenySymbol")),
-            url=_abs_url(base, d.get("selectedPackageUrl")),
+            url=_flying_deal_url(base, d),
             country=_he(d.get("destinationCountryName")).title(),
             date_from=_date(d.get("departureDate")), date_to=_date(d.get("arrivalDate")),
             nights=d.get("nights") or None,
@@ -692,6 +692,32 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             luggage=luggage, luggage_extra=luggage_extra,
         ))
     return out
+
+
+def _flying_deal_url(base: str, d: dict) -> str:
+    """Link to one Flying Carpet deal, in the format the site's own deal cards use.
+
+    The API's `selectedPackageUrl` (product-page?packId=…&laId=…) is an older
+    format: the site now opens it as an empty product page. The home page links
+    deals as product-page?packCateg=…&packageDates=from,to&hotelCode=…&packageIds=….
+    Falls back to the API's link when a needed field is missing.
+    """
+    first, last = _date(d.get("departureDate")), _date(d.get("arrivalDate"))
+    needed = (d.get("categoryId"), first, last, d.get("flightDestinationCode"),
+              d.get("hotelId"), d.get("packageId"), d.get("id"))
+    if not all(needed):
+        return _abs_url(base, d.get("selectedPackageUrl"))
+    params = {
+        "packCateg": d["categoryId"],
+        "packageDates": f"{first.isoformat()},{last.isoformat()}",
+        "hotelSupplier": "FlyingCarpet",
+        "flightDestCode": d["flightDestinationCode"],
+        "hotelCode": d["hotelId"],
+        "paxByRoom": f"{_int(d.get('adult')) or 2},{_int(d.get('child'))},{_int(d.get('infant'))}",
+        "packageIds": d["packageId"],
+        "dealId": d["id"],
+    }
+    return f"{base}/product-page?" + urlencode(params, safe=",")
 
 
 def _scan_gulliver() -> list[VacationDeal]:
