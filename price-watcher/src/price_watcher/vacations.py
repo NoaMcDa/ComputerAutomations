@@ -15,9 +15,23 @@ pages and merges them into one ranked list:
 Every source is plain HTTP, runs independently, and a failing source never
 sinks the others. Prices are per person as each site states them.
 
-The report keeps, for packages and for flights separately, the cheapest
-`PW_DEALS_TOP` deals (default 15): one deal per source and destination, and
-at most `_MAX_PER_DESTINATION` rows for the same destination.
+For packages and for flights separately, the report groups the deals by
+continent (see `continents.py`) in this order: Europe, Asia, North America,
+South America, Africa, Oceania. Within a continent it ranks cheapest first,
+one deal per source and destination and at most `_MAX_PER_DESTINATION` rows
+for the same destination, and keeps:
+
+  Europe       departures today .. today + PW_DEALS_EUROPE_DAYS (50),
+               up to PW_DEALS_TOP deals (15)
+  elsewhere    departures today .. today + PW_DEALS_OTHER_DAYS (365),
+               PW_DEALS_OTHER_TOP deals per continent (4)
+  Asia         its deals include the cheapest Japan and the cheapest
+               Thailand deal whenever one exists in the window; a missing
+               one is recorded on the group so the email can say so.
+
+Undated deals can't be placed in a window and are left out, as are deals
+whose destination can't be placed on a continent (logged and counted).
+PW_DEALS_DAYS, when set, caps every window.
 """
 
 from __future__ import annotations
@@ -37,6 +51,7 @@ from bs4 import BeautifulSoup
 from rich.console import Console
 from rich.table import Table
 
+from price_watcher import continents as _continents
 from price_watcher import logging_setup
 from price_watcher.http_headers import USER_AGENT
 
@@ -58,19 +73,53 @@ _MAX_PER_DESTINATION = 3
 _CURRENCY_CODES = {"$": "USD", "₪": "ILS", "€": "EUR", "£": "GBP"}
 
 
-def _window_days() -> int:
-    """Only keep deals departing within this many days. 0 (default) = no limit."""
+def _env_int(name: str, default: int, minimum: int) -> int:
     try:
-        return max(0, int(os.environ.get("PW_DEALS_DAYS", "0")))
+        return max(minimum, int(os.environ.get(name, str(default))))
     except ValueError:
-        return 0
+        return default
+
+
+def _window_days() -> int:
+    """Global cap on the departure window (PW_DEALS_DAYS). 0 (default) = none."""
+    return _env_int("PW_DEALS_DAYS", 0, 0)
 
 
 def _top_n() -> int:
-    try:
-        return max(1, int(os.environ.get("PW_DEALS_TOP", "15")))
-    except ValueError:
-        return 15
+    """How many Europe deals to keep per list (PW_DEALS_TOP)."""
+    return _env_int("PW_DEALS_TOP", 15, 1)
+
+
+def _other_top() -> int:
+    """How many deals to keep per non-Europe continent (PW_DEALS_OTHER_TOP)."""
+    return _env_int("PW_DEALS_OTHER_TOP", 4, 1)
+
+
+def _capped(days: int) -> int:
+    cap = _window_days()
+    return min(days, cap) if cap else days
+
+
+def _europe_days() -> int:
+    """Europe departure window in days (PW_DEALS_EUROPE_DAYS), capped by PW_DEALS_DAYS."""
+    return _capped(_env_int("PW_DEALS_EUROPE_DAYS", 50, 0))
+
+
+def _other_days() -> int:
+    """Departure window of every other continent (PW_DEALS_OTHER_DAYS), capped by PW_DEALS_DAYS."""
+    return _capped(_env_int("PW_DEALS_OTHER_DAYS", 365, 0))
+
+
+def _continent_days(continent: str) -> int:
+    return _europe_days() if continent == _continents.EUROPE else _other_days()
+
+
+def _continent_limit(continent: str) -> int:
+    return _top_n() if continent == _continents.EUROPE else _other_top()
+
+
+# Asia must show at least one deal for each of these (ISO-2) when one exists.
+_ASIA_REQUIRED = ("JP", "TH")
 
 
 # ---- Data model ----
@@ -93,6 +142,7 @@ class VacationDeal:
     adults: int = 0                 # party the site priced the deal for (0 = not stated)
     children: int = 0
     total_price: Optional[Decimal] = None  # whole-party price when the site gives it
+    continent: str = ""             # continents.EUROPE / ASIA / ... (set by scan_and_report)
 
     @property
     def party_size(self) -> int:
@@ -125,18 +175,39 @@ class SourceStatus:
 
 
 @dataclass
+class ContinentGroup:
+    """The deals of one kind (packages or flights) shown for one continent."""
+    continent: str                  # continents.EUROPE / ASIA / ...
+    deals: list[VacationDeal] = field(default_factory=list)
+    limit: int = 0                  # most deals this continent may show
+    window_days: int = 0            # departures from today to today + window_days
+    missing_required: list[str] = field(default_factory=list)  # e.g. ["Thailand"]: none in the window
+
+    @property
+    def title_he(self) -> str:
+        return _continents.CONTINENT_HE.get(self.continent, self.continent)
+
+
+@dataclass
 class VacationReport:
     status: str = "ok"              # "ok" / "fetch_failed"
-    packages: list[VacationDeal] = field(default_factory=list)
-    flights: list[VacationDeal] = field(default_factory=list)
+    packages: list[VacationDeal] = field(default_factory=list)  # every package shown, in display order
+    flights: list[VacationDeal] = field(default_factory=list)   # every flight shown, in display order
     sources: list[SourceStatus] = field(default_factory=list)
     total_found: int = 0            # before dedupe / top-N cut
-    days_ahead: int = 0             # departure window applied (0 = none)
+    days_ahead: int = 0             # global departure cap PW_DEALS_DAYS (0 = none)
     error: Optional[str] = None
+    package_groups: list[ContinentGroup] = field(default_factory=list)  # by continent, display order
+    flight_groups: list[ContinentGroup] = field(default_factory=list)
+    unmapped: list[str] = field(default_factory=list)  # "source: destination (country)" left out
 
     @property
     def deals(self) -> list[VacationDeal]:
         return self.packages + self.flights
+
+    @property
+    def unmapped_count(self) -> int:
+        return len(self.unmapped)
 
 
 # ---- Small parsing helpers ----
@@ -481,34 +552,66 @@ def _scan_hulyo() -> list[VacationDeal]:
 
 _LASTMINUTE_EUROPE = [
     "BER", "MAD", "BCN", "BUS", "ZRH", "VCE", "SOF", "GVA", "ROM", "CHQ", "SKG", "ZTH",
-    "JTR", "AMS", "ATH", "CFU", "KGS", "HER", "JMK", "RHO", "PRG", "PAR", "DXB", "LON",
+    "JTR", "AMS", "ATH", "CFU", "KGS", "HER", "JMK", "RHO", "PRG", "PAR", "LON",
     "LCA", "LIS", "TBS", "TIV", "BOJ", "BAK", "PAS", "PFO", "VIE", "MIL", "OTP", "WAW",
-    "BUD", "SEZ",
+    "BUD",
+]
+# Each group is asked for in its own box, so cheaper deals elsewhere don't
+# crowd it out of the per-box cap (30). Japan and Thailand get boxes of their
+# own because the Asia list must include both. Codes the site doesn't sell
+# are simply ignored by the API.
+_LASTMINUTE_JAPAN = ["TYO", "NRT", "OSA", "KIX"]
+_LASTMINUTE_THAILAND = ["BKK", "HKT", "USM", "CNX", "KBV"]
+_LASTMINUTE_ASIA = [  # rest of Asia, incl. the Gulf and Uzbekistan
+    "DXB", "AUH", "TAS", "SKD", "CMB", "MLE", "HAN", "SGN", "PQC", "DPS", "SIN", "HKG",
+    "DEL", "GOI", "BOM", "MNL", "ICN", "SEL", "PEK", "PVG", "KTM",
+]
+_LASTMINUTE_OTHER = [
+    "JFK", "NYC", "LAX", "MIA", "YTO", "YYZ", "MEX", "CUN", "HAV", "PUJ", "SJO",  # N. America
+    "BUE", "EZE", "GRU", "RIO", "SAO", "LIM", "BOG", "SCL",                       # S. America
+    "SEZ", "ZNZ", "MRU", "CPT", "JNB", "NBO", "RAK", "CMN", "SSH", "HRG", "ADD",  # Africa
+    "SYD", "MEL", "AKL", "BNE", "PER",                                            # Oceania
 ]
 
 
 def _scan_lastminute() -> list[VacationDeal]:
     base = "https://www.lastminute.co.il/"
     today = date.today()
-    window = {
-        "FromDate": f"{today.isoformat()}T00:00:00",
-        "MaxFromDate": f"{(today + timedelta(days=_window_days() or 240)).isoformat()}T00:00:00",
-    }
-    common = {
-        "DealBoxType": 1, "MinPrice": 0, "DynamicDate": 0, "MaxNumberOfDeals": 30,
-        "DepartureCodes": ["TLV"], "ArrivalCodes": _LASTMINUTE_EUROPE,
-        "FlightDirectType": 1, "AirlineCodes": [], "FlightCabin": [], **window,
-    }
+
+    def _box(codes: list[str], days: int, title: str) -> dict:
+        return {
+            "DealBoxType": 1, "MinPrice": 0, "DynamicDate": 0, "MaxNumberOfDeals": 30,
+            "DepartureCodes": ["TLV"], "ArrivalCodes": codes,
+            "FlightDirectType": 1, "AirlineCodes": [], "FlightCabin": [],
+            "FromDate": f"{today.isoformat()}T00:00:00",
+            "MaxFromDate": f"{(today + timedelta(days=days)).isoformat()}T00:00:00",
+            "Title": title,
+        }
+
+    # (arrival codes, departure window, max flight price, max package price)
+    boxes = (
+        (_LASTMINUTE_EUROPE, _europe_days(), 600, 900),
+        (_LASTMINUTE_JAPAN, _other_days(), 2500, 4000),
+        (_LASTMINUTE_THAILAND, _other_days(), 2500, 4000),
+        (_LASTMINUTE_ASIA, _other_days(), 2500, 4000),
+        (_LASTMINUTE_OTHER, _other_days(), 2500, 4000),
+    )
     request = {
-        "flight": [{**common, "Title": "טיסות", "MaxPrice": 600, "ProductType": 0, "DataSorce": 0}],
-        "dynamic": [{**common, "Title": "חופשות", "MaxPrice": 900, "ProductType": 1,
+        "flight": [{**_box(codes, days, "f"), "MaxPrice": max_flight, "ProductType": 0,
+                    "DataSorce": 0}
+                   for codes, days, max_flight, _ in boxes],
+        "dynamic": [{**_box(codes, days, "p"), "MaxPrice": max_package, "ProductType": 1,
                      "DataSorce": 1, "StarsRating": 0, "MinNights": 2, "MaxNights": 30,
-                     "HotelName": ""}],
+                     "HotelName": ""}
+                    for codes, days, _, max_package in boxes],
         "flightToAnywhere": [],
     }
     with _client(Accept="application/json", Referer=base) as c:
+        # Compact JSON: ten boxes in a query string (~7 KB); the server
+        # rejects (414) URLs much longer than that.
         r = c.get(f"{base}api/Deals/GetDeals",
-                  params={"request": json.dumps(request, ensure_ascii=False)})
+                  params={"request": json.dumps(request, ensure_ascii=False,
+                                                separators=(",", ":"))})
     r.raise_for_status()
     out: list[VacationDeal] = []
     for group in r.json() or []:
@@ -618,18 +721,92 @@ def _rank(deals: list[VacationDeal], top_n: int) -> list[VacationDeal]:
     return out
 
 
+def _deal_label(d: VacationDeal) -> str:
+    return f"{d.source}: {d.destination}" + (f" ({d.country})" if d.country else "")
+
+
+def _country_code(d: VacationDeal) -> str:
+    hit = _continents.classify(d.destination, d.country)
+    return hit[0] if hit else ""
+
+
+def _classify(deals: list[VacationDeal]) -> tuple[list[VacationDeal], list[str]]:
+    """Set each deal's continent. Returns (placed deals, labels of unplaced deals).
+
+    Domestic deals (Israel, e.g. a flight to Eilat) are not trips abroad and
+    are dropped without counting as unplaced.
+    """
+    placed: list[VacationDeal] = []
+    unmapped: list[str] = []
+    for d in deals:
+        hit = _continents.classify(d.destination, d.country)
+        if hit is None:
+            unmapped.append(_deal_label(d))
+            log.warning("Vacation scan: no continent for %s", _deal_label(d))
+            continue
+        if hit[1] == _continents.DOMESTIC:
+            log.info("Vacation scan: domestic deal left out: %s", _deal_label(d))
+            continue
+        d.continent = hit[1]
+        placed.append(d)
+    return placed, unmapped
+
+
+def _select_asia(ranked: list[VacationDeal], limit: int) -> tuple[list[VacationDeal], list[str]]:
+    """Up to `limit` deals from `ranked` (already in display order), reserving a
+    slot for the cheapest Japan and the cheapest Thailand deal. Returns
+    (chosen, English names of required countries with no deal)."""
+    chosen: list[VacationDeal] = []
+    missing: list[str] = []
+    for code in _ASIA_REQUIRED:
+        pick = next((d for d in ranked if _country_code(d) == code), None)
+        if pick is None:
+            missing.append(_continents.country_name(code))
+        elif len(chosen) < limit:
+            chosen.append(pick)
+    for d in ranked:
+        if len(chosen) >= limit:
+            break
+        if not any(c is d for c in chosen):
+            chosen.append(d)
+    order = {id(d): i for i, d in enumerate(ranked)}
+    return sorted(chosen, key=lambda d: order[id(d)]), missing
+
+
+def _continent_groups(deals: list[VacationDeal], today: date) -> list[ContinentGroup]:
+    """One kind's deals (continent already set) -> a group per continent, in order."""
+    groups: list[ContinentGroup] = []
+    for continent in _continents.CONTINENT_ORDER:
+        days = _continent_days(continent)
+        limit = _continent_limit(continent)
+        last_day = today + timedelta(days=days)
+        candidates = [
+            d for d in deals
+            if d.continent == continent and d.date_from is not None
+            and today <= d.date_from <= last_day
+        ]
+        group = ContinentGroup(continent=continent, limit=limit, window_days=days)
+        if continent == _continents.ASIA:
+            ranked = _rank(candidates, len(candidates) or 1)
+            group.deals, group.missing_required = _select_asia(ranked, limit)
+        else:
+            group.deals = _rank(candidates, limit)
+        groups.append(group)
+    return groups
+
+
 def scan_and_report() -> VacationReport:
-    """Scan every source in parallel and return the ranked report."""
+    """Scan every source in parallel and return the report, grouped by continent."""
     log.info("Running vacation deal scan across %d sites", len(_SOURCES))
     today = date.today()
     days = _window_days()
-    last_day = today + timedelta(days=days) if days else None
+    # The longest continent window (each is already capped by PW_DEALS_DAYS).
+    last_day = today + timedelta(days=max(_europe_days(), _other_days()))
     report = VacationReport(days_ahead=days)
 
     def _in_window(d: VacationDeal) -> bool:
-        if d.date_from is None:
-            return last_day is None  # undated deals can't be placed in a window
-        return d.date_from >= today and (last_day is None or d.date_from <= last_day)
+        # Undated deals can't be placed in a window.
+        return d.date_from is not None and today <= d.date_from <= last_day
 
     def _one(source: tuple[str, Callable[[], list[VacationDeal]]]):
         name, fn = source
@@ -650,9 +827,13 @@ def scan_and_report() -> VacationReport:
             found.extend(live)
 
     report.total_found = len(found)
-    top_n = _top_n()
-    report.packages = _rank([d for d in found if d.kind == KIND_PACKAGE], top_n)
-    report.flights = _rank([d for d in found if d.kind == KIND_FLIGHT], top_n)
+    placed, report.unmapped = _classify(found)
+    if report.unmapped:
+        log.warning("Vacation scan: %d deal(s) with no continent left out", len(report.unmapped))
+    report.package_groups = _continent_groups([d for d in placed if d.kind == KIND_PACKAGE], today)
+    report.flight_groups = _continent_groups([d for d in placed if d.kind == KIND_FLIGHT], today)
+    report.packages = [d for g in report.package_groups for d in g.deals]
+    report.flights = [d for g in report.flight_groups for d in g.deals]
     if not found:
         report.status = "fetch_failed"
         report.error = "לא נמצאו דילים באף אתר" + (f" ל-{days} הימים הקרובים" if days else "")
@@ -668,19 +849,30 @@ def print_report(report: VacationReport) -> None:
     if report.status != "ok":
         console.print(f"[red]Vacation scan failed:[/red] {report.error or ''}")
         return
-    for title, deals in (("Packages", report.packages), ("Flights", report.flights)):
-        table = Table(title=title, show_header=True, header_style="bold")
-        for col in ("#", "Price", "Destination", "Dates", "Nights", "Source", "Hotel / note"):
-            table.add_column(col)
-        for i, d in enumerate(deals, 1):
-            dates = (
-                f"{d.date_from:%d/%m}" + (f"-{d.date_to:%d/%m}" if d.date_to else "")
-                if d.date_from else "—"
-            )
-            table.add_row(
-                str(i), f"{d.price} {d.currency}",
-                d.destination + (f", {d.country}" if d.country else ""),
-                dates, str(d.nights_or_computed or "—"), d.source,
-                " · ".join(x for x in (d.hotel, d.note) if x)[:60],
-            )
-        console.print(table)
+    if report.unmapped:
+        console.print(f"  [yellow]{len(report.unmapped)} deal(s) with no continent left out:[/yellow] "
+                      + "; ".join(report.unmapped[:10]))
+    for kind, groups in (("Packages", report.package_groups), ("Flights", report.flight_groups)):
+        for g in groups:
+            title = (f"{kind} — {g.continent} ({len(g.deals)}/{g.limit}, "
+                     f"departing within {g.window_days} days)")
+            if g.missing_required:
+                title += f" — no {' / '.join(g.missing_required)} deal"
+            if not g.deals:
+                console.print(f"[dim]{title}: none[/dim]")
+                continue
+            table = Table(title=title, show_header=True, header_style="bold")
+            for col in ("#", "Price", "Destination", "Dates", "Nights", "Source", "Hotel / note"):
+                table.add_column(col)
+            for i, d in enumerate(g.deals, 1):
+                dates = (
+                    f"{d.date_from:%d/%m}" + (f"-{d.date_to:%d/%m}" if d.date_to else "")
+                    if d.date_from else "—"
+                )
+                table.add_row(
+                    str(i), f"{d.price} {d.currency}",
+                    d.destination + (f", {d.country}" if d.country else ""),
+                    dates, str(d.nights_or_computed or "—"), d.source,
+                    " · ".join(x for x in (d.hotel, d.note) if x)[:60],
+                )
+            console.print(table)

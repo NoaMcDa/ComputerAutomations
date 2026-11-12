@@ -136,6 +136,20 @@ python -m price_watcher install-digest-schedule       # run `digest` daily at 09
 
 The daily report (`digest`) goes to `PW_EMAIL_TO` and ends with a vacation-deals section: the cheapest packages and flights from Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Lastminute, Travelist and Secret Flights (`src/price_watcher/vacations.py`).
 
+Packages and flights are each split by continent, in this order: Europe, Asia, North America, South America, Africa, Oceania. Within a continent the deals go cheapest first, with one deal per site and destination and at most 3 for the same destination.
+
+| Continent | Departures | Deals shown |
+|---|---|---|
+| Europe | today to today + `PW_DEALS_EUROPE_DAYS` (50) | up to `PW_DEALS_TOP` (15) |
+| Every other continent | today to today + `PW_DEALS_OTHER_DAYS` (365) | `PW_DEALS_OTHER_TOP` (4) each |
+
+- Asia's deals always include the cheapest Japan deal and the cheapest Thailand deal when one is on offer in the window. If there is none, the email says so in one line.
+- Georgia, Armenia, Azerbaijan, Cyprus and Turkey count as Europe. The UAE and Uzbekistan count as Asia. Egypt (Sinai included) counts as Africa.
+- Deals with no departure date are left out, since they can't be placed in a window. Domestic deals (e.g. a flight to Eilat) are left out as well.
+- The continent comes from the destination city or the country the site gives, in Hebrew or English (`src/price_watcher/continents.py`). A deal whose destination isn't in that table is left out, logged, and counted in the email; add the city to `_PLACES` to bring it in.
+- `PW_DEALS_DAYS` (default 0 = off) caps every window. `deals --days N` sets it for one run.
+- A continent with no deals gets one line ("no deals today for …") instead of an empty table.
+
 Addresses in `PW_DEALS_EMAIL_TO` (comma-separated) get a separate email with **only** the vacation deals each time `digest` runs. They never get the rest of the report.
 
 `--test` is for trying things out: `digest --test` emails only `PW_EMAIL_TO` and saves nothing; `deals --test` sends the deals-only email to `PW_EMAIL_TO` instead of the deals-only recipients.
