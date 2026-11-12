@@ -1,0 +1,10 @@
+{
+  "_comment": "Synthetic fixture modelled on the assumed Tabit temp-reservations 'no exact match' response (unverified live). Times are UTC; Israel is UTC+2 in Nov-Dec.",
+  "alternative_results": [
+    {"reserved_from": "2026-11-13T17:15:00.000Z", "preference": "inside"},
+    {"reserved_from": "2026-11-13T19:00:00.000Z", "preference": "bar"},
+    {"reserved_from": "2026-11-13T21:45:00.000Z", "preference": "inside"},
+    {"reserved_from": "2026-11-14T18:00:00.000Z", "preference": "inside"},
+    {"preference": "inside"}
+  ]
+}

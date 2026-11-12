@@ -1,0 +1,11 @@
+# Runtime
+requests>=2.31,<3
+# Windows has no system time-zone database; needed for Asia/Jerusalem.
+tzdata>=2024.1; sys_platform == "win32"
+
+# Tests
+pytest>=7.4
+
+# Optional, not used by default. A headless-browser fallback could be added
+# later if the JSON endpoints start requiring JavaScript challenges.
+# playwright>=1.45

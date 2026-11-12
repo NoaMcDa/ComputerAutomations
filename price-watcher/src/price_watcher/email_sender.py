@@ -1,10 +1,13 @@
-"""Email notifications for price / stock / promo changes.
+"""Email notifications for price / stock / promo changes and the daily report.
 
 Public API
 ----------
 send_change_notification(events)  -> bool
 send_test_email()                 -> None   (raises on failure)
 build_payload(events)             -> EmailPayload | None
+describe_failure(fetch)           -> dict   (status / detail / hint, Hebrew)
+build_daily_payload(report)       -> EmailPayload | None
+send_daily_email(report)          -> bool
 """
 
 from __future__ import annotations
@@ -16,19 +19,21 @@ from html import escape
 from urllib.parse import urlparse
 
 from price_watcher import config as _config_module
-from price_watcher.contracts import ChangeEvent, ChangeType, EmailPayload
+from price_watcher.contracts import (
+    NOTIFIABLE_TYPES,
+    ChangeEvent,
+    ChangeType,
+    EmailPayload,
+    FetchResult,
+    FetchStatus,
+    PromoInfo,
+)
 from price_watcher.logging_setup import get as _get_logger
 
 log = _get_logger(__name__)
 
-# Change types that warrant an email.
-_NOTIFIABLE = {
-    ChangeType.PRICE_CHANGED,
-    ChangeType.STOCK_CHANGED,
-    ChangeType.PROMO_CHANGED,
-    ChangeType.THRESHOLD_FAILURE,
-    ChangeType.RECOVERED,
-}
+# Change types that warrant an email (kept under the old private name).
+_NOTIFIABLE = NOTIFIABLE_TYPES
 
 # Well-known currency symbols.
 _CURRENCY_SYMBOLS: dict[str, str] = {
@@ -62,34 +67,60 @@ def _truncate(s: str, max_len: int = 35) -> str:
     return s[: max_len - 1] + "…"
 
 
+def _num(price: Decimal | None) -> str:
+    """Format a price: thousands separators, agorot only when non-zero.
+
+    499 -> "499", 1299.9 -> "1,299.90", 19.90 -> "19.90".
+    """
+    if price is None:
+        return "?"
+    text = f"{price:,.2f}"
+    return text[:-3] if text.endswith(".00") else text
+
+
 def _fmt_price(price: Decimal | None, symbol: str) -> str:
     if price is None:
         return "?"
-    return f"{price:,.2f} {symbol}".rstrip("0").rstrip(".")
+    return f"{_num(price)} {symbol}"
 
 
-def _direction_word(pct: float | None) -> str:
+def _direction_word(pct: float | None, diff: Decimal | None = None) -> str:
     """Internal (English) direction key — see _DIRECTION_HE for display."""
+    if diff is not None:
+        if diff < 0:
+            return "dropped"
+        if diff > 0:
+            return "rose"
     if pct is None:
         return "changed"
     return "dropped" if pct < 0 else "rose"
 
 
-_DIRECTION_HE = {"dropped": "ירד", "rose": "עלה", "changed": "השתנה"}
+_DIRECTION_HE = {
+    "dropped": "ירד", "rose": "עלה", "changed": "השתנה",
+    # creatine: a different product took the lead at the identical price
+    "same_price": "נשאר זהה (מוצר אחר)",
+}
 
 _STATUS_HE = {
+    "ok": "תקין",
     "unreachable": "האתר לא זמין",
     "blocked": "האתר חסם את הבקשה",
+    "not_found": "הדף לא נמצא (ייתכן שהמוצר הוסר)",
+    "price_not_found": "המחיר לא נמצא בדף",
     "fetch_failed": "האחזור נכשל",
+    "no_promo": "לא זוהה מבצע כלל-אתרי",
     "no_powder": "לא נמצאה אבקת קריאטין",
+    "no_products": "לא נמצאו מוצרים בעמוד",
+    "parse_failed": "פענוח העמוד נכשל",
     "unavailable": "לא זמין",
 }
 
 _SIGNATURE = "מעקב מחירים"
 
 
-def _direction_he(pct: float | None) -> str:
-    return _DIRECTION_HE[_direction_word(pct)]
+def _direction_he(pct: float | None, diff: Decimal | None = None) -> str:
+    return _DIRECTION_HE[_direction_word(pct, diff)]
 
 
 def _status_he(status: str | None) -> str:
@@ -106,6 +137,165 @@ def _ltr(value: object) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Failure description (threshold alert + last-run.json)
+# ---------------------------------------------------------------------------
+
+def describe_failure(fetch: FetchResult) -> dict:
+    """Explain why a fetch failed, in Hebrew, with what the user can do.
+
+    Returns {"status", "status_he", "http_status", "error_message",
+    "detail", "hint"}; ``detail`` is one line combining the status, the
+    HTTP code and the error message.
+    """
+    status = fetch.status.value if isinstance(fetch.status, FetchStatus) else str(fetch.status)
+    msg = (fetch.error_message or "").strip()
+    parts = [_status_he(status)]
+    if fetch.http_status:
+        parts.append(f"HTTP {fetch.http_status}")
+    detail = " · ".join(parts)
+    if msg:
+        detail += f" — {msg}"
+
+    low = msg.lower()
+    if fetch.status == FetchStatus.NOT_FOUND and "variant" in low:
+        hint = (
+            "המידה / הצבע שבקישור כבר לא קיימים במוצר. יש להסיר את המעקב "
+            "ולהוסיף אותו מחדש עם קישור לווריאנט קיים "
+            "(price-watcher remove ואז price-watcher add)."
+        )
+    elif fetch.status == FetchStatus.NOT_FOUND:
+        hint = (
+            "ייתכן שהמוצר הוסר מהאתר או שהקישור השתנה. בדקו את הקישור בדפדפן; "
+            "אם המוצר עבר לכתובת חדשה, הסירו את המעקב והוסיפו את הכתובת החדשה."
+        )
+    elif fetch.status == FetchStatus.BLOCKED:
+        hint = (
+            "האתר חוסם בקשות אוטומטיות (הגנה מבוטים). לרוב זה חולף מעצמו; "
+            "אם זה נמשך ימים, נסו להוסיף את המעקב מחדש עם ‎--selector‎."
+        )
+    elif fetch.status == FetchStatus.PRICE_NOT_FOUND:
+        hint = (
+            "הדף נטען אבל המחיר לא זוהה (או שזוהה מחיר 0). אם עיצוב הדף השתנה, "
+            "הוסיפו את המעקב מחדש עם ‎--selector‎ שמצביע על המחיר."
+        )
+    elif fetch.status == FetchStatus.UNREACHABLE:
+        hint = "האתר לא ענה. בדקו את החיבור לאינטרנט ושהאתר עולה בדפדפן."
+    else:
+        hint = None
+    return {
+        "status": status,
+        "status_he": _status_he(status),
+        "http_status": fetch.http_status,
+        "error_message": fetch.error_message,
+        "detail": detail,
+        "hint": hint,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion (MyProtein banner) wording
+# ---------------------------------------------------------------------------
+
+def _promo_computable(promo: PromoInfo | None) -> bool:
+    return promo is not None and promo.discount_pct > 0
+
+
+def _promo_desc(promo: PromoInfo) -> str:
+    pct = f"{_num(promo.discount_pct)}%"
+    if promo.code:
+        return f"הקוד {promo.code} ({pct})"
+    return f"הנחה אוטומטית ({pct})"
+
+
+def _promo_rows(event: ChangeEvent, sym: str) -> list[tuple[str, str]]:
+    """(label, plain-text value) rows about the promotion / estimated price.
+
+    The estimated final price is always marked as an estimate. A banner
+    that could not be read never turns into a price rise: it is reported as
+    "displayed price only".
+    """
+    fetch = event.fetch
+    promo = fetch.promo
+    rows: list[tuple[str, str]] = []
+    if event.watch.excluded_from_promo:
+        rows.append(("מבצעים", "הפריט מסומן כמוחרג ממבצעי האתר — מוצג המחיר המוצג בלבד"))
+        return rows
+    if not event.watch.track_promo:
+        return rows
+
+    old = event.old_promo if _promo_computable(event.old_promo) else None
+    if promo is None and old is not None:
+        rows.append(("מבצע", f"המבצע הסתיים (היה: {_promo_desc(old)})"))
+        rows.append(("מחיר סופי משוער", f"{_fmt_price(fetch.price, sym)} (ללא מבצע)"))
+        return rows
+    if promo is None:
+        return rows
+    if not _promo_computable(promo):
+        rows.append((
+            "מבצע",
+            "באנר המבצע לא נקרא במלואו או שהמבצע מדורג ('עד X%') — "
+            "לא ניתן להעריך מחיר סופי; מוצג המחיר המוצג בלבד",
+        ))
+        if promo.source_text:
+            rows.append(("טקסט הבאנר", promo.source_text[:200]))
+        return rows
+
+    est = fetch.estimated_final_price
+    rows.append((
+        "מחיר סופי משוער",
+        f"מוצג {_fmt_price(fetch.price, sym)}, בערך {_fmt_price(est, sym)} "
+        f"עם {_promo_desc(promo)} (הערכה)",
+    ))
+    if promo.condition:
+        rows.append(("תנאי המבצע", promo.condition[:200]))
+    if old is not None and (old.code != promo.code or old.discount_pct != promo.discount_pct):
+        rows.append(("מבצע קודם", _promo_desc(old)))
+    if (
+        event.old_estimated_price is not None
+        and est is not None
+        and event.old_estimated_price != est
+    ):
+        rows.append((
+            "מחיר משוער קודם",
+            f"{_fmt_price(event.old_estimated_price, sym)} → {_fmt_price(est, sym)}",
+        ))
+    return rows
+
+
+def _what_changed(event: ChangeEvent) -> str | None:
+    """Say whether the displayed price, the promotion or both changed."""
+    promo_changed = _promo_changed(event)
+    if event.type == ChangeType.PROMO_CHANGED:
+        return "המבצע (המחיר המוצג לא השתנה)"
+    if event.type == ChangeType.PRICE_CHANGED and promo_changed:
+        return "המחיר המוצג וגם המבצע"
+    if event.type == ChangeType.PRICE_CHANGED and _promo_computable(event.fetch.promo):
+        return "המחיר המוצג (המבצע לא השתנה)"
+    return None
+
+
+def _promo_changed(event: ChangeEvent) -> bool:
+    if not event.watch.track_promo or event.watch.excluded_from_promo:
+        return False
+    old = event.old_promo if _promo_computable(event.old_promo) else None
+    new = event.fetch.promo if _promo_computable(event.fetch.promo) else None
+    if old is None and new is None:
+        return False
+    if old is None or new is None:
+        return True
+    return old.code != new.code or old.discount_pct != new.discount_pct
+
+
+def _promo_heading(event: ChangeEvent) -> str:
+    old = event.old_promo if _promo_computable(event.old_promo) else None
+    if event.fetch.promo is None and old is not None:
+        return "המבצע הסתיים"
+    if old is None:
+        return "מבצע חדש"
+    return "המבצע השתנה"
+
+
+# ---------------------------------------------------------------------------
 # Subject builders
 # ---------------------------------------------------------------------------
 
@@ -114,19 +304,29 @@ def _subject_single(event: ChangeEvent) -> str:
     sym = _currency_symbol(event.fetch.currency)
 
     if event.type == ChangeType.PRICE_CHANGED:
-        old = f"{event.old_price:,.0f}" if event.old_price is not None else "?"
-        new = f"{event.new_price:,.0f}" if event.new_price is not None else "?"
+        old = _num(event.old_price)
+        new = _num(event.new_price)
         pct = f" ({event.pct_change:+.1f}%)" if event.pct_change is not None else ""
-        return f"המחיר {_direction_he(event.pct_change)}: {label} – מ-{old} ל-{new} {sym}{pct}"
+        return (
+            f"המחיר {_direction_he(event.pct_change, event.diff)}: {label} – "
+            f"מ-{old} ל-{new} {sym}{pct}"
+        )
 
     if event.type == ChangeType.STOCK_CHANGED:
         return f"עדכון מלאי: {label} – {_stock_he(event.fetch.in_stock)}"
 
     if event.type == ChangeType.PROMO_CHANGED:
-        return f"המבצע השתנה: {label}"
+        promo = event.fetch.promo
+        heading = _promo_heading(event)
+        if _promo_computable(promo) and event.fetch.estimated_final_price is not None:
+            return (
+                f"{heading}: {label} – בערך {_num(event.fetch.estimated_final_price)} {sym} "
+                f"עם {_promo_desc(promo)}"
+            )
+        return f"{heading}: {label}"
 
     if event.type == ChangeType.THRESHOLD_FAILURE:
-        return f"המעקב הפסיק לעבוד: {label}"
+        return f"המעקב הפסיק לעבוד: {label} – {_status_he(event.fetch.status.value)}"
 
     if event.type == ChangeType.RECOVERED:
         return f"המעקב חזר לעבוד: {label}"
@@ -147,72 +347,98 @@ def _subject_multi(events: list[ChangeEvent]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Event content (shared by the text and HTML bodies)
+# ---------------------------------------------------------------------------
+
+def _event_content(event: ChangeEvent) -> tuple[str, str, list[tuple[str, str]]]:
+    """Return (heading, heading colour, [(label, plain value), ...]).
+
+    Prices go in their own rows so the HTML body can keep them LTR.
+    """
+    label = _watch_label(event)
+    sym = _currency_symbol(event.fetch.currency)
+    ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
+    rows: list[tuple[str, str]] = []
+    color = ""
+
+    if event.type == ChangeType.PRICE_CHANGED:
+        direction = _direction_word(event.pct_change, event.diff)
+        color = "#c00" if direction == "rose" else "#080"
+        heading = f"המחיר {_DIRECTION_HE[direction]}: {label}"
+        diff_str = ""
+        if event.diff is not None:
+            diff_str = f"{event.diff:+,.2f} {sym}"
+            if event.pct_change is not None:
+                diff_str += f", {event.pct_change:+.1f}%"
+        rows += [
+            ("מחיר קודם", _fmt_price(event.old_price, sym)),
+            ("מחיר חדש", _fmt_price(event.new_price, sym)),
+        ]
+        if diff_str:
+            rows.append(("שינוי", diff_str))
+        if event.reason and "currency" in event.reason:
+            rows.append(("הערה", f"המטבע השתנה ({event.reason})"))
+        what = _what_changed(event)
+        if what:
+            rows.append(("מה השתנה", what))
+        rows += _promo_rows(event, sym)
+
+    elif event.type == ChangeType.STOCK_CHANGED:
+        color = "#080" if event.fetch.in_stock else "#c00"
+        heading = f"{_stock_he(event.fetch.in_stock)}: {label}"
+        rows.append(("מחיר נוכחי", _fmt_price(event.new_price or event.fetch.price, sym)))
+        rows += _promo_rows(event, sym)
+
+    elif event.type == ChangeType.PROMO_CHANGED:
+        heading = f"{_promo_heading(event)}: {label}"
+        rows.append(("מחיר מוצג", _fmt_price(event.fetch.price, sym)))
+        rows.append(("מה השתנה", _what_changed(event) or "המבצע"))
+        rows += _promo_rows(event, sym)
+
+    elif event.type == ChangeType.THRESHOLD_FAILURE:
+        color = "#c00"
+        heading = f"המעקב הפסיק לעבוד: {label}"
+        info = describe_failure(event.fetch)
+        rows.append(("סיבה", event.reason or "שגיאה לא ידועה"))
+        rows.append(("פירוט", info["detail"]))
+        if info["hint"]:
+            rows.append(("מה לעשות", info["hint"]))
+        rows.append(("הערה", "ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש; לא תישלח התראה נוספת עד אז."))
+
+    elif event.type == ChangeType.RECOVERED:
+        color = "#080"
+        heading = f"המעקב חזר לעבוד: {label}"
+        rows.append(("מחיר נוכחי", _fmt_price(event.new_price or event.fetch.price, sym)))
+        if (
+            event.old_price is not None
+            and event.new_price is not None
+            and event.old_price != event.new_price
+        ):
+            rows.append(("מחיר לפני התקלה", _fmt_price(event.old_price, sym)))
+        rows += _promo_rows(event, sym)
+
+    else:
+        heading = f"עדכון: {label}"
+
+    rows.append(("נבדק", ts))
+    return heading, color, rows
+
+
+_LTR_ROWS = {
+    "מחיר קודם", "מחיר חדש", "שינוי", "מחיר נוכחי", "מחיר מוצג",
+    "מחיר לפני התקלה", "נבדק", "מחיר משוער קודם",
+}
+
+
+# ---------------------------------------------------------------------------
 # Body builders (plain text)
 # ---------------------------------------------------------------------------
 
 def _text_event(event: ChangeEvent) -> str:
-    label = _watch_label(event)
-    sym = _currency_symbol(event.fetch.currency)
-    url = event.watch.url
-    ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
-    lines: list[str] = []
-
-    if event.type == ChangeType.PRICE_CHANGED:
-        old = _fmt_price(event.old_price, sym)
-        new = _fmt_price(event.new_price, sym)
-        diff_str = ""
-        if event.diff is not None and event.pct_change is not None:
-            diff_str = f"  ({event.diff:+,.2f} {sym}, {event.pct_change:+.1f}%)"
-        lines += [
-            f"המחיר {_direction_he(event.pct_change)}: {label}",
-            f"  מחיר קודם: {old}",
-            f"  מחיר חדש: {new}{diff_str}",
-            f"  קישור: {url}",
-            f"  נבדק: {ts}",
-        ]
-
-    elif event.type == ChangeType.STOCK_CHANGED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        lines += [
-            f"עדכון מלאי: {_stock_he(event.fetch.in_stock)}",
-            f"  מוצר: {label}",
-            f"  מחיר נוכחי: {price_str}",
-            f"  קישור: {url}",
-        ]
-
-    elif event.type == ChangeType.PROMO_CHANGED:
-        promo = event.fetch.promo
-        displayed = _fmt_price(event.fetch.price, sym)
-        estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-        lines += [f"המבצע השתנה: {label}"]
-        if promo:
-            if promo.code:
-                lines.append(f"  קוד: {promo.code}  ({promo.discount_pct}% הנחה)")
-            if promo.condition:
-                lines.append(f"  תנאים: {promo.condition}")
-        lines += [
-            f"  מחיר מוצג: {displayed}",
-            f"  מחיר סופי משוער: {estimated}",
-            f"  קישור: {url}",
-        ]
-
-    elif event.type == ChangeType.THRESHOLD_FAILURE:
-        reason = event.reason or "שגיאה לא ידועה"
-        lines += [
-            f"המעקב הפסיק לעבוד: {label}",
-            f"  סיבה: {reason}",
-            "  ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש.",
-            f"  קישור: {url}",
-        ]
-
-    elif event.type == ChangeType.RECOVERED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        lines += [
-            f"המעקב חזר לעבוד: {label}",
-            f"  מחיר נוכחי: {price_str}",
-            f"  קישור: {url}",
-        ]
-
+    heading, _color, rows = _event_content(event)
+    lines = [heading]
+    lines += [f"  {key}: {val}" for key, val in rows]
+    lines.append(f"  קישור: {event.watch.url}")
     return "\n".join(lines)
 
 
@@ -226,96 +452,37 @@ def _build_text_body(events: list[ChangeEvent]) -> str:
 # ---------------------------------------------------------------------------
 
 def _html_event(event: ChangeEvent) -> str:
-    label = escape(_watch_label(event))
-    sym = _currency_symbol(event.fetch.currency)
+    heading_text, color, rows = _event_content(event)
     url = escape(event.watch.url)
-    ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
     link = f'<a href="{url}" dir="ltr">{url}</a>'
 
-    rows: list[str] = []
-
-    def row(key: str, val: str) -> str:
+    def row(key: str, val_html: str) -> str:
         return (
             f'<tr><td style="padding:4px 8px;color:#555;white-space:nowrap;text-align:right">'
             f'<strong>{escape(key)}</strong></td>'
-            f'<td style="padding:4px 8px;text-align:right">{val}</td></tr>'
+            f'<td style="padding:4px 8px;text-align:right">{val_html}</td></tr>'
         )
 
-    if event.type == ChangeType.PRICE_CHANGED:
-        direction = _direction_word(event.pct_change)
-        color = "#c00" if direction == "rose" else "#080"
-        old = _fmt_price(event.old_price, sym)
-        new = _fmt_price(event.new_price, sym)
-        diff_str = ""
-        if event.diff is not None and event.pct_change is not None:
-            diff_str = f"{event.diff:+,.2f} {sym}, {event.pct_change:+.1f}%"
-        heading = (
-            f'המחיר <span style="color:{color}">{_DIRECTION_HE[direction]}</span>: {label}'
-        )
-        rows += [
-            row("מחיר קודם", _ltr(old)),
-            row("מחיר חדש", f'<strong style="color:{color}">{_ltr(new)}</strong>'),
-            row("שינוי", _ltr(diff_str)),
-            row("נבדק", _ltr(ts)),
-            row("קישור", link),
-        ]
+    html_rows: list[str] = []
+    for key, val in rows:
+        val_html = _ltr(val) if key in _LTR_ROWS else escape(val)
+        if key == "מחיר חדש" and color:
+            val_html = f'<strong style="color:{color}">{val_html}</strong>'
+        html_rows.append(row(key, val_html))
+    html_rows.append(row("קישור", link))
 
-    elif event.type == ChangeType.STOCK_CHANGED:
-        color = "#080" if event.fetch.in_stock else "#c00"
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        heading = f'<span style="color:{color}">{_stock_he(event.fetch.in_stock)}</span>: {label}'
-        rows += [
-            row("מחיר נוכחי", _ltr(price_str)),
-            row("קישור", link),
-        ]
+    heading = escape(heading_text)
+    if color:
+        heading = f'<span style="color:{color}">{heading}</span>'
 
-    elif event.type == ChangeType.PROMO_CHANGED:
-        promo = event.fetch.promo
-        displayed = _fmt_price(event.fetch.price, sym)
-        estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-        heading = f"המבצע השתנה: {label}"
-        if promo and promo.code:
-            rows.append(row(
-                "קוד",
-                f'<strong dir="ltr">{escape(promo.code)}</strong> '
-                f'({escape(str(promo.discount_pct))}% הנחה)',
-            ))
-        if promo and promo.condition:
-            rows.append(row("תנאים", escape(promo.condition)))
-        rows += [
-            row("מחיר מוצג", _ltr(displayed)),
-            row("מחיר סופי משוער", f'<strong>{_ltr(estimated)}</strong> <em>(הערכה)</em>'),
-            row("קישור", link),
-        ]
-
-    elif event.type == ChangeType.THRESHOLD_FAILURE:
-        reason = escape(event.reason or "שגיאה לא ידועה")
-        heading = f'המעקב הפסיק לעבוד: {label}'
-        rows += [
-            row("סיבה", reason),
-            row("הערה", "ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש."),
-            row("קישור", link),
-        ]
-
-    elif event.type == ChangeType.RECOVERED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        heading = f'המעקב חזר לעבוד: {label}'
-        rows += [
-            row("מחיר נוכחי", _ltr(price_str)),
-            row("קישור", link),
-        ]
-    else:
-        heading = f"עדכון: {label}"
-
-    table = (
+    return (
         '<table dir="rtl" style="border-collapse:collapse;font-family:sans-serif;font-size:14px;'
         'width:100%;max-width:560px">'
         f'<tr><th colspan="2" style="text-align:right;padding:8px;background:#f4f4f4;'
         f'border-bottom:2px solid #ddd">{heading}</th></tr>'
-        + "".join(rows)
+        + "".join(html_rows)
         + "</table>"
     )
-    return table
 
 
 def _build_html_body(events: list[ChangeEvent]) -> str:
@@ -355,7 +522,7 @@ def build_payload(events: list[ChangeEvent]) -> EmailPayload | None:
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
 
-def _send_via_smtp(payload: EmailPayload, cfg: "config.EmailConfig") -> None:  # type: ignore[name-defined]
+def _send_via_smtp(payload: EmailPayload, cfg: _config_module.EmailConfig) -> None:
     """Low-level SMTP send. Raises on any failure."""
     msg = EmailMessage()
     msg["Subject"] = payload.subject
@@ -384,7 +551,11 @@ def send_change_notification(events: list[ChangeEvent]) -> bool:
         log.debug("send_change_notification: no notifiable events, skipping email")
         return True
 
-    cfg = _config_module.load().email
+    try:
+        cfg = _config_module.load().email
+    except Exception as exc:  # missing / invalid SMTP settings in .env
+        log.error("Cannot send notification email: %s", exc)
+        return False
     try:
         log.info("Sending notification email: %s", payload.subject)
         _send_via_smtp(payload, cfg)
@@ -427,123 +598,90 @@ def send_test_email() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Daily sales digest
+# Daily report: site-wide promotions section
 # ---------------------------------------------------------------------------
 
-def build_digest_payload(digests) -> EmailPayload | None:
-    """Build the detailed daily digest email. Lists every promo per site with
-    code, percentage, condition, and raw source excerpt."""
-    from price_watcher.digest import SiteDigest  # lazy to avoid circular import
-    digests: list[SiteDigest] = list(digests)
-    if not digests:
-        return None
+def _site_promos_section_text(site_digests) -> list[str]:
+    """Plain-text lines for the "site-wide promotions" part of the daily email."""
+    from price_watcher.digest import NO_PROMO_HE
 
-    all_promos = [(d, p) for d in digests for p in d.promos]
-    if all_promos:
-        best = max(all_promos, key=lambda dp: dp[1].discount_pct)
-        best_site, best_promo = best
-        total = len(all_promos)
-        subject = (
-            f"דוח מבצעים יומי: {total} מבצעים "
-            f"(המוביל: {best_promo.discount_pct}% הנחה ב-{best_site.display_name}"
-            + (f" עם הקוד {best_promo.code}" if best_promo.code else "")
-            + ")"
-        )
-    else:
-        subject = "דוח מבצעים יומי: אין היום מבצעים כלל-אתריים"
-
-    # --- Plain text body ---
-    text_lines = ["דוח מבצעים יומי", "=" * 50, ""]
-    for d in digests:
-        text_lines.append(f"▼ {d.display_name}  ({d.host})")
-        text_lines.append(f"   {d.homepage_url}")
-        if d.status != "ok":
-            text_lines.append(f"   [{_status_he(d.status)}] {d.error or ''}")
-            text_lines.append("")
+    lines = ["מבצעים כלל-אתריים", "-" * 50, ""]
+    if not site_digests:
+        lines.append("  (אין אתרים ברשימת המעקב)")
+        lines.append("")
+    for d in site_digests:
+        lines.append(f"▼ {d.display_name}  ({d.host})")
+        lines.append(f"  {d.homepage_url}")
+        if d.failed:
+            lines.append(f"  [{_status_he(d.status)}] {d.error or ''}".rstrip())
+            lines.append("")
             continue
         if not d.promos:
-            text_lines.append("   (לא זוהה מבצע כלל-אתרי)")
-            text_lines.append("")
+            lines.append(f"  ({NO_PROMO_HE})")
+            lines.append("")
             continue
         for i, p in enumerate(d.promos, 1):
             code_part = f"קוד: {p.code}" if p.code else "ללא קוד"
-            text_lines.append(f"   {i}. {p.discount_pct}% הנחה  —  {code_part}")
+            lines.append(f"  {i}. {p.discount_pct}% הנחה  —  {code_part}")
             if p.condition:
-                text_lines.append(f"      פירוט: {p.condition[:200]}")
-        text_lines.append("")
-    text_lines.append(f"— {_SIGNATURE}")
-    text_body = "\n".join(text_lines)
+                lines.append(f"     {p.condition[:200]}")
+        lines.append("")
+    return lines
 
-    # --- HTML body ---
-    html_parts = [
-        '<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8"></head>',
-        '<body dir="rtl" style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
-        'padding:16px;max-width:680px;line-height:1.5;text-align:right">',
-        '<h2 style="margin:0 0 20px">דוח מבצעים יומי</h2>',
-    ]
-    for d in digests:
-        html_parts.append(
-            f'<div style="margin:0 0 24px;padding:14px 16px;border:1px solid #e5e7eb;'
+
+def _site_promos_section_html(site_digests) -> str:
+    """HTML for the "site-wide promotions" part of the daily email."""
+    from price_watcher.digest import NO_PROMO_HE
+
+    parts: list[str] = []
+    if not site_digests:
+        parts.append('<div style="color:#888;font-style:italic">אין אתרים ברשימת המעקב.</div>')
+    for d in site_digests:
+        parts.append(
+            f'<div style="margin:0 0 20px;padding:14px 16px;border:1px solid #e5e7eb;'
             f'border-radius:8px;background:#fafafa">'
-        )
-        html_parts.append(
             f'<div style="font-size:16px;font-weight:600">{escape(d.display_name)}'
-            f' <a href="{escape(d.homepage_url)}" style="font-weight:normal;color:#2563eb;'
+            f' <a href="{escape(d.homepage_url)}" dir="ltr" style="font-weight:normal;color:#2563eb;'
             f'text-decoration:none;font-size:13px">({escape(d.host)})</a></div>'
         )
-        if d.status != "ok":
-            html_parts.append(
+        if d.failed:
+            parts.append(
                 f'<div style="margin-top:8px;color:#c33">'
                 f'<b>{escape(_status_he(d.status))}:</b> {escape(d.error or "—")}</div>'
             )
         elif not d.promos:
-            html_parts.append(
+            parts.append(
                 '<div style="margin-top:8px;color:#888;font-style:italic">'
-                'לא זוהה מבצע כלל-אתרי</div>'
+                f'{NO_PROMO_HE}</div>'
             )
         else:
             for p in d.promos:
                 code_html = (
-                    f'<code style="background:#111;color:#fff;padding:2px 8px;'
-                    f'border-radius:4px;font-size:14px;font-weight:600" dir="ltr">{escape(p.code)}</code>'
+                    f'<code dir="ltr" style="background:#111;color:#fff;padding:2px 8px;'
+                    f'border-radius:4px;font-size:14px;font-weight:600">{escape(p.code)}</code>'
                     if p.code
                     else '<span style="color:#888;font-size:13px">(ללא קוד)</span>'
                 )
-                html_parts.append(
+                parts.append(
                     f'<div style="margin:10px 0 0;padding-top:10px;border-top:1px solid #eee">'
                     f'<div style="font-size:15px">'
-                    f'<b style="color:#dc2626">{p.discount_pct}% הנחה</b>  &nbsp; {code_html}</div>'
+                    f'<b style="color:#dc2626">{escape(str(p.discount_pct))}% הנחה</b>'
+                    f'  &nbsp; {code_html}</div>'
                 )
                 if p.condition:
-                    html_parts.append(
+                    parts.append(
                         f'<div style="margin-top:4px;color:#555;font-size:13px">'
                         f'{escape(p.condition[:300])}</div>'
                     )
-                html_parts.append('</div>')
-        html_parts.append('</div>')
-    html_parts.append(
-        f'<p style="color:#999;font-size:12px;margin-top:24px">— {_SIGNATURE}</p>'
-        '</body></html>'
-    )
-    html_body = "".join(html_parts)
-
-    return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
+                parts.append('</div>')
+        parts.append('</div>')
+    return "".join(parts)
 
 
-def _group_meat_by_category(sm):
-    """Returns: dict[category_name -> list[MeatPromo]], ordered by _CATEGORIES."""
-    from price_watcher.supermarkets import _categorize, _CATEGORIES
-    groups: dict[str, list] = {}
-    for p in sm.promos:
-        cat = _categorize(p)
-        groups.setdefault(cat, []).append(p)
-    ordered = {}
-    for cat_name, _ in _CATEGORIES:
-        if cat_name in groups:
-            ordered[cat_name] = groups.pop(cat_name)
-    for cat_name, items in groups.items():
-        ordered[cat_name] = items
-    return ordered
+def _group_meat_by_category(sm) -> list[tuple[str, bool, list]]:
+    """(category, ranked, rows) in the scanner's order: ranked cuts, then catch-alls."""
+    from price_watcher.supermarkets import group_by_category
+    return group_by_category(list(sm.promos or []))
 
 
 # ---- Design tokens for email HTML ----
@@ -560,34 +698,11 @@ _FONT_STACK = ("-apple-system,BlinkMacSystemFont,'Segoe UI',"
 # (keywords in the Hebrew category name, icon) — first match wins.
 _CATEGORY_ICONS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("הודו",), "🦃"),
-    (("עוף", "כנפיים", "ירכיים", "שוקיים", "פולקע", "פרגיות", "קורקבן"), "🍗"),
-    (("כבש", "טלה"), "🐑"),
-    (("עגל", "בייבי"), "🐄"),
-    (("לשון",), "👅"),
-    (("מוח",), "🧠"),
+    (("אווז", "ברווז"), "🦆"),
+    (("עוף", "פרגיות", "פולקע"), "🍗"),
+    (("טלה",), "🐑"),
+    (("עגל",), "🐄"),
 )
-
-def _region_order() -> tuple[str, ...]:
-    from price_watcher.supermarkets import _REGION_ORDER
-    return _REGION_ORDER
-
-
-def _group_meat_by_region(sm) -> dict[str, list]:
-    """region -> its deals, already sorted best-first by the scanner."""
-    groups: dict[str, list] = {region: [] for region in _region_order()}
-    for p in sm.promos:
-        groups.setdefault(getattr(p, "region", "") or "אחר", []).append(p)
-    return {region: items for region, items in groups.items() if items}
-
-
-def _where_label(p) -> str:
-    """Cities (and store count) a deal was seen in, e.g. 'נתניה, רעננה · 5 סניפים'."""
-    cities = list(getattr(p, "cities", None) or [])
-    if not cities:
-        return ""
-    shown = ", ".join(cities[:3]) + (" ועוד" if len(cities) > 3 else "")
-    count = getattr(p, "store_count", 1)
-    return shown if count <= 1 else f"{shown} · {count} סניפים"
 
 
 def _category_icon(cat_name: str) -> str:
@@ -599,26 +714,59 @@ def _category_icon(cat_name: str) -> str:
     return "🥩"
 
 
+def _meat_store_label(p) -> str:
+    """Store the deal is in, e.g. 'סוקולוב (הרצליה) ועוד 2 סניפים'."""
+    names = list(getattr(p, "store_names", None) or [])
+    first = names[0] if names else (getattr(p, "store_name", "") or "")
+    city = getattr(p, "city", "") or ""
+    if first and city and city not in first:
+        label = f"{first} ({city})"
+    else:
+        label = first or city
+    extra = int(getattr(p, "store_count", 1) or 1) - 1
+    if extra == 1:
+        label += " ועוד סניף אחד"
+    elif extra > 1:
+        label += f" ועוד {extra} סניפים"
+    return label
+
+
+def _meat_price_parts(p) -> tuple[str, str]:
+    """(main price, secondary line): per kg when known, else per unit."""
+    per_kg = getattr(p, "price_per_kg", None)
+    promo = getattr(p, "promo_price", None)
+    if per_kg is not None:
+        main = f'₪{per_kg} לק"ג'
+        if getattr(p, "weighted", False):
+            regular = getattr(p, "regular_per_kg", None)
+            second = f'במקום ₪{regular} לק"ג' if regular else ""
+        else:
+            second = f"₪{promo} לאריזה" + (f" (במקום ₪{p.regular_price})" if p.regular_price else "")
+        return main, second
+    if promo is not None:
+        return f"₪{promo} ליחידה", (f"במקום ₪{p.regular_price}" if p.regular_price else "")
+    return "—", ""
+
+
+def _meat_tags(p) -> list[str]:
+    """Fresh / frozen and the promo end date, e.g. ['קפוא', 'בתוקף עד 15/11/2026']."""
+    from price_watcher.supermarkets import FRESHNESS_HE
+    tags = []
+    fresh = FRESHNESS_HE.get(getattr(p, "freshness", ""), "")
+    if fresh:
+        tags.append(fresh)
+    until = getattr(p, "end_date_display", "")
+    if until:
+        tags.append(f"בתוקף עד {until}")
+    return tags
+
+
 def _shekel(value: object) -> str:
     return f'<span dir="ltr">₪{value}</span>'
 
 
 def _usd(value: object) -> str:
     return f'<span dir="ltr">${value}</span>'
-
-
-def _price_cell_html(p) -> str:
-    """Render the before/after price cell: strike-through old, bold new."""
-    if p.regular_price and p.discounted_price:
-        return (
-            f'<span style="color:{_COLOR_MUTED};text-decoration:line-through">{_shekel(p.regular_price)}</span>'
-            f'<br><b style="color:{_COLOR_TEXT}">{_shekel(p.discounted_price)}</b>'
-        )
-    if p.discounted_price:
-        return f'<b>{_shekel(p.discounted_price)}</b>'
-    if p.regular_price:
-        return f'<span style="color:{_COLOR_MUTED}">{_shekel(p.regular_price)}</span>'
-    return "—"
 
 
 def _section_heading_html(title: str, first: bool = False) -> str:
@@ -640,8 +788,25 @@ def _failure_box_html(title: str, status: str | None, error: str | None) -> str:
     )
 
 
+def _meat_scope_lines(sm) -> list[str]:
+    cities = ", ".join(getattr(sm, "cities", None) or []) or "—"
+    lines = [f"  אזור: {cities}"]
+    scanned = list(sm.chains_scanned or [])
+    lines.append(f"  רשתות שנסרקו ({len(scanned)}): {', '.join(scanned) if scanned else 'אין'}")
+    without = list(getattr(sm, "chains_without_promos", None) or [])
+    if without:
+        lines.append(f"  נסרקו, ללא מבצעי בשר היום: {', '.join(without)}")
+    no_stores = list(getattr(sm, "chains_no_stores", None) or [])
+    if no_stores:
+        lines.append(f"  אין סניפים באזור: {', '.join(no_stores)}")
+    failed = dict(getattr(sm, "chains_failed", None) or {})
+    if failed:
+        lines.append("  הסריקה נכשלה: " + ", ".join(f"{c} ({why})" for c, why in failed.items()))
+    lines.append(f"  סניפים שנסרקו: {len(getattr(sm, 'stores_scanned', None) or [])}")
+    return lines
+
+
 def _supermarkets_section_text(sm) -> list[str]:
-    from price_watcher.supermarkets import _categorize
     lines = ["מבצעי בשר בסופרמרקטים", "-" * 50, ""]
     if sm is None:
         lines.append("  (לא נסרק)")
@@ -649,66 +814,74 @@ def _supermarkets_section_text(sm) -> list[str]:
     if sm.status != "ok":
         lines.append(f"  הסריקה נכשלה: {_status_he(sm.status)}  {sm.error or ''}")
         return lines
-    chains = ", ".join(sm.chains_scanned) if sm.chains_scanned else "אין"
-    lines.append(f"  רשתות שנסרקו: {chains}")
-    lines.append(f"  סניפים שנסרקו: {len(getattr(sm, 'stores_scanned', None) or [])}")
+    lines.extend(_meat_scope_lines(sm))
     if not sm.promos:
         lines.append("  לא נמצאו היום מבצעי בשר.")
         return lines
-    stores_by_region = getattr(sm, "stores_by_region", None) or {}
-    promos_by_region = getattr(sm, "promos_by_region", None) or {}
-    for region, items in _group_meat_by_region(sm).items():
+    top_n = getattr(sm, "top_per_category", 5)
+    counts = getattr(sm, "promos_by_category", None) or {}
+    lines.append(f'  בכל קטגוריה: {top_n} הזולים ביותר לפי מחיר מבצע לק"ג.')
+    unranked_header_done = False
+    for cat, ranked, items in _group_meat_by_category(sm):
+        total = counts.get(cat, len(items))
         lines.append("")
-        lines.append(f"  ▼ {region}")
-        lines.append(
-            f"    {stores_by_region.get(region, 0)} סניפים · "
-            f"{len(items)} המבצעים הטובים ביותר מתוך {promos_by_region.get(region, len(items))}"
-        )
+        if not ranked and not unranked_header_done:
+            lines.append("  ── קטגוריות כלליות (מוצרים שונים, לא מדורג) ──")
+            unranked_header_done = True
+        more = f" ({len(items)} מתוך {total})" if total > len(items) else ""
+        lines.append(f"  ▼ {cat}{more}")
         for i, p in enumerate(items, 1):
-            pct = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
-            was = f"₪{p.regular_price}" if p.regular_price else "—"
-            now = f"₪{p.discounted_price}" if p.discounted_price else "—"
-            lines.append(f"    {i}. הנחה {pct} · {p.chain} · {p.item_name[:50]}")
-            lines.append(f"       מחיר רגיל {was} · מחיר מבצע {now} · {_categorize(p)}")
+            main, second = _meat_price_parts(p)
+            bullet = f"{i}." if ranked else "•"
+            lines.append(f"    {bullet} {main} · {p.item_name[:50]}")
+            lines.append(f"       {p.chain} – {_meat_store_label(p)}")
+            details = [d for d in (second, *_meat_tags(p)) if d]
+            if details:
+                lines.append(f"       {' · '.join(details)}")
             if p.promotion_description:
                 lines.append(f"       {p.promotion_description[:90]}")
-            where = _where_label(p)
-            if where:
-                lines.append(f"       {where}")
     return lines
 
 
 def _supermarkets_section_html(sm) -> str:
-    """Meat section: one card per region, deals ranked best to worst. RTL."""
-    from price_watcher.supermarkets import _categorize
+    """Meat section: one card per category (one cut of one animal), cheapest first. RTL."""
     if sm is None:
         return '<div style="color:#888;font-style:italic;text-align:right">(לא נסרק)</div>'
     if sm.status != "ok":
         return _failure_box_html("סריקת הסופרמרקטים נכשלה", sm.status, sm.error)
 
-    # Summary card
-    chains_scanned = sm.chains_scanned or []
+    chains_scanned = list(sm.chains_scanned or [])
     stores_scanned = list(getattr(sm, "stores_scanned", None) or [])
-    stores_by_region = getattr(sm, "stores_by_region", None) or {}
-    promos_by_region = getattr(sm, "promos_by_region", None) or {}
-    grouped = _group_meat_by_region(sm)
+    cities = list(getattr(sm, "cities", None) or [])
+    counts = getattr(sm, "promos_by_category", None) or {}
+    top_n = getattr(sm, "top_per_category", 5)
+    without = list(getattr(sm, "chains_without_promos", None) or [])
+    no_stores = list(getattr(sm, "chains_no_stores", None) or [])
+    failed = dict(getattr(sm, "chains_failed", None) or {})
+    small = f'font-size:12px;color:{_COLOR_MUTED};margin-top:4px'
 
     html = []
     html.append(
         f'<div style="padding:14px 16px;background:{_COLOR_BG_SOFT};'
         f'border:1px solid {_COLOR_BORDER};border-radius:10px;margin-bottom:18px;'
         f'font-family:{_FONT_STACK};color:{_COLOR_TEXT};text-align:right">'
-        f'<div style="font-size:13px;color:{_COLOR_MUTED}">הסריקה של היום</div>'
+        f'<div style="font-size:13px;color:{_COLOR_MUTED}">הסריקה של היום · '
+        f'{escape(", ".join(cities)) or "—"}</div>'
         f'<div style="font-size:15px;margin-top:4px">'
         f'<b>{len(chains_scanned)}</b> רשתות · '
         f'<b>{len(stores_scanned)}</b> סניפים · '
-        f'<b>{sum(promos_by_region.values()) or len(sm.promos)}</b> מבצעי בשר</div>'
-        f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:6px">'
-        f'רשתות: ' + " · ".join(escape(c) for c in chains_scanned)
-        + '</div>'
-        f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
-        f'בכל אזור מוצגים המבצעים הטובים ביותר, מההנחה הגבוהה לנמוכה.'
-        f'</div></div>'
+        f'<b>{sum(counts.values()) or len(sm.promos)}</b> מבצעי בשר</div>'
+        f'<div style="{small}">רשתות שנסרקו: '
+        + (" · ".join(escape(c) for c in chains_scanned) or "אין") + '</div>'
+        + (f'<div style="{small}">נסרקו, ללא מבצעי בשר היום: '
+           + " · ".join(escape(c) for c in without) + '</div>' if without else '')
+        + (f'<div style="{small}">אין סניפים באזור: '
+           + " · ".join(escape(c) for c in no_stores) + '</div>' if no_stores else '')
+        + (f'<div style="font-size:12px;color:{_COLOR_DANGER};margin-top:4px">הסריקה נכשלה: '
+           + " · ".join(f"{escape(c)} ({escape(why)})" for c, why in failed.items())
+           + '</div>' if failed else '')
+        + f'<div style="{small}">בכל קטגוריה (נתח אחד של בעל חיים אחד) מוצגים '
+        f'{top_n} המבצעים הזולים ביותר, לפי מחיר המבצע לק"ג.</div></div>'
     )
 
     if not sm.promos:
@@ -723,78 +896,80 @@ def _supermarkets_section_html(sm) -> str:
         f'letter-spacing:0.5px'
     )
     cell = f'border-top:1px solid {_COLOR_BORDER};vertical-align:top'
+    unranked_header_done = False
 
-    # One card per region, best deal first.
-    for region, items in grouped.items():
+    for cat, ranked, items in _group_meat_by_category(sm):
+        if not ranked and not unranked_header_done:
+            html.append(
+                f'<div style="margin:24px 0 10px;font-family:{_FONT_STACK};text-align:right;'
+                f'font-size:13px;color:{_COLOR_MUTED}"><b>קטגוריות כלליות</b> — '
+                f'מוצרים שונים זה מזה, לכן הרשימה לא מדורגת לפי מחיר.</div>'
+            )
+            unranked_header_done = True
         rows_html = []
         for i, p in enumerate(items):
-            is_best = i == 0
+            is_best = ranked and i == 0
             row_bg = "#ecfdf5" if is_best else ("#ffffff" if i % 2 == 0 else _COLOR_BG_SOFT)
-            pct_txt = f"{int(p.savings_pct)}%" if p.savings_pct is not None else "—"
+            main, second = _meat_price_parts(p)
             best_badge = (
                 f'<div><span style="display:inline-block;background:{_COLOR_ACCENT};'
                 f'color:#fff;font-size:10px;font-weight:700;padding:2px 6px;'
-                f'border-radius:4px;margin-top:3px">הכי משתלם</span></div>'
+                f'border-radius:4px;margin-top:3px">הכי זול</span></div>'
                 if is_best else ""
             )
-            category = _categorize(p)
-            where = _where_label(p)
+            tag_html = "".join(
+                f'<span style="display:inline-block;border:1px solid {_COLOR_BORDER};'
+                f'border-radius:4px;padding:0 5px;margin-left:4px;font-size:11px;'
+                f'color:{_COLOR_MUTED}">{escape(t)}</span>'
+                for t in _meat_tags(p)
+            )
             rows_html.append(
                 f'<tr style="background:{row_bg}">'
-                # Rank
                 f'<td style="padding:8px 6px 8px 0;font-size:12px;color:{_COLOR_MUTED};'
-                f'text-align:center;{cell}">{i + 1}</td>'
-                # Chain column
+                f'text-align:center;{cell}">{i + 1 if ranked else "•"}</td>'
                 f'<td style="padding:8px 10px;font-size:12px;color:{_COLOR_LINK};'
                 f'font-weight:600;{cell};text-align:right">{escape(p.chain)}'
-                + (f'<div style="font-size:11px;font-weight:400;color:{_COLOR_MUTED};'
-                   f'margin-top:2px">{escape(where)}</div>' if where else '')
+                f'<div style="font-size:11px;font-weight:400;color:{_COLOR_MUTED};'
+                f'margin-top:2px">{escape(_meat_store_label(p))}</div>'
                 + best_badge
                 + '</td>'
-                # Item name
                 f'<td style="padding:8px 10px;font-size:13px;color:{_COLOR_TEXT};'
-                f'{cell};text-align:right">'
-                f'{escape(p.item_name[:60])}'
+                f'{cell};text-align:right">{escape(p.item_name[:60])}'
+                + (f'<div style="margin-top:3px">{tag_html}</div>' if tag_html else '')
                 + (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
                    f'{escape(p.promotion_description[:70])}</div>'
                    if p.promotion_description else '')
-                + f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-                  f'{_category_icon(category)} {escape(category)}</div>'
                 + '</td>'
-                # Price (was / now)
-                f'<td style="padding:8px 10px;font-size:12px;text-align:left;'
-                f'white-space:nowrap;{cell}">{_price_cell_html(p)}</td>'
-                # Discount %
-                f'<td style="padding:8px 10px;font-size:14px;font-weight:700;'
-                f'color:{_COLOR_DANGER};text-align:left;white-space:nowrap;{cell}">'
-                f'<span dir="ltr">-{pct_txt}</span></td>'
-                f'</tr>'
+                f'<td style="padding:8px 10px;font-size:13px;text-align:left;'
+                f'white-space:nowrap;{cell}"><b style="color:{_COLOR_TEXT}" dir="rtl">'
+                f'{escape(main)}</b>'
+                + (f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px" dir="rtl">'
+                   f'{escape(second)}</div>' if second else '')
+                + '</td></tr>'
             )
 
-        total_in_region = promos_by_region.get(region, len(items))
-        shown_txt = (
-            f'{len(items)} המבצעים הטובים ביותר מתוך {total_in_region}'
-            if total_in_region > len(items) else f'{len(items)} מבצעים'
-        )
+        total = counts.get(cat, len(items))
+        if ranked:
+            shown_txt = (f'{len(items)} הזולים ביותר מתוך {total}'
+                         if total > len(items) else f'{len(items)} מבצעים')
+        else:
+            shown_txt = (f'{len(items)} מתוך {total} · לא מדורג'
+                         if total > len(items) else f'{len(items)} מבצעים · לא מדורג')
         html.append(
             f'<div style="margin:0 0 20px;background:#ffffff;border:1px solid {_COLOR_BORDER};'
             f'border-radius:10px;overflow:hidden;font-family:{_FONT_STACK}">'
-            # Header strip
             f'<div style="padding:10px 14px;background:{_COLOR_BG_SOFT};'
             f'border-bottom:1px solid {_COLOR_BORDER};text-align:right">'
             f'<div style="font-size:15px;font-weight:700;color:{_COLOR_TEXT}">'
-            f'📍 {escape(region)}</div>'
-            f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">'
-            f'{stores_by_region.get(region, 0)} סניפים נסרקו · {shown_txt}'
-            f'</div></div>'
-            # Table header + body
+            f'{_category_icon(cat)} {escape(cat)}</div>'
+            f'<div style="font-size:11px;color:{_COLOR_MUTED};margin-top:2px">{shown_txt}</div>'
+            f'</div>'
             '<table dir="rtl" style="border-collapse:collapse;width:100%">'
             '<thead><tr>'
             f'<th style="{th_style};text-align:center">#</th>'
-            f'<th style="{th_style};text-align:right">רשת</th>'
+            f'<th style="{th_style};text-align:right">רשת וסניף</th>'
             f'<th style="{th_style};text-align:right">מוצר</th>'
-            f'<th style="{th_style};text-align:left">מחיר</th>'
-            f'<th style="{th_style};text-align:left">הנחה</th>'
+            f'<th style="{th_style};text-align:left">מחיר מבצע</th>'
             '</tr></thead>'
             '<tbody>' + "".join(rows_html) + '</tbody>'
             '</table>'
@@ -1043,35 +1218,15 @@ def build_daily_payload(report) -> EmailPayload | None:
 
     # ---- Plain text ----
     text_lines = ["דוח יומי", "=" * 50, ""]
-    text_lines.append("מבצעים כלל-אתריים")
-    text_lines.append("-" * 50)
-    text_lines.append("")
-    if not site_digests:
-        text_lines.append("  (אין אתרים ברשימת המעקב)")
-        text_lines.append("")
-    for d in site_digests:
-        text_lines.append(f"▼ {d.display_name}  ({d.host})")
-        text_lines.append(f"  {d.homepage_url}")
-        if d.status != "ok":
-            text_lines.append(f"  [{_status_he(d.status)}] {d.error or ''}")
-            text_lines.append("")
-            continue
-        if not d.promos:
-            text_lines.append("  (לא זוהה מבצע כלל-אתרי)")
-            text_lines.append("")
-            continue
-        for i, p in enumerate(d.promos, 1):
-            code_part = f"קוד: {p.code}" if p.code else "ללא קוד"
-            text_lines.append(f"  {i}. {p.discount_pct}% הנחה  —  {code_part}")
-            if p.condition:
-                text_lines.append(f"     {p.condition[:200]}")
-        text_lines.append("")
+    text_lines.extend(_site_promos_section_text(site_digests))
     text_lines.extend(_creatine_section_text(report.creatine))
     text_lines.append("")
     text_lines.extend(_sims4_section_text(getattr(report, "sims4", None)))
     text_lines.append("")
     text_lines.extend(_supermarkets_section_text(sm))
     text_lines.append("")
+    from price_watcher import marketplace as _marketplace  # #54 hook
+    text_lines.extend(_marketplace.section_text(getattr(report, "marketplace", None)))
     text_lines.append(f"— {_SIGNATURE}")
     text_body = "\n".join(text_lines)
 
@@ -1095,48 +1250,7 @@ def build_daily_payload(report) -> EmailPayload | None:
         f'<tr><td style="padding:16px 24px;text-align:right">',
         _section_heading_html("מבצעים כלל-אתריים", first=True),
     ]
-    if not site_digests:
-        html_parts.append(
-            '<div style="color:#888;font-style:italic">אין אתרים ברשימת המעקב.</div>'
-        )
-    for d in site_digests:
-        html_parts.append(
-            f'<div style="margin:0 0 20px;padding:14px 16px;border:1px solid #e5e7eb;'
-            f'border-radius:8px;background:#fafafa">'
-            f'<div style="font-size:16px;font-weight:600">{escape(d.display_name)}'
-            f' <a href="{escape(d.homepage_url)}" dir="ltr" style="font-weight:normal;color:#2563eb;'
-            f'text-decoration:none;font-size:13px">({escape(d.host)})</a></div>'
-        )
-        if d.status != "ok":
-            html_parts.append(
-                f'<div style="margin-top:8px;color:#c33">'
-                f'<b>{escape(_status_he(d.status))}:</b> {escape(d.error or "—")}</div>'
-            )
-        elif not d.promos:
-            html_parts.append(
-                '<div style="margin-top:8px;color:#888;font-style:italic">'
-                'לא זוהה מבצע כלל-אתרי</div>'
-            )
-        else:
-            for p in d.promos:
-                code_html = (
-                    f'<code dir="ltr" style="background:#111;color:#fff;padding:2px 8px;'
-                    f'border-radius:4px;font-size:14px;font-weight:600">{escape(p.code)}</code>'
-                    if p.code
-                    else '<span style="color:#888;font-size:13px">(ללא קוד)</span>'
-                )
-                html_parts.append(
-                    f'<div style="margin:10px 0 0;padding-top:10px;border-top:1px solid #eee">'
-                    f'<div style="font-size:15px">'
-                    f'<b style="color:#dc2626">{p.discount_pct}% הנחה</b>  &nbsp; {code_html}</div>'
-                )
-                if p.condition:
-                    html_parts.append(
-                        f'<div style="margin-top:4px;color:#555;font-size:13px">'
-                        f'{escape(p.condition[:300])}</div>'
-                    )
-                html_parts.append('</div>')
-        html_parts.append('</div>')
+    html_parts.append(_site_promos_section_html(site_digests))
 
     html_parts.append(_section_heading_html("קריאטין"))
     html_parts.append(_creatine_section_html(report.creatine))
@@ -1146,6 +1260,7 @@ def build_daily_payload(report) -> EmailPayload | None:
 
     html_parts.append(_section_heading_html("מבצעי בשר בסופרמרקטים"))
     html_parts.append(_supermarkets_section_html(sm))
+    html_parts.append(_marketplace.section_html(getattr(report, "marketplace", None)))  # #54 hook
 
     html_parts.append(
         f'</td></tr>'
@@ -1165,31 +1280,15 @@ def send_daily_email(report) -> bool:
     if payload is None:
         log.info("No daily report to send")
         return True
-    cfg = _config_module.load().email
+    try:
+        cfg = _config_module.load().email
+    except Exception as exc:  # missing / invalid SMTP settings in .env
+        log.error("Cannot send the daily email: %s", exc)
+        return False
     try:
         _send_via_smtp(payload, cfg)
         log.info("Daily email sent to %s", cfg.email_to)
         return True
     except (smtplib.SMTPException, OSError) as exc:
-        log.error("Daily email send failed: %s", type(exc).__name__)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Legacy digest-only payload (kept for backward compatibility, unused now)
-# ---------------------------------------------------------------------------
-
-def send_digest_email(digests) -> bool:
-    """Send the daily digest email. Returns True on success, False on failure."""
-    payload = build_digest_payload(digests)
-    if payload is None:
-        log.info("No digest to send (no sites)")
-        return True
-    cfg = _config_module.load().email
-    try:
-        _send_via_smtp(payload, cfg)
-        log.info("Digest email sent to %s", cfg.email_to)
-        return True
-    except (smtplib.SMTPException, OSError) as exc:
-        log.error("Digest email send failed: %s", type(exc).__name__)
+        log.error("Daily email send failed: %s: %s", type(exc).__name__, exc)
         return False
