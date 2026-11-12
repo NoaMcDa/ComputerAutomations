@@ -10,6 +10,7 @@ pages and merges them into one ranked list:
   חוליו            hulyo.co.il catalogue files
   טרווליסט         travelist.co.il flight-deal file
   טיסות סודיות     secretflights.co.il deal feed
+  הולידיי פיינדר   holidayfinder.co.il "secret deals" lists (offers feed)
 
 Every source is plain HTTP, runs independently, and a failing source never
 sinks the others. Prices are per person as each site states them.
@@ -486,8 +487,8 @@ def _client(**extra_headers: str) -> httpx.Client:
 
 # ---- Sources ----
 #
-# Luggage: only Flying Carpet (_flying_luggage) and Hulyo (_hulyo_luggage)
-# state it per deal in the data scanned here. Issta's cards and links,
+# Luggage: only Flying Carpet (_flying_luggage), Hulyo (_hulyo_luggage) and
+# Holiday Finder (_hf_luggage) state it per deal in the data scanned here. Issta's cards and links,
 # Eshet's promotions, Gulliver's hot deals, Travelist and Secret Flights carry
 # no luggage field, so their deals stay LUGGAGE_UNKNOWN. (Eshet's page has a
 # general sale blurb about luggage, but nothing tied to a deal.)
@@ -884,6 +885,124 @@ def _scan_secret_flights() -> list[VacationDeal]:
     return out
 
 
+_HOLIDAY_FINDER = "הולידיי פיינדר"
+_HF_BOARDS = {
+    "RO": "לינה בלבד", "BB": "לינה וארוחת בוקר", "HB": "חצי פנסיון",
+    "FB": "פנסיון מלא", "AI": "הכל כלול",
+}
+
+
+def _hf_luggage(stickers: object) -> str:
+    """Luggage of a Holiday Finder offer from its stickers.
+
+    luggageIncluded = suitcase, carryOnTrolleyIncluded = trolley, both for
+    every passenger both ways (the deal page shows "טרולי כלול" or the trolley
+    add-on price to match). A missing flag means the deal doesn't say.
+    """
+    if not isinstance(stickers, dict):
+        return LUGGAGE_UNKNOWN
+    return _trip_luggage([_leg_luggage(stickers.get("luggageIncluded"),
+                                       stickers.get("carryOnTrolleyIncluded"))])
+
+
+def _hf_offer(item: dict, base: str) -> Optional[VacationDeal]:
+    """One Holiday Finder offer -> VacationDeal (None when price or destination is missing)."""
+    offer = item.get("offer") or {}
+    dest = item.get("destinationData") or {}
+    hotel = item.get("hotel") or {}
+    flight = item.get("flight") or {}
+    stickers = offer.get("stickers") or {}
+    total = _dec(offer.get("price"))  # whole package for the priced party
+    destination = _clean(dest.get("name"))
+    if total is None or not destination:
+        return None
+    capacity = offer.get("capacity") or {}
+    adults, children = _int(capacity.get("adult")), _int(capacity.get("child"))
+    party = adults + children
+    stars = _stars(hotel.get("rating"))
+    name = _clean(hotel.get("name"))
+    board = _HF_BOARDS.get(_clean(stickers.get("boardType")).upper(), "")
+    url = str(offer.get("packageDeeplinkUrl") or "")
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return VacationDeal(
+        source=_HOLIDAY_FINDER, kind=KIND_PACKAGE, destination=destination,
+        price=_dec(total / party) if party else total,
+        currency=_currency(offer.get("currency") or "USD"),
+        url=_abs_url(base, url) if url else f"{base}/in/the-secret-deals",
+        country=_clean(dest.get("atlas_top") or dest.get("atlas_top_en")),
+        date_from=_date(offer.get("outboundDate")), date_to=_date(offer.get("inboundDate")),
+        nights=_int(offer.get("duration")) or None,
+        hotel=name + (_star_label(stars) if name else ""),
+        note=" · ".join(x for x in (
+            board, "טיסה ישירה" if stickers.get("direct") else "", _clean(flight.get("company_name")),
+        ) if x),
+        includes=_includes(
+            _FLIGHT_INCLUDED, _hotel_line(name, stars), board, hotel.get("roomName"),
+        ),
+        adults=adults, children=children, total_price=total if party else None,
+        stars=stars, luggage=_hf_luggage(stickers),
+    )
+
+
+def _scan_holiday_finder() -> list[VacationDeal]:
+    """Holiday Finder's "secret deals" (holidayfinder.co.il/in/the-secret-deals).
+
+    The page reads its deal lists (offer ids) from partner-data, then prices
+    each list with an offers call for two adults from TLV, as the page does.
+    Lists are priced one call each: the server fails (500) on a call that
+    mixes ids from different lists. A failing list is skipped and logged; the
+    source fails only when every list does. The rest of the site is a date
+    search and isn't scanned.
+    """
+    base = "https://www.holidayfinder.co.il"
+    out: list[VacationDeal] = []
+    seen: set[str] = set()
+    with _client(Accept="application/json", Referer=f"{base}/in/the-secret-deals",
+                 Origin=base) as c:
+        lists = c.get(f"{base}/api/v-6/v6-release/partner-data",
+                      params={"name": "the-secret-deals"})
+        lists.raise_for_status()
+        payload = lists.json() or {}
+        if "lists" not in payload:
+            payload = payload.get("data") or {}
+        id_lists = [ids for ids in (
+            list(dict.fromkeys(i for i in lst.get("hfOfferIds") or [] if i))
+            for lst in payload.get("lists") or [] if isinstance(lst, dict)
+        ) if ids]
+        if not id_lists:
+            raise ValueError("no deal ids in the secret-deals lists")
+        last_error: Optional[Exception] = None
+        priced = 0
+        for ids in id_lists:
+            body = {"data": {
+                "locale": "he", "market": 4, "currency": "USD",
+                "limit": max(100, len(ids)), "offset": 0,
+                "hfOffers": [{"id": i, "offerId": i,
+                              "capacity": {"adult": 2, "child": 0, "childAges": [], "room": 1},
+                              "airports": ["TLV"], "filters": []} for i in ids],
+            }}
+            try:
+                r = c.post(f"{base}/api_no_auth/holiday_finder/offers/", json=body)
+                r.raise_for_status()
+                items = ((r.json() or {}).get("data") or {}).get("offers") or []
+            except (httpx.HTTPError, ValueError) as e:
+                log.warning("Holiday Finder: a deal list of %d ids failed: %s", len(ids), e)
+                last_error = e
+                continue
+            priced += 1
+            for item in items:
+                key = str(((item.get("offer") or {}).get("hfOfferId")) or id(item)) \
+                    if isinstance(item, dict) else ""
+                deal = _hf_offer(item, base) if key and key not in seen else None
+                if deal:
+                    seen.add(key)
+                    out.append(deal)
+    if not priced and last_error is not None:
+        raise last_error
+    return out
+
+
 _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
     ("איסתא", _scan_issta),
     ("אשת טורס", _scan_eshet),
@@ -892,6 +1011,7 @@ _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
     ("חוליו", _scan_hulyo),
     ("טרווליסט", _scan_travelist),
     ("טיסות סודיות", _scan_secret_flights),
+    (_HOLIDAY_FINDER, _scan_holiday_finder),
 )
 
 
