@@ -444,6 +444,35 @@ def _includes(*parts: object) -> list[str]:
     return out
 
 
+# Luggage states from least to most included; a trip gets what every leg has.
+_LUGGAGE_ORDER = (LUGGAGE_NONE, LUGGAGE_CARRY_ON, LUGGAGE_SUITCASE)
+
+
+def _leg_luggage(suitcase: Optional[bool], trolley: Optional[bool]) -> Optional[str]:
+    """Luggage state of one flight leg; None when the site leaves it open.
+
+    `suitcase` / `trolley`: True = included, False = not included, None = not stated.
+    """
+    if suitcase:
+        return LUGGAGE_SUITCASE
+    if suitcase is False:
+        if trolley:
+            return LUGGAGE_CARRY_ON
+        if trolley is False:
+            return LUGGAGE_NONE
+    return None
+
+
+def _trip_luggage(legs: list[Optional[str]]) -> str:
+    """Only what holds on every leg: a suitcase out but nothing back is LUGGAGE_NONE.
+
+    LUGGAGE_UNKNOWN when there are no legs or any leg is not stated.
+    """
+    if not legs or any(leg is None for leg in legs):
+        return LUGGAGE_UNKNOWN
+    return min(legs, key=_LUGGAGE_ORDER.index)
+
+
 def _abs_url(base: str, href: object) -> str:
     """Join + percent-encode (some sites put brackets / spaces / Hebrew in links)."""
     return quote(urljoin(base, str(href or "")), safe=":/?&=%#+,;@~")
@@ -456,6 +485,12 @@ def _client(**extra_headers: str) -> httpx.Client:
 
 
 # ---- Sources ----
+#
+# Luggage: only Flying Carpet (_flying_luggage) and Hulyo (_hulyo_luggage)
+# state it per deal in the data scanned here. Issta's cards and links,
+# Eshet's promotions, Gulliver's hot deals, Travelist and Secret Flights carry
+# no luggage field, so their deals stay LUGGAGE_UNKNOWN. (Eshet's page has a
+# general sale blurb about luggage, but nothing tied to a deal.)
 
 def _scan_issta() -> list[VacationDeal]:
     base = "https://www.issta.co.il"
@@ -544,6 +579,62 @@ def _scan_eshet() -> list[VacationDeal]:
     return out
 
 
+def _positive(value: object) -> Optional[bool]:
+    """'20' / 25 -> True, '0' / 0 -> False, missing or unreadable -> None."""
+    d = _dec(value)
+    return None if d is None else d > 0
+
+
+def _money(symbol: str, value: object) -> str:
+    return f"{symbol}{_dec(value)}"
+
+
+def _flying_luggage(deal: dict) -> tuple[str, str]:
+    """(luggage, luggage_extra) of a Flying Carpet package.
+
+    Each flight leg gives the most it allows (FL_Max_Weight = suitcase kg,
+    FL_Max_Weight_Trolley = trolley kg; "0" = none; the site's own page shows
+    the suitcase from FL_Max_Weight). `chargedBaggagePrices` holds, per
+    direction and per passenger, what the site charges to add a trolley
+    (carryOnBaggage) or a suitcase (checkinBaggage): a price there means that
+    item is not in the package. FL_Max_Weight_Hand (a small handbag) does not
+    count as a carry-on.
+    """
+    flights = (deal.get("roundTripFlight") or {}).get("FlightDetail") or []
+    charged = {bool(b.get("returningLeg")): b
+               for b in deal.get("chargedBaggagePrices") or [] if isinstance(b, dict)}
+    if flights:
+        # One-way = one leg; otherwise the first half goes out, the rest comes back.
+        legs = [(f, i >= (len(flights) + 1) // 2) for i, f in enumerate(flights)]
+    else:
+        legs = [({}, returning) for returning in sorted(charged)]
+    states = []
+    for flight, returning in legs:
+        bag = charged.get(returning) or {}
+        suitcase = False if _positive(bag.get("checkinBaggage")) else _positive(flight.get("FL_Max_Weight"))
+        trolley = False if _positive(bag.get("carryOnBaggage")) else _positive(flight.get("FL_Max_Weight_Trolley"))
+        states.append(_leg_luggage(suitcase, trolley))
+    luggage = _trip_luggage(states)
+    if luggage == LUGGAGE_SUITCASE:
+        return luggage, ""
+    symbol = _clean(deal.get("currenySymbol")) or "$"
+    per_leg = []
+    for returning in (False, True):
+        bag = charged.get(returning) or {}
+        per_leg.append(", ".join(x for x in (
+            f"טרולי {_money(symbol, bag['carryOnBaggage'])}" if _positive(bag.get("carryOnBaggage")) else "",
+            f"מזוודה {_money(symbol, bag['checkinBaggage'])}" if _positive(bag.get("checkinBaggage")) else "",
+        ) if x))
+    out_text, back_text = per_leg
+    if out_text == back_text:
+        extra = f"{out_text} לכיוון" if out_text else ""
+    else:
+        extra = " · ".join(x for x in (
+            f"הלוך: {out_text}" if out_text else "", f"חזור: {back_text}" if back_text else "",
+        ) if x)
+    return luggage, extra
+
+
 def _scan_flying_carpet() -> list[VacationDeal]:
     base = "https://www.flying.co.il"
     api = "https://apipck.flyingisr.com/api"
@@ -581,14 +672,7 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             transfers = f"העברות: {transfers}"
         elif "without transfers" in _he(d.get("subjectName")).lower():
             transfers = "ללא העברות"
-        bag = next((b for b in d.get("chargedBaggagePrices") or []
-                    if b.get("carryOnBaggage") or b.get("checkinBaggage")), None)
-        baggage = ""
-        if bag:
-            baggage = "כבודה בתוספת תשלום לכיוון: " + ", ".join(x for x in (
-                f"טרולי ${bag['carryOnBaggage']}" if bag.get("carryOnBaggage") else "",
-                f"מזוודה ${bag['checkinBaggage']}" if bag.get("checkinBaggage") else "",
-            ) if x)
+        luggage, luggage_extra = _flying_luggage(d)
         out.append(VacationDeal(
             source="השטיח המעופף", kind=KIND_PACKAGE, destination=destination, price=price,
             currency=_currency(d.get("currenySymbol")),
@@ -600,11 +684,12 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             note=_clean(d.get("priceRemark")),
             includes=_includes(
                 _FLIGHT_INCLUDED, _hotel_line(hotel, stars), _he(d.get("boardBasisName")),
-                _he(d.get("roomTypeName")), transfers, baggage,
+                _he(d.get("roomTypeName")), transfers,
             ),
             adults=_int(d.get("adult")), children=_int(d.get("child")),
             total_price=_dec((d.get("discountedPrice") or {}).get("price")),
             stars=stars,
+            luggage=luggage, luggage_extra=luggage_extra,
         ))
     return out
 
@@ -660,17 +745,22 @@ def _scan_gulliver() -> list[VacationDeal]:
     return out
 
 
-def _hulyo_baggage(product: dict) -> str:
-    """'מזוודה לא כלולה · טרולי כלול' — only what holds on every flight leg."""
-    legs = [leg.get("baggageAllowance") or {} for leg in product.get("legRefs") or []]
-    parts = []
-    for key, label, suffix in (("baggage", "מזוודה", "ה"), ("trolley", "טרולי", "")):
-        values = {leg.get(key) for leg in legs}
-        if values == {"include"}:
-            parts.append(f"{label} כלול{suffix}")
-        elif values == {"notInclude"}:
-            parts.append(f"{label} לא כלול{suffix}")
-    return " · ".join(parts)
+_HULYO_INCLUDED = {"include": True, "notInclude": False}
+
+
+def _hulyo_luggage(product: dict) -> str:
+    """Luggage of a Hulyo product from each leg's baggageAllowance.
+
+    {"baggage": suitcase, "trolley": carry-on}, each "include" / "notInclude".
+    Only what holds on every leg counts (see _trip_luggage). Hulyo quotes no
+    add-on prices in this data, so there is no luggage_extra.
+    """
+    states = []
+    for leg in product.get("legRefs") or []:
+        allowance = leg.get("baggageAllowance") or {}
+        states.append(_leg_luggage(_HULYO_INCLUDED.get(allowance.get("baggage")),
+                                   _HULYO_INCLUDED.get(allowance.get("trolley"))))
+    return _trip_luggage(states)
 
 
 def _scan_hulyo() -> list[VacationDeal]:
@@ -709,11 +799,12 @@ def _scan_hulyo() -> list[VacationDeal]:
                     note=board,
                     includes=_includes(
                         _FLIGHT_INCLUDED, _hotel_line(hotel.get("name"), hotel.get("rating")),
-                        board, room, _hulyo_baggage(product),
+                        board, room,
                     ) if kind == KIND_PACKAGE else [],
                     adults=pax.count("A") if kind == KIND_PACKAGE else 0,
                     children=pax.count("C") if kind == KIND_PACKAGE else 0,
                     stars=_stars(hotel.get("rating")) if kind == KIND_PACKAGE else None,
+                    luggage=_hulyo_luggage(product),
                 ))
     return out
 
