@@ -58,12 +58,11 @@ from price_watcher.paths import data_dir
 
 log = logging_setup.get(__name__)
 
+from price_watcher.http_headers import USER_AGENT
+
 _SCHEMA_VERSION = 1
 _BASE = "https://www.facebook.com"
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+_BROWSER_UA = USER_AGENT
 
 # Statuses of one query fetch.
 STATUS_OK = "ok"

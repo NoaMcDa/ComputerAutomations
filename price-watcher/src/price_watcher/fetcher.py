@@ -36,13 +36,11 @@ from price_watcher import paths
 from price_watcher import sites
 from price_watcher.contracts import FetchResult, FetchStatus
 
+from price_watcher.http_headers import USER_AGENT
+
 log = logging_setup.get(__name__)
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+_USER_AGENT = USER_AGENT
 
 _DEFAULT_HEADERS = {
     "User-Agent": _USER_AGENT,

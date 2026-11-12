@@ -45,3 +45,11 @@ def test_per_user_dirs_are_created_and_utf8_safe(_isolated_app_dirs):
 def test_setup_scripts_exist():
     assert (ROOT / "setup.sh").is_file()
     assert (ROOT / "setup.ps1").is_file()
+
+
+def test_single_user_agent_source():
+    """#40: one shared User-Agent string, no per-module Chrome versions."""
+    src = ROOT / "src" / "price_watcher"
+    offenders = [p.name for p in src.rglob("*.py")
+                 if "Chrome/" in p.read_text(encoding="utf-8") and p.name != "http_headers.py"]
+    assert offenders == []
