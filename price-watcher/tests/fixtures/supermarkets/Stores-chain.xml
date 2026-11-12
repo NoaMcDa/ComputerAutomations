@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Root>
+  <ChainId>7290000000001</ChainId>
+  <SubChains><SubChain><SubChainId>001</SubChainId>
+    <Stores>
+      <Store><StoreId>005</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>קרית אליעזר</StoreName><Address>תל אביב 11</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>028</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>ראשלצ רמת אליהו</StoreName><Address>משורר השואה 15</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>027</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>יד אליהו</StoreName><Address>יגאל אלון 57</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>031</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>הרצליה מרכז</StoreName><Address>סוקולוב 20</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>032</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>סניף ים</StoreName><Address>בן גוריון 3, הרצליה</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>033</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>מורשה</StoreName><Address>קרן היסוד 4</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>034</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>רמת השרון</StoreName><Address>סוקולוב 52</Address><City>2650</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>035</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>חיפה מרכז</StoreName><Address>רחוב הרצליה 5</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>036</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>רעננה אחוזה</StoreName><Address>אחוזה 100</Address><City>8700</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>037</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>שדרות</StoreName><Address>שד' רמת השרון 3</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>038</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>ראשון-לציון מערב</StoreName><Address>הרצל 1</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>039</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>ראשל״צ הזהב</StoreName><Address>דרך השלום</Address><City>0</City><ZipCode>0</ZipCode></Store>
+      <Store><StoreId>040</StoreId><BikoretNo>1</BikoretNo><StoreType>1</StoreType><StoreName>ראשון</StoreName><Address>הרצל 2</Address><City>0</City><ZipCode>0</ZipCode></Store>
+    </Stores>
+  </SubChain></SubChains>
+</Root>

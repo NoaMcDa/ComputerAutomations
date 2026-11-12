@@ -13,6 +13,7 @@ effective_fetch(watch, fetch) -> FetchResult
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -251,6 +252,12 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
     stored_price = _decimal_or_none(ws.get("last_price"))
     stored_promo = _promo_from_dict(ws.get("promo"))
     stored_estimate = _decimal_or_none(ws.get("estimated_final_price"))
+
+    # A fetch that could not read the currency (e.g. a blocked Shopify page
+    # rescued through its product JSON) keeps the watch's stored currency, so
+    # emails still show the symbol.
+    if fetch.currency is None and ws.get("currency"):
+        fetch = dataclasses.replace(fetch, currency=ws["currency"])
 
     # Recovery
     if consecutive > 0 and failure_notified:

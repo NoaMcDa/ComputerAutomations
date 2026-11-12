@@ -240,5 +240,11 @@ def uninstall_digest_schedule() -> None:
     _uninstall()
 
 
+# --- hook: flight watches (#10) + Marketplace preview (#54), see cli_extras.py ---
+from price_watcher.cli_extras import register as _register_extras  # noqa: E402
+
+_register_extras(app)
+
+
 if __name__ == "__main__":
     app()

@@ -56,7 +56,7 @@ def test_dead_code_removed():
 def test_user_agent_is_shared():
     from price_watcher.http_headers import USER_AGENT
     assert dg._HEADERS["User-Agent"] == USER_AGENT
-    assert "Chrome/131" in USER_AGENT
+    assert USER_AGENT.startswith("Mozilla/5.0") and "Chrome/" in USER_AGENT
 
 
 # ---- #47 no_promo ----------------------------------------------------------

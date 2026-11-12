@@ -4,17 +4,21 @@ Public API
 ----------
 fetch(url, selector=None, *, use_browser_fallback=True) -> FetchResult
 
-Extraction ladder (stops at first price found):
+Extraction ladder (stops at the first step that gives a result):
   1. Shopify product JSON  (/products/<handle>.js)
   2. JSON-LD Product/Offer  (via extruct)
   3. Open Graph / meta tags
-  4. Microdata              (via extruct)
+  4. Microdata              (itemprop="price", skipping struck-through prices)
   5. CSS selector           (if `selector` arg provided)
   6. Playwright fallback    (reruns 2-5 on rendered HTML)
+
+A blocked (403/429/challenge) Shopify page is rescued through the product JSON,
+with the currency read from /cart.js or /meta.json.
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import re
@@ -102,18 +106,28 @@ def fetch(
             error_message=error_msg,
         )
 
-    if http_status == 404:
+    if http_status in (404, 410):
         return FetchResult(
             status=FetchStatus.NOT_FOUND,
             final_url=final_url,
             http_status=http_status,
-            error_message="404 Not Found",
+            error_message=f"HTTP {http_status}: page moved or removed",
         )
 
     html = response.text
 
     # Check for block / captcha
     if http_status in (403, 429) or (http_status == 200 and _is_challenge_page(html)):
+        # A Shopify store often blocks the HTML page but still serves the
+        # product JSON, so try that before giving up.
+        rescued = _try_shopify(url, final_url, None, http_status, None)
+        if rescued is not None:
+            if rescued.status == FetchStatus.OK and rescued.currency is None:
+                rescued = dataclasses.replace(
+                    rescued, currency=_shopify_currency(_origin(url))
+                )
+            log.info("HTML blocked for %s; used the Shopify product JSON", url)
+            return rescued
         return FetchResult(
             status=FetchStatus.BLOCKED,
             final_url=final_url,
@@ -125,7 +139,7 @@ def fetch(
     raw_path = _save_raw(url, html)
 
     # --- Extraction ladder ---
-    result = _extract(html, url, final_url, selector, http_status, raw_path, response)
+    result = _extract(html, url, final_url, selector, http_status, raw_path)
 
     # --- Playwright fallback ---
     if use_browser_fallback and result.status == FetchStatus.PRICE_NOT_FOUND:
@@ -154,6 +168,8 @@ def _http_get(
 
     Retries on network errors and 5xx responses with exponential backoff.
     Returns (None, error, None, url) on failure after all retries.
+    Non-ASCII (e.g. Hebrew) URLs are percent-encoded by httpx for the request;
+    the caller keeps the readable form for display.
     """
     last_error: Optional[str] = None
     final_url = url
@@ -194,6 +210,31 @@ def _http_get(
     return None, last_error, None, final_url
 
 
+def _get_json(url: str) -> Optional[object]:
+    """GET *url* and decode JSON; None on any failure (single attempt)."""
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=20,
+            headers=_DEFAULT_HEADERS,
+        ) as client:
+            resp = client.get(url)
+    except Exception as exc:
+        log.debug("JSON fetch failed for %s: %s", url, exc)
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def _currency_from_html(soup: BeautifulSoup) -> Optional[str]:
     """Pull a currency code from meta tags or JSON-LD when a prior extractor got price but no currency."""
     for prop in ("og:price:currency", "product:price:currency"):
@@ -205,6 +246,22 @@ def _currency_from_html(soup: BeautifulSoup) -> Optional[str]:
         m = re.search(r'"priceCurrency"\s*:\s*"([A-Z]{3})"', text)
         if m:
             return m.group(1)
+    return None
+
+
+def _shopify_currency(origin: str) -> Optional[str]:
+    """Store currency from Shopify's cheap JSON endpoints.
+
+    The product JSON (`/products/<handle>.js`) carries no currency, so when the
+    HTML page is unavailable (blocked) the currency comes from `/cart.js`
+    (`currency`) or, failing that, `/meta.json` (`currency`).
+    """
+    for path in ("/cart.js", "/meta.json"):
+        data = _get_json(origin + path)
+        if isinstance(data, dict):
+            cur = data.get("currency")
+            if isinstance(cur, str) and re.fullmatch(r"[A-Za-z]{3}", cur.strip()):
+                return cur.strip().upper()
     return None
 
 
@@ -250,18 +307,29 @@ def _extract(
     selector: Optional[str],
     http_status: Optional[int],
     raw_path: Optional[str],
-    response: Optional[httpx.Response],
+    *,
+    include_shopify: bool = True,
 ) -> FetchResult:
-    """Run the extraction ladder and return a FetchResult."""
+    """Run the extraction ladder and return a FetchResult.
+
+    `include_shopify=False` skips step 1 (used for the Playwright fallback,
+    which only re-reads rendered HTML).
+
+    A step may return a non-OK result (e.g. NOT_FOUND for a pinned variant
+    that is gone); that ends the ladder, so a later step can never silently
+    substitute another variant's price.
+    """
     soup = BeautifulSoup(html, "html.parser")
     title = _extract_title(soup)
 
     # 1. Shopify product JSON
-    result = _try_shopify(url, final_url, title, http_status, raw_path)
-    if result is not None:
-        if result.currency is None:
-            result = dataclasses.replace(result, currency=_currency_from_html(soup))
-        return result
+    if include_shopify:
+        result = _try_shopify(url, final_url, title, http_status, raw_path)
+        if result is not None:
+            if result.status == FetchStatus.OK and result.currency is None:
+                currency = _currency_from_html(soup) or _shopify_currency(_origin(url))
+                result = dataclasses.replace(result, currency=currency)
+            return result
 
     # 2. JSON-LD
     result = _try_jsonld(html, url, final_url, title, http_status, raw_path)
@@ -274,49 +342,11 @@ def _extract(
         return result
 
     # 4. Microdata
-    result = _try_microdata(html, url, final_url, title, http_status, raw_path)
+    result = _try_microdata(soup, final_url, title, http_status, raw_path)
     if result is not None:
         return result
 
     # 5. CSS selector
-    if selector:
-        result = _try_selector(soup, selector, final_url, title, http_status, raw_path)
-        if result is not None:
-            return result
-
-    return FetchResult(
-        status=FetchStatus.PRICE_NOT_FOUND,
-        final_url=final_url,
-        title=title,
-        http_status=http_status,
-        raw_html_path=raw_path,
-    )
-
-
-def _extract_from_html(
-    html: str,
-    url: str,
-    final_url: str,
-    selector: Optional[str],
-    http_status: Optional[int],
-    raw_path: Optional[str],
-) -> FetchResult:
-    """Like _extract but without Shopify step (used in Playwright fallback)."""
-    soup = BeautifulSoup(html, "html.parser")
-    title = _extract_title(soup)
-
-    result = _try_jsonld(html, url, final_url, title, http_status, raw_path)
-    if result is not None:
-        return result
-
-    result = _try_meta(soup, final_url, title, http_status, raw_path)
-    if result is not None:
-        return result
-
-    result = _try_microdata(html, url, final_url, title, http_status, raw_path)
-    if result is not None:
-        return result
-
     if selector:
         result = _try_selector(soup, selector, final_url, title, http_status, raw_path)
         if result is not None:
@@ -342,66 +372,55 @@ def _try_shopify(
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> Optional[FetchResult]:
+    """Read `/products/<handle>.js`.
+
+    Returns None when the URL is not a Shopify product URL or the JSON is not
+    available. When the URL pins `?variant=<id>` and that variant is not in the
+    product, returns NOT_FOUND (never another variant's price).
+    """
     parsed = urlparse(url)
     path_parts = parsed.path.strip("/").split("/")
     if len(path_parts) < 2 or path_parts[0] != "products":
         return None
 
     handle = path_parts[1]
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    js_url = f"{origin}/products/{handle}.js"
+    js_url = f"{_origin(url)}/products/{handle}.js"
 
-    # Check for variant in query string
     qs = parse_qs(parsed.query)
-    variant_id: Optional[str] = None
-    if "variant" in qs:
-        variant_id = qs["variant"][0]
+    variant_id: Optional[str] = qs["variant"][0] if qs.get("variant") else None
 
-    try:
-        with httpx.Client(
-            follow_redirects=True,
-            timeout=20,
-            headers=_DEFAULT_HEADERS,
-        ) as client:
-            resp = client.get(js_url)
-    except Exception as exc:
-        log.debug("Shopify .js fetch failed for %s: %s", js_url, exc)
+    data = _get_json(js_url)
+    if not isinstance(data, dict):
         return None
 
-    if resp.status_code != 200:
-        return None
-
-    try:
-        data = resp.json()
-    except Exception:
-        return None
-
-    variants = data.get("variants", [])
+    variants = data.get("variants") or []
     if not variants:
         return None
 
-    variant = None
-    if variant_id:
-        for v in variants:
-            if str(v.get("id")) == str(variant_id):
-                variant = v
-                break
+    prod_title = data.get("title") or title
 
-    if variant is None:
-        # Pick first available, or first overall
+    if variant_id:
+        variant = next((v for v in variants if str(v.get("id")) == str(variant_id)), None)
+        if variant is None:
+            return FetchResult(
+                status=FetchStatus.NOT_FOUND,
+                final_url=final_url,
+                title=prod_title,
+                http_status=http_status,
+                raw_html_path=raw_path,
+                error_message=f"Shopify variant {variant_id} not found in product",
+            )
+    else:
+        # No variant pinned: the product's default (first available, else first)
         variant = next((v for v in variants if v.get("available")), variants[0])
 
-    price_cents = variant.get("price")
-    if price_cents is None:
+    price = _shopify_money(variant.get("price"))
+    if price is None:
         return None
-
-    try:
-        price = Decimal(str(price_cents)) / Decimal("100")
-    except InvalidOperation:
-        return None
+    compare_at = _shopify_money(variant.get("compare_at_price"))
+    regular_price = compare_at if compare_at is not None and compare_at > price else None
 
     currency = data.get("currency") or variant.get("currency")
-    prod_title = data.get("title") or title
     available = variant.get("available")
     in_stock = bool(available) if available is not None else None
 
@@ -411,15 +430,132 @@ def _try_shopify(
         title=prod_title,
         price=price,
         currency=currency,
+        regular_price=regular_price,
         in_stock=in_stock,
         http_status=http_status,
         raw_html_path=raw_path,
     )
 
 
+def _shopify_money(cents: object) -> Optional[Decimal]:
+    """Shopify `.js` prices are integer cents."""
+    if cents is None or isinstance(cents, bool):
+        return None
+    try:
+        return Decimal(str(cents)) / Decimal("100")
+    except InvalidOperation:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Step 2: JSON-LD
 # ---------------------------------------------------------------------------
+
+# Query parameters that pin a variant in the watched URL.
+_VARIANT_PARAMS = ("variation", "variant", "sku")
+
+# JSON-LD keys that identify a variant / offer.
+_JSONLD_ID_KEYS = ("sku", "productID", "gtin", "gtin8", "gtin12", "gtin13", "gtin14", "mpn")
+
+
+def _jsonld_wanted_ids(url: str) -> set[str]:
+    qs = parse_qs(urlparse(url).query)
+    return {v.strip() for k in _VARIANT_PARAMS for v in qs.get(k, []) if v.strip()}
+
+
+def _jsonld_type_is(node: dict, *names: str) -> bool:
+    t = node.get("@type", "")
+    types = t if isinstance(t, list) else [t]
+    for item in types:
+        if isinstance(item, str) and item.rsplit("/", 1)[-1] in names:
+            return True
+    return False
+
+
+def _jsonld_flatten(items: list) -> list[dict]:
+    flat: list[dict] = []
+    stack = list(items)
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, list):
+            stack[0:0] = item
+        elif isinstance(item, dict):
+            if "@graph" in item:
+                stack[0:0] = list(item.get("@graph") or [])
+            else:
+                flat.append(item)
+    return flat
+
+
+def _as_list(value: object) -> list:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _node_ids(node: dict) -> set[str]:
+    """Variant identifiers exposed by one JSON-LD node (Product or Offer)."""
+    ids: set[str] = set()
+    for key in _JSONLD_ID_KEYS:
+        for v in _as_list(node.get(key)):
+            if isinstance(v, (str, int)) and str(v).strip():
+                ids.add(str(v).strip())
+    for key in ("url", "@id"):
+        for v in _as_list(node.get(key)):
+            if isinstance(v, str):
+                ids |= _jsonld_wanted_ids(v)
+    return ids
+
+
+def _jsonld_candidates(product: dict) -> list[tuple[dict, dict]]:
+    """All (offer, owning product) pairs under a Product / ProductGroup."""
+    owners = [product] + [
+        v for v in _as_list(product.get("hasVariant")) if isinstance(v, dict)
+    ]
+    out: list[tuple[dict, dict]] = []
+    for owner in owners:
+        stack = [o for o in _as_list(owner.get("offers")) if isinstance(o, dict)]
+        while stack:
+            offer = stack.pop(0)
+            nested = [o for o in _as_list(offer.get("offers")) if isinstance(o, dict)]
+            if nested:  # AggregateOffer with individual offers
+                stack[0:0] = nested
+                if offer.get("price") is None and offer.get("lowPrice") is None:
+                    continue
+            out.append((offer, owner))
+    return out
+
+
+def _offer_price(offer: dict) -> tuple[Optional[Decimal], Optional[str]]:
+    raw = offer.get("price")
+    if raw is None:
+        raw = offer.get("lowPrice")
+    currency = offer.get("priceCurrency")
+    if raw is None:
+        for spec in _as_list(offer.get("priceSpecification")):
+            if isinstance(spec, dict) and spec.get("price") is not None:
+                raw = spec.get("price")
+                currency = currency or spec.get("priceCurrency")
+                break
+    if raw is None:
+        return None, None
+    try:
+        price, detected = _parse_price(str(raw))
+    except ValueError:
+        return None, None
+    return price, currency or detected
+
+
+def _availability(value: object) -> Optional[bool]:
+    text = str(value or "").lower().replace(" ", "").replace("_", "")
+    if not text:
+        return None
+    if any(k in text for k in ("outofstock", "soldout", "discontinued", "oos")):
+        return False
+    if any(k in text for k in ("instock", "limitedavailability", "onlineonly", "instoreonly", "preorder")):
+        return True
+    return None
+
 
 def _try_jsonld(
     html: str,
@@ -429,82 +565,72 @@ def _try_jsonld(
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> Optional[FetchResult]:
+    """Read JSON-LD Product / ProductGroup offers.
+
+    Variant selection:
+      * URL names a variant (?variation= / ?variant= / ?sku=) and the page
+        exposes variant ids -> use the matching offer; if none matches, return
+        NOT_FOUND (never another variant's price).
+      * URL names no variant, or the page exposes no ids at all -> the lowest
+        offer price (the product's default "from" price).
+    """
     try:
         data = extruct.extract(html, base_url=url, syntaxes=["json-ld"])
     except Exception as exc:
         log.debug("extruct json-ld failed for %s: %s", url, exc)
         return None
 
-    items = data.get("json-ld", [])
-    if not items:
-        return None
-
-    # Flatten @graph entries
-    flat: list[dict] = []
-    for item in items:
-        if item.get("@type") == "Graph" or "@graph" in item:
-            flat.extend(item.get("@graph", []))
-        else:
-            flat.append(item)
-
-    # Find Product
-    product: Optional[dict] = None
-    for item in flat:
-        t = item.get("@type", "")
-        if t == "Product" or (isinstance(t, list) and "Product" in t):
-            product = item
-            break
-
+    flat = _jsonld_flatten(data.get("json-ld", []))
+    product = next((n for n in flat if _jsonld_type_is(n, "ProductGroup", "Product")), None)
     if product is None:
         return None
 
-    offers_raw = product.get("offers")
-    if offers_raw is None:
+    candidates = []
+    for offer, owner in _jsonld_candidates(product):
+        price, currency = _offer_price(offer)
+        if price is not None:
+            candidates.append((offer, owner, price, currency))
+    if not candidates:
         return None
 
-    # Normalise offers to a list
-    if isinstance(offers_raw, dict):
-        offers = [offers_raw]
-    elif isinstance(offers_raw, list):
-        offers = offers_raw
-    else:
-        return None
+    pool = candidates
+    wanted = _jsonld_wanted_ids(url)
+    if wanted:
+        exposes_ids = False
+        matching = []
+        for cand in candidates:
+            offer, owner = cand[0], cand[1]
+            ids = _node_ids(offer)
+            if owner is not product:  # a hasVariant entry: its ids are variant ids
+                ids |= _node_ids(owner)
+            elif len(candidates) == 1:
+                ids |= _node_ids(owner)
+            if ids:
+                exposes_ids = True
+            if ids & wanted:
+                matching.append(cand)
+        if matching:
+            pool = matching
+        elif exposes_ids:
+            return FetchResult(
+                status=FetchStatus.NOT_FOUND,
+                final_url=final_url,
+                title=product.get("name") or title,
+                http_status=http_status,
+                raw_html_path=raw_path,
+                error_message=f"variant {', '.join(sorted(wanted))} not found in JSON-LD",
+            )
 
-    # Pick lowest price among valid offers
-    best_price: Optional[Decimal] = None
-    best_currency: Optional[str] = None
-    in_stock: Optional[bool] = None
-
-    for offer in offers:
-        raw_price = offer.get("price")
-        if raw_price is None:
-            continue
-        try:
-            p, _ = _parse_price(str(raw_price))
-        except Exception:
-            continue
-
-        if best_price is None or p < best_price:
-            best_price = p
-            best_currency = offer.get("priceCurrency")
-            availability = offer.get("availability", "")
-            if "OutOfStock" in availability:
-                in_stock = False
-            elif "InStock" in availability:
-                in_stock = True
-
-    if best_price is None:
-        return None
-
-    prod_title = product.get("name") or title
+    offer, owner, price, currency = min(pool, key=lambda c: c[2])
+    name = owner.get("name") if owner is not product else None
 
     return FetchResult(
         status=FetchStatus.OK,
         final_url=final_url,
-        title=prod_title,
-        price=best_price,
-        currency=best_currency,
-        in_stock=in_stock,
+        title=name or product.get("name") or title,
+        price=price,
+        currency=currency,
+        in_stock=_availability(offer.get("availability")),
         http_status=http_status,
         raw_html_path=raw_path,
     )
@@ -529,22 +655,17 @@ def _try_meta(
             return tag["content"]
         return None
 
-    amount_str = (
-        _meta("product:price:amount")
-        or _meta("og:price:amount")
-        or _meta("product:price:currency")  # fallback order intentional; checked below
-    )
-    # We need to be specific — re-check in proper order
     amount_str = _meta("product:price:amount") or _meta("og:price:amount")
     if not amount_str:
         return None
 
     try:
         price, detected_currency = _parse_price(amount_str)
-    except Exception:
+    except ValueError:
         return None
 
     currency = _meta("product:price:currency") or _meta("og:price:currency") or detected_currency
+    in_stock = _availability(_meta("product:availability") or _meta("og:availability"))
 
     return FetchResult(
         status=FetchStatus.OK,
@@ -552,68 +673,90 @@ def _try_meta(
         title=title,
         price=price,
         currency=currency,
+        in_stock=in_stock,
         http_status=http_status,
         raw_html_path=raw_path,
     )
 
 
 # ---------------------------------------------------------------------------
+# Struck-through (old) prices
+# ---------------------------------------------------------------------------
+
+_STRUCK_TAGS = ("del", "s", "strike")
+
+
+def _is_struck(tag) -> bool:
+    if getattr(tag, "name", None) in _STRUCK_TAGS:
+        return True
+    style = (tag.get("style") or "") if hasattr(tag, "get") else ""
+    return "line-through" in style.replace(" ", "").lower()
+
+
+def _inside_struck(el) -> bool:
+    node = el
+    while node is not None and getattr(node, "name", None) not in (None, "[document]"):
+        if _is_struck(node):
+            return True
+        node = node.parent
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Step 4: Microdata
 # ---------------------------------------------------------------------------
 
+def _microdata_value(el) -> str:
+    return (el.get("content") or el.get("value") or el.get_text(" ", strip=True) or "").strip()
+
+
 def _try_microdata(
-    html: str,
-    url: str,
+    soup: BeautifulSoup,
     final_url: str,
     title: Optional[str],
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> Optional[FetchResult]:
-    try:
-        data = extruct.extract(html, base_url=url, syntaxes=["microdata"])
-    except Exception as exc:
-        log.debug("extruct microdata failed for %s: %s", url, exc)
+    """Read `itemprop="price"`.
+
+    The first price that is not inside <del>/<s>/<strike> (or a line-through
+    style) is the price charged; a struck-through one is the regular price.
+    """
+    current: Optional[tuple[Decimal, Optional[str]]] = None
+    struck: list[Decimal] = []
+    for el in soup.find_all(attrs={"itemprop": "price"}):
+        try:
+            price, detected = _parse_price(_microdata_value(el))
+        except ValueError:
+            continue
+        if _inside_struck(el):
+            struck.append(price)
+        elif current is None:
+            current = (price, detected)
+    if current is None:
         return None
 
-    items = data.get("microdata", [])
+    price, currency = current
+    cur_el = soup.find(attrs={"itemprop": "priceCurrency"})
+    if cur_el is not None and _microdata_value(cur_el):
+        currency = _microdata_value(cur_el).upper()
+    avail_el = soup.find(attrs={"itemprop": "availability"})
+    in_stock = None
+    if avail_el is not None:
+        in_stock = _availability(avail_el.get("href") or _microdata_value(avail_el))
+    regular = max((p for p in struck if p > price), default=None)
 
-    def _walk(node: object) -> Optional[str]:
-        if isinstance(node, dict):
-            props = node.get("properties", {})
-            # Direct price property
-            price_val = props.get("price")
-            if price_val:
-                if isinstance(price_val, list) and price_val:
-                    return str(price_val[0])
-                if isinstance(price_val, str):
-                    return price_val
-            # Recurse
-            for v in props.values():
-                if isinstance(v, list):
-                    for child in v:
-                        found = _walk(child)
-                        if found:
-                            return found
-        return None
-
-    for item in items:
-        raw_price = _walk(item)
-        if raw_price:
-            try:
-                price, currency = _parse_price(raw_price)
-                return FetchResult(
-                    status=FetchStatus.OK,
-                    final_url=final_url,
-                    title=title,
-                    price=price,
-                    currency=currency,
-                    http_status=http_status,
-                    raw_html_path=raw_path,
-                )
-            except Exception:
-                continue
-
-    return None
+    return FetchResult(
+        status=FetchStatus.OK,
+        final_url=final_url,
+        title=title,
+        price=price,
+        currency=currency,
+        regular_price=regular,
+        in_stock=in_stock,
+        http_status=http_status,
+        raw_html_path=raw_path,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -628,25 +771,58 @@ def _try_selector(
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> Optional[FetchResult]:
-    el = soup.select_one(selector)
+    """Read the price from the element matched by *selector*.
+
+    When the element holds an old and a sale price (`<del>₪129.90</del>
+    <ins>₪99.90</ins>`), the struck-through part is the regular price and the
+    rest is the price charged. Plain text that still holds several different
+    prices is refused by `_parse_price` (narrow the selector instead).
+    """
+    try:
+        el = soup.select_one(selector)
+    except Exception as exc:  # invalid selector syntax
+        log.warning("Invalid CSS selector %r: %s", selector, exc)
+        return None
     if el is None:
         return None
-    text = el.get_text(strip=True)
+
+    el = copy.copy(el)
+    regular_texts: list[str] = []
+    if not _is_struck(el):
+        for struck in el.find_all(_is_struck):
+            if struck.parent is None:  # already removed with an ancestor
+                continue
+            regular_texts.append(struck.get_text(" ", strip=True))
+            struck.decompose()
+
+    text = el.get_text(" ", strip=True)
     if not text:
         return None
     try:
         price, currency = _parse_price(text)
-        return FetchResult(
-            status=FetchStatus.OK,
-            final_url=final_url,
-            title=title,
-            price=price,
-            currency=currency,
-            http_status=http_status,
-            raw_html_path=raw_path,
-        )
-    except Exception:
+    except ValueError as exc:
+        log.info("CSS selector %r: %s", selector, exc)
         return None
+
+    regular: Optional[Decimal] = None
+    for rt in regular_texts:
+        try:
+            p, _ = _parse_price(rt)
+        except ValueError:
+            continue
+        if p > price and (regular is None or p > regular):
+            regular = p
+
+    return FetchResult(
+        status=FetchStatus.OK,
+        final_url=final_url,
+        title=title,
+        price=price,
+        currency=currency,
+        regular_price=regular,
+        http_status=http_status,
+        raw_html_path=raw_path,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,14 +856,13 @@ def _playwright_fallback(
                 )
                 return prior_result
 
-            page = browser.new_page()
             try:
+                page = browser.new_page()
                 page.goto(url, wait_until="networkidle", timeout=30_000)
                 html = page.content()
                 final_url = page.url
             except PlaywrightError as exc:
                 log.warning("Playwright navigation failed for %s: %s", url, exc)
-                browser.close()
                 return prior_result
             finally:
                 browser.close()
@@ -695,8 +870,8 @@ def _playwright_fallback(
         # Save rendered HTML too
         raw_path = _save_raw(url + "#playwright", html)
 
-        result = _extract_from_html(
-            html, url, final_url, selector, http_status, raw_path
+        result = _extract(
+            html, url, final_url, selector, http_status, raw_path, include_shopify=False
         )
 
         # Carry over in-stock info from prior if still missing
@@ -731,6 +906,8 @@ def _extract_title(soup: BeautifulSoup) -> Optional[str]:
 # Currency symbol/code -> ISO code
 _CURRENCY_MAP: dict[str, str] = {
     "₪": "ILS",
+    'ש"ח': "ILS",
+    "ש״ח": "ILS",
     "$": "USD",
     "€": "EUR",
     "£": "GBP",
@@ -742,60 +919,105 @@ _CURRENCY_MAP: dict[str, str] = {
     "GBP": "GBP",
 }
 
-# Ordered longest-first so "NIS" matches before "N"
-_CURRENCY_TOKENS = sorted(_CURRENCY_MAP.keys(), key=len, reverse=True)
+# Symbols match anywhere; letter codes only as whole upper-case words, so
+# "Details 99" is not read as ILS.
+_CURRENCY_RE = "|".join(
+    rf"(?<![A-Za-z]){t}(?![A-Za-z])" if t.isascii() and t.isalpha() else re.escape(t)
+    for t in sorted(_CURRENCY_MAP, key=len, reverse=True)
+)
+_CURRENCY_BEFORE = re.compile(rf"(?:{_CURRENCY_RE})\s*$")
+_CURRENCY_AFTER = re.compile(rf"^\s*(?:{_CURRENCY_RE})")
+_CURRENCY_ANY = re.compile(_CURRENCY_RE)
+
+# One number token: digits joined by separators. Plain spaces are NOT joined
+# (so "129.90 99.90" is two tokens); no-break spaces are, as thousands marks.
+_NUMBER_TOKEN = re.compile(r"\d+(?:[.,'  ]\d+)*")
+
+
+def _currency_code(token: str) -> str:
+    return _CURRENCY_MAP.get(token.strip(), token.strip())
+
+
+def _number_from_token(token: str) -> Decimal:
+    """Turn ONE number token into a Decimal.
+
+    * both '.' and ',' present -> the last one is the decimal mark
+      (1,299.90 / 1.299,90);
+    * the same mark repeated -> thousands marks (1.299.000);
+    * a single mark -> decimal unless exactly three digits follow it
+      (1,299 = 1299; 129,9 = 129.9; 0.999 = 0.999);
+    * thousands groups must be 3 digits, so two prices glued together
+      ("129.9099.90") are rejected instead of becoming 129909990.
+    """
+    seps = re.findall(r"[.,'  ]", token)
+    groups = re.split(r"[.,'  ]", token)
+    if not seps:
+        return Decimal(token)
+
+    last = seps[-1]
+    decimal_part: Optional[str] = None
+    if last in ".," and seps.count(last) == 1:
+        if len(seps) > 1:
+            is_decimal = True
+        else:
+            is_decimal = len(groups[-1]) != 3 or groups[0] == "0" or len(groups[0]) > 3
+        if is_decimal:
+            decimal_part = groups[-1]
+            groups = groups[:-1]
+            seps = seps[:-1]
+
+    if seps:
+        if len(set(seps)) != 1 or not (1 <= len(groups[0]) <= 3) or any(
+            len(g) != 3 for g in groups[1:]
+        ):
+            raise ValueError(f"Malformed number {token!r}")
+
+    normalised = "".join(groups) + (f".{decimal_part}" if decimal_part else "")
+    try:
+        return Decimal(normalised)
+    except InvalidOperation as exc:
+        raise ValueError(f"Cannot convert {token!r} to Decimal") from exc
 
 
 def _parse_price(text: str) -> tuple[Decimal, Optional[str]]:
     """Parse a price string into (Decimal, currency_code | None).
 
-    Handles both US/UK style (1,299.90) and EU style (1.299,90).
-    Raises ValueError if no valid number can be extracted.
+    Handles currency symbols/codes (₪ ש"ח NIS $ € £ ...), thousands marks and
+    both 1,299.90 and 1.299,90 styles. Raises ValueError when no single price
+    can be read.
+
+    Several numbers in one string are never concatenated. They are resolved as:
+      * all numbers equal -> that number;
+      * exactly one distinct value has a currency marker next to it -> that one
+        ("Pack of 2 - ₪49.90" -> 49.90);
+      * otherwise (e.g. "₪129.90 ₪99.90", "Was ₪129.90 Now ₪99.90") -> refused.
+        Which of two prices is charged depends on the shop's layout (old-then-new
+        or new-then-old), so guessing could record the regular price as the
+        price. Callers that see markup (CSS selector, microdata) drop
+        <del>/<s>/<strike> parts first; otherwise the user narrows the selector.
     """
-    text = text.strip()
+    tokens = []  # (value, currency | None)
+    for m in _NUMBER_TOKEN.finditer(text):
+        value = _number_from_token(m.group(0))
+        before = _CURRENCY_BEFORE.search(text[: m.start()])
+        after = _CURRENCY_AFTER.search(text[m.end():])
+        cur_tok = before.group(0) if before else (after.group(0) if after else None)
+        tokens.append((value, _currency_code(cur_tok) if cur_tok else None))
 
-    # Detect and remove currency symbols / codes
-    detected_currency: Optional[str] = None
-    for token in _CURRENCY_TOKENS:
-        if token in text:
-            detected_currency = _CURRENCY_MAP[token]
-            text = text.replace(token, "")
-            break
+    if not tokens:
+        raise ValueError(f"No price in {text!r}")
 
-    # Remove leftover whitespace and miscellaneous non-numeric chars except . , -
-    text = re.sub(r"[^\d.,\-]", "", text).strip()
-
-    if not text:
-        raise ValueError("No numeric content after stripping currency")
-
-    # Determine decimal separator: whichever separator appears LAST
-    # and has 1 or 2 digits after it is the decimal separator.
-    dot_pos = text.rfind(".")
-    comma_pos = text.rfind(",")
-
-    after_dot = len(text) - dot_pos - 1 if dot_pos != -1 else -1
-    after_comma = len(text) - comma_pos - 1 if comma_pos != -1 else -1
-
-    dot_is_decimal = dot_pos != -1 and 1 <= after_dot <= 2
-    comma_is_decimal = comma_pos != -1 and 1 <= after_comma <= 2
-
-    if dot_is_decimal and comma_is_decimal:
-        # Both qualify — the one that appears LAST is the decimal separator
-        if dot_pos > comma_pos:
-            # dot is decimal, comma is thousands
-            normalised = text.replace(",", "")
-        else:
-            # comma is decimal, dot is thousands
-            normalised = text.replace(".", "").replace(",", ".")
-    elif dot_is_decimal:
-        normalised = text.replace(",", "")
-    elif comma_is_decimal:
-        normalised = text.replace(".", "").replace(",", ".")
+    values = {v for v, _ in tokens}
+    if len(values) == 1:
+        chosen = tokens[0][0]
     else:
-        # Neither qualifies as decimal separator — treat as integer
-        normalised = text.replace(",", "").replace(".", "")
+        with_currency = {v for v, c in tokens if c}
+        if len(with_currency) != 1:
+            raise ValueError(f"Several prices in {text!r}; refusing to guess")
+        chosen = with_currency.pop()
 
-    try:
-        return Decimal(normalised), detected_currency
-    except InvalidOperation as exc:
-        raise ValueError(f"Cannot convert '{normalised}' to Decimal") from exc
+    currency = next((c for v, c in tokens if v == chosen and c), None)
+    if currency is None:
+        any_cur = _CURRENCY_ANY.search(text)
+        currency = _currency_code(any_cur.group(0)) if any_cur else None
+    return chosen, currency
