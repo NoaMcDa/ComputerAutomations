@@ -36,6 +36,10 @@ package rows. The other rows are 4–5★.
 Lastminute (lastminute.co.il) was dropped as a source on the owner's
 request: its packages carry no star rating and its reviews are poor.
 
+Secret Flights deals use their own window instead of the continent's:
+departures today .. today + PW_DEALS_SECRET_FLIGHTS_DAYS (90), since the
+site publishes deals 2-4 months ahead.
+
 Undated deals can't be placed in a window and are left out, as are deals
 whose destination can't be placed on a continent (logged and counted).
 PW_DEALS_DAYS, when set, caps every window.
@@ -119,6 +123,33 @@ def _other_days() -> int:
 
 def _continent_days(continent: str) -> int:
     return _europe_days() if continent == _continents.EUROPE else _other_days()
+
+
+# Sites whose deals use their own departure window instead of the continent's:
+# source name -> (env var, default days). Secret Flights publishes deals 2-4
+# months ahead, so the 50-day Europe window would drop all of them.
+_SECRET_FLIGHTS = "טיסות סודיות"
+_SOURCE_WINDOWS: dict[str, tuple[str, int]] = {
+    _SECRET_FLIGHTS: ("PW_DEALS_SECRET_FLIGHTS_DAYS", 90),
+}
+
+
+def _source_days(source: str) -> Optional[int]:
+    """The site's own departure window (capped by PW_DEALS_DAYS), or None."""
+    if source not in _SOURCE_WINDOWS:
+        return None
+    name, default = _SOURCE_WINDOWS[source]
+    return _capped(_env_int(name, default, 0))
+
+
+def _deal_days(d: "VacationDeal", continent: str) -> int:
+    own = _source_days(d.source)
+    return own if own is not None else _continent_days(continent)
+
+
+def source_windows() -> dict[str, int]:
+    """Site -> its own departure window in days (for the email's summary line)."""
+    return {s: _source_days(s) for s in _SOURCE_WINDOWS}
 
 
 def _continent_limit(continent: str) -> int:
@@ -797,11 +828,10 @@ def _continent_groups(deals: list[VacationDeal], today: date) -> list[ContinentG
     for continent in _continents.CONTINENT_ORDER:
         days = _continent_days(continent)
         limit = _continent_limit(continent)
-        last_day = today + timedelta(days=days)
         candidates = [
             d for d in deals
             if d.continent == continent and d.date_from is not None
-            and today <= d.date_from <= last_day
+            and today <= d.date_from <= today + timedelta(days=_deal_days(d, continent))
         ]
         group = ContinentGroup(continent=continent, limit=limit, window_days=days)
         if continent == _continents.ASIA:
@@ -819,8 +849,9 @@ def scan_and_report() -> VacationReport:
     log.info("Running vacation deal scan across %d sites", len(_SOURCES))
     today = date.today()
     days = _window_days()
-    # The longest continent window (each is already capped by PW_DEALS_DAYS).
-    last_day = today + timedelta(days=max(_europe_days(), _other_days()))
+    # The longest continent or site window (each is already capped by PW_DEALS_DAYS).
+    last_day = today + timedelta(days=max(
+        _europe_days(), _other_days(), *source_windows().values()))
     report = VacationReport(days_ahead=days)
 
     def _in_window(d: VacationDeal) -> bool:
