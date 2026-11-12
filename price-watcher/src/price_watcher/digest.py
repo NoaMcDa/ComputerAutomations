@@ -381,6 +381,7 @@ class DailyReport:
     creatine: Optional["object"] = None     # CreatineReport
     sims4: Optional["object"] = None        # Sims4Report
     supermarkets: Optional["object"] = None # SupermarketReport
+    marketplace: Optional["object"] = None  # MarketplaceReport (#54); None = feature off
 
 
 def collect_daily_report() -> DailyReport:
@@ -402,6 +403,12 @@ def collect_daily_report() -> DailyReport:
         report.supermarkets = _supermarkets.scan_and_report()
     except Exception as exc:
         log.error("Supermarket stage failed: %s: %s", type(exc).__name__, exc)
+    # --- Facebook Marketplace hook (#54); logic lives in marketplace.py ---
+    try:
+        from price_watcher import marketplace as _marketplace
+        report.marketplace = _marketplace.scan_and_report()
+    except Exception as exc:
+        log.error("Marketplace stage failed: %s: %s", type(exc).__name__, exc)
     return report
 
 
@@ -420,6 +427,9 @@ def _print_daily_report(report: DailyReport) -> None:
         console.print("\n[bold underline]Supermarket meat discounts[/bold underline]")
         from price_watcher import supermarkets as _sm
         _sm.print_report(report.supermarkets)
+    if getattr(report, "marketplace", None) is not None:  # #54
+        from price_watcher import marketplace as _marketplace
+        _marketplace.print_report(report.marketplace)
 
 
 def run_digest(dry_run: bool = False) -> int:
@@ -447,4 +457,7 @@ def run_digest(dry_run: bool = False) -> int:
         if report.supermarkets is not None:
             from price_watcher import supermarkets as _sm
             _sm.persist(report.supermarkets)
+        if getattr(report, "marketplace", None) is not None:  # #54
+            from price_watcher import marketplace as _marketplace
+            _marketplace.persist(report.marketplace)
     return 0 if sent else 1
