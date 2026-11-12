@@ -41,6 +41,9 @@ def _isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PW_SMTP_PASSWORD", "not-a-real-password")
     monkeypatch.setenv("PW_EMAIL_FROM", "from@example.invalid")
     monkeypatch.setenv("PW_EMAIL_TO", "to@example.invalid")
+    # Most vacation fixtures don't state a party; the couples-only rule has
+    # its own tests (test_vacations_couples.py), which turn it back on.
+    monkeypatch.setenv("PW_DEALS_COUPLES_ONLY", "0")
     monkeypatch.setattr(smtplib, "SMTP", _NoSMTP)
     monkeypatch.setattr(smtplib, "SMTP_SSL", _NoSMTP)
     yield

@@ -18,7 +18,7 @@ def _pkg(price: int, nights: int, luggage: str = V.LUGGAGE_UNKNOWN, extra: str =
         source="אתר", kind=V.KIND_PACKAGE, destination=dest, price=Decimal(price),
         url="https://example.invalid/deal", date_from=start,
         date_to=start + timedelta(days=nights), stars=Decimal(4),
-        luggage=luggage, luggage_extra=extra,
+        luggage=luggage, luggage_extra=extra, adults=2,
     )
 
 
@@ -56,9 +56,9 @@ def test_best_value_skips_cheaper_rows_without_luggage():
 def test_no_best_value_when_no_row_has_luggage():
     deals = [_pkg(150, 5, V.LUGGAGE_NONE), _pkg(160, 4)]
     assert _value_row(deals) is None
-    # The cheapest-per-person mark is unaffected by luggage.
+    # The cheapest-package mark is unaffected by luggage.
     marks = E._deal_badges(deals, is_packages=True)
-    assert E._BADGE_CHEAPEST in marks[0]
+    assert E._BADGE_PACKAGE in marks[0]
 
 
 def test_email_shows_luggage_and_no_value_note():
