@@ -12,6 +12,7 @@ mark_notified(events) -> None
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from datetime import datetime
@@ -168,6 +169,12 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
     # ------------------------------------------------------------------ #
     consecutive = ws.get("consecutive_failures", 0)
     failure_notified = ws.get("failure_notified", False)
+
+    # A fetch that could not read the currency (e.g. a blocked Shopify page
+    # rescued through its product JSON) keeps the watch's stored currency, so
+    # emails still show the symbol.
+    if fetch.currency is None and ws.get("currency"):
+        fetch = dataclasses.replace(fetch, currency=ws["currency"])
 
     # Recovery
     if consecutive > 0 and failure_notified:

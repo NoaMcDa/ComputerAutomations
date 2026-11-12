@@ -4,11 +4,12 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 from rich.console import Console
 from rich.table import Table
@@ -19,19 +20,53 @@ from price_watcher.paths import watchlist_file
 console = Console()
 
 _SCHEMA_VERSION = 1
-_KEEP_PARAMS = {"variant", "size", "sku", "color", "colour", "flavour", "pid", "product_id", "id"}
+# Query parameters that identify the product / variant; everything else
+# (utm_*, fbclid, gclid, ref, ...) is tracking and is dropped.
+_KEEP_PARAMS = {
+    "variant", "variation", "size", "sku", "color", "colour", "flavour",
+    "pid", "product_id", "id",
+}
+
+# A run of percent-encoded bytes >= 0x80, i.e. an encoded non-ASCII character.
+_PCT_NON_ASCII = re.compile(r"(?:%[89A-Fa-f][0-9A-Fa-f])+")
+
+
+def _readable_path(path: str) -> str:
+    """Decode percent-encoded non-ASCII (e.g. Hebrew) characters in a path.
+
+    "/%D7%A1%D7%99%D7%99%D7%9C" -> "/סייל". Encoded ASCII such as %2F or %20
+    is left alone, so the path still means the same thing. The fetcher
+    percent-encodes again for the request.
+    """
+    def _decode(m: re.Match) -> str:
+        try:
+            return unquote(m.group(0), errors="strict")
+        except UnicodeDecodeError:
+            return m.group(0)
+    return _PCT_NON_ASCII.sub(_decode, path)
 
 
 def _normalise_url(raw: str) -> str:
-    parsed = urlparse(raw)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"Invalid URL (must have scheme and host): {raw!r}")
+    parsed = urlparse(raw.strip())
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Invalid URL (must be http(s) with a host): {raw!r}")
     qs = parse_qs(parsed.query, keep_blank_values=True)
     kept = {k: v for k, v in qs.items() if k in _KEEP_PARAMS}
     new_query = urlencode(kept, doseq=True)
-    # Strip fragment; preserve path with non-ASCII chars as-is (no re-encoding)
-    normalised = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, ""))
+    # Strip fragment; keep the path readable (non-ASCII shown as characters)
+    normalised = urlunparse(
+        (parsed.scheme, parsed.netloc, _readable_path(parsed.path), parsed.params, new_query, "")
+    )
     return normalised
+
+
+def _same_url(stored: str, normalised: str | None) -> bool:
+    if normalised is None:
+        return False
+    try:
+        return _normalise_url(stored) == normalised
+    except ValueError:
+        return stored == normalised
 
 
 def _make_id(normalised_url: str) -> str:
@@ -94,9 +129,9 @@ def add(url: str, name: str | None = None, selector: str | None = None) -> None:
     watch_id = _make_id(normalised)
     watches = load_all()
 
-    if any(w.id == watch_id for w in watches):
+    if any(w.id == watch_id or _same_url(w.url, normalised) for w in watches):
         console.print(f"[yellow]Already watching:[/yellow] {normalised}")
-        return
+        raise SystemExit(1)
 
     from price_watcher.contracts import FetchStatus
     from price_watcher.fetcher import fetch
@@ -167,22 +202,22 @@ def remove(target: str) -> None:
         target_id = target
         normalised = None
 
-    before = len(watches)
-    watches = [
+    removed = [
         w for w in watches
-        if w.id != target_id and w.id != target and w.url != normalised
+        if w.id in (target_id, target) or _same_url(w.url, normalised)
     ]
 
-    if len(watches) == before:
+    if not removed:
         console.print(f"[yellow]Not found:[/yellow] {target!r}")
         raise SystemExit(1)
 
+    watches = [w for w in watches if w not in removed]
     save_all(watches)
 
-    removed_id = target_id if target_id else target
     try:
         from price_watcher.state import drop_watch
-        drop_watch(removed_id)
+        for w in removed:
+            drop_watch(w.id)
     except Exception:
         pass
 
