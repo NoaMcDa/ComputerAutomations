@@ -87,6 +87,17 @@ The daily email includes meat deals from the supermarkets' public price files (I
 - **Bareket** is read from its Bina Projects portal. If that changes, set `PW_BAREKET_SOURCE` (`bina:<url>`, `publishedprices:<username>` or `off`).
 - `PW_TOP_PER_REGION` is no longer used.
 
+## Travel deals
+
+The daily email can include a "Travel deals" section grouped by continent.
+Only 4- and 5-star hotels are shown (4.5 passes; 3.5, unrated and missing
+ratings do not), and a package with no such hotel is dropped. Europe lists up
+to `PW_TRAVEL_EUROPE_LIMIT` deals departing in the next 50 days. Every other
+continent lists 4 deals departing in the next 365 days, and Asia always
+includes Japan and Thailand when either has a deal. The section reads
+`travel_deals.json`; there is no scraper for it yet. See
+[docs/travel-deals.md](docs/travel-deals.md).
+
 ## Known limits
 
 - Checks only happen while the computer is on and awake. A closed laptop means no checks until it's opened again.

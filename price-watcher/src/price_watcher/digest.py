@@ -357,6 +357,7 @@ class DailyReport:
     sims4: Optional["object"] = None        # Sims4Report
     supermarkets: Optional["object"] = None # SupermarketReport
     marketplace: Optional["object"] = None  # MarketplaceReport (#54); None = feature off
+    travel: Optional["object"] = None       # TravelReport (#52, #53); None = feature off
 
 
 def collect_daily_report() -> DailyReport:
@@ -384,6 +385,12 @@ def collect_daily_report() -> DailyReport:
         report.marketplace = _marketplace.scan_and_report()
     except Exception as exc:
         log.error("Marketplace stage failed: %s: %s", type(exc).__name__, exc)
+    # --- Travel deals (#52, #53); logic lives in travel_deals.py ---
+    try:
+        from price_watcher import travel_deals as _travel
+        report.travel = _travel.scan_and_report()
+    except Exception as exc:
+        log.error("Travel deals stage failed: %s: %s", type(exc).__name__, exc)
     return report
 
 
@@ -405,6 +412,9 @@ def _print_daily_report(report: DailyReport) -> None:
     if getattr(report, "marketplace", None) is not None:  # #54
         from price_watcher import marketplace as _marketplace
         _marketplace.print_report(report.marketplace)
+    if getattr(report, "travel", None) is not None:  # #52, #53
+        from price_watcher import travel_deals as _travel
+        _travel.print_report(report.travel)
 
 
 def run_digest(dry_run: bool = False) -> int:

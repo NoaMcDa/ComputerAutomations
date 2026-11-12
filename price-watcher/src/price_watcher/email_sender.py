@@ -1227,6 +1227,8 @@ def build_daily_payload(report) -> EmailPayload | None:
     text_lines.append("")
     from price_watcher import marketplace as _marketplace  # #54 hook
     text_lines.extend(_marketplace.section_text(getattr(report, "marketplace", None)))
+    from price_watcher import travel_deals as _travel  # #52, #53 hook
+    text_lines.extend(_travel.section_text(getattr(report, "travel", None)))
     text_lines.append(f"— {_SIGNATURE}")
     text_body = "\n".join(text_lines)
 
@@ -1261,6 +1263,7 @@ def build_daily_payload(report) -> EmailPayload | None:
     html_parts.append(_section_heading_html("מבצעי בשר בסופרמרקטים"))
     html_parts.append(_supermarkets_section_html(sm))
     html_parts.append(_marketplace.section_html(getattr(report, "marketplace", None)))  # #54 hook
+    html_parts.append(_travel.section_html(getattr(report, "travel", None)))  # #52, #53 hook
 
     html_parts.append(
         f'</td></tr>'
