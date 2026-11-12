@@ -75,13 +75,19 @@ def _direction_word(pct: float | None) -> str:
     return "dropped" if pct < 0 else "rose"
 
 
-_DIRECTION_HE = {"dropped": "ירד", "rose": "עלה", "changed": "השתנה"}
+_DIRECTION_HE = {
+    "dropped": "ירד", "rose": "עלה", "changed": "השתנה",
+    # creatine: a different product took the lead at the identical price
+    "same_price": "נשאר זהה (מוצר אחר)",
+}
 
 _STATUS_HE = {
     "unreachable": "האתר לא זמין",
     "blocked": "האתר חסם את הבקשה",
     "fetch_failed": "האחזור נכשל",
     "no_powder": "לא נמצאה אבקת קריאטין",
+    "no_products": "לא נמצאו מוצרים בעמוד",
+    "parse_failed": "פענוח העמוד נכשל",
     "unavailable": "לא זמין",
 }
 
