@@ -8,7 +8,6 @@ pages and merges them into one ranked list:
   השטיח המעופף     flying.co.il home-page package feed
   גוליבר           gulliver.co.il home-page hot deals
   חוליו            hulyo.co.il catalogue files
-  לאסט מינט        lastminute.co.il deal feed
   טרווליסט         travelist.co.il flight-deal file
   טיסות סודיות     secretflights.co.il deal feed
 
@@ -28,6 +27,14 @@ for the same destination, and keeps:
   Asia         its deals include the cheapest Japan and the cheapest
                Thailand deal whenever one exists in the window; a missing
                one is recorded on the group so the email can say so.
+
+Packages need a hotel rated 3 to 5 stars; unrated packages are left out.
+3★ hotels are limited to a third of the rows: at most one of a
+destination's (up to) three rows, and at most a third of each continent's
+package rows. The other rows are 4–5★.
+
+Lastminute (lastminute.co.il) was dropped as a source on the owner's
+request: its packages carry no star rating and its reviews are poor.
 
 Undated deals can't be placed in a window and are left out, as are deals
 whose destination can't be placed on a continent (logged and counted).
@@ -204,7 +211,7 @@ class VacationReport:
     flight_groups: list[ContinentGroup] = field(default_factory=list)
     unmapped: list[str] = field(default_factory=list)  # "source: destination (country)" left out
 
-    # Packages dropped because the hotel isn't a verified 4–5★ (#52).
+    # Packages dropped because the hotel isn't a verified 3–5★ (#52).
     dropped_low_star: int = 0
 
     @property
@@ -302,19 +309,33 @@ def _star_label(stars: Optional[Decimal]) -> str:
     return f" ({stars:f}★)" if stars else ""
 
 
-_MIN_STARS = Decimal("4")
+_MIN_STARS = Decimal("3")
 _MAX_STARS = Decimal("5")
+_UPPER_TIER_STARS = Decimal("4")  # 4–5★; 3–3.5★ is the capped lower tier
 
 
 def _hotel_qualifies(deal: VacationDeal) -> bool:
-    """Packages need a verified 4–5★ hotel (4, 4.5 and 5 pass); flights always pass.
+    """Packages need a verified 3–5★ hotel (3, 3.5 … 5 pass); flights always pass.
 
-    A missing or unreadable rating fails: there's no fallback to lower-tier hotels.
+    A missing or unreadable rating fails: an unknown hotel is never shown.
     """
     if deal.kind != KIND_PACKAGE:
         return True
     stars = _stars(deal.stars)
     return stars is not None and _MIN_STARS <= stars <= _MAX_STARS
+
+
+def _is_three_star(deal: VacationDeal) -> bool:
+    """A package whose hotel is in the 3★ tier (3 or 3.5 stars)."""
+    if deal.kind != KIND_PACKAGE:
+        return False
+    stars = _stars(deal.stars)
+    return stars is not None and stars < _UPPER_TIER_STARS
+
+
+def _three_star_cap(rows: int) -> int:
+    """How many of `rows` may be 3★: a third, rounded down."""
+    return rows // 3
 
 
 def _hotel_line(name: object, stars: object = None) -> str:
@@ -608,96 +629,6 @@ def _scan_hulyo() -> list[VacationDeal]:
     return out
 
 
-_LASTMINUTE_EUROPE = [
-    "BER", "MAD", "BCN", "BUS", "ZRH", "VCE", "SOF", "GVA", "ROM", "CHQ", "SKG", "ZTH",
-    "JTR", "AMS", "ATH", "CFU", "KGS", "HER", "JMK", "RHO", "PRG", "PAR", "LON",
-    "LCA", "LIS", "TBS", "TIV", "BOJ", "BAK", "PAS", "PFO", "VIE", "MIL", "OTP", "WAW",
-    "BUD",
-]
-# Each group is asked for in its own box, so cheaper deals elsewhere don't
-# crowd it out of the per-box cap (30). Japan and Thailand get boxes of their
-# own because the Asia list must include both. Codes the site doesn't sell
-# are simply ignored by the API.
-_LASTMINUTE_JAPAN = ["TYO", "NRT", "OSA", "KIX"]
-_LASTMINUTE_THAILAND = ["BKK", "HKT", "USM", "CNX", "KBV"]
-_LASTMINUTE_ASIA = [  # rest of Asia, incl. the Gulf and Uzbekistan
-    "DXB", "AUH", "TAS", "SKD", "CMB", "MLE", "HAN", "SGN", "PQC", "DPS", "SIN", "HKG",
-    "DEL", "GOI", "BOM", "MNL", "ICN", "SEL", "PEK", "PVG", "KTM",
-]
-_LASTMINUTE_OTHER = [
-    "JFK", "NYC", "LAX", "MIA", "YTO", "YYZ", "MEX", "CUN", "HAV", "PUJ", "SJO",  # N. America
-    "BUE", "EZE", "GRU", "RIO", "SAO", "LIM", "BOG", "SCL",                       # S. America
-    "SEZ", "ZNZ", "MRU", "CPT", "JNB", "NBO", "RAK", "CMN", "SSH", "HRG", "ADD",  # Africa
-    "SYD", "MEL", "AKL", "BNE", "PER",                                            # Oceania
-]
-
-
-def _scan_lastminute() -> list[VacationDeal]:
-    base = "https://www.lastminute.co.il/"
-    today = date.today()
-
-    def _box(codes: list[str], days: int, title: str) -> dict:
-        return {
-            "DealBoxType": 1, "MinPrice": 0, "DynamicDate": 0, "MaxNumberOfDeals": 30,
-            "DepartureCodes": ["TLV"], "ArrivalCodes": codes,
-            "FlightDirectType": 1, "AirlineCodes": [], "FlightCabin": [],
-            "FromDate": f"{today.isoformat()}T00:00:00",
-            "MaxFromDate": f"{(today + timedelta(days=days)).isoformat()}T00:00:00",
-            "Title": title,
-        }
-
-    # (arrival codes, departure window, max flight price, max package price)
-    boxes = (
-        (_LASTMINUTE_EUROPE, _europe_days(), 600, 900),
-        (_LASTMINUTE_JAPAN, _other_days(), 2500, 4000),
-        (_LASTMINUTE_THAILAND, _other_days(), 2500, 4000),
-        (_LASTMINUTE_ASIA, _other_days(), 2500, 4000),
-        (_LASTMINUTE_OTHER, _other_days(), 2500, 4000),
-    )
-    request = {
-        "flight": [{**_box(codes, days, "f"), "MaxPrice": max_flight, "ProductType": 0,
-                    "DataSorce": 0}
-                   for codes, days, max_flight, _ in boxes],
-        "dynamic": [{**_box(codes, days, "p"), "MaxPrice": max_package, "ProductType": 1,
-                     "DataSorce": 1, "StarsRating": 0, "MinNights": 2, "MaxNights": 30,
-                     "HotelName": ""}
-                    for codes, days, _, max_package in boxes],
-        "flightToAnywhere": [],
-    }
-    with _client(Accept="application/json", Referer=base) as c:
-        # Compact JSON: ten boxes in a query string (~7 KB); the server
-        # rejects (414) URLs much longer than that.
-        r = c.get(f"{base}api/Deals/GetDeals",
-                  params={"request": json.dumps(request, ensure_ascii=False,
-                                                separators=(",", ":"))})
-    r.raise_for_status()
-    out: list[VacationDeal] = []
-    for group in r.json() or []:
-        for d in group.get("Deals") or []:
-            price = _dec(d.get("PriceActual"))
-            title = _clean(d.get("Title"))
-            if price is None or price <= 0 or not title:
-                continue
-            is_package = d.get("ProductType") == 1
-            # No star rating in the deal data and the link is a search-results
-            # page, not one hotel, so `stars` stays unknown and the 4–5★ filter
-            # drops these packages rather than guessing (#52).
-            destination = re.sub(r"^(?:טיסות|טיסה\s*\+\s*מלון)\s+ל", "", title, count=1) or title
-            out.append(VacationDeal(
-                source="לאסט מינט", kind=KIND_PACKAGE if is_package else KIND_FLIGHT,
-                destination=destination, price=price.quantize(Decimal("1")),
-                currency=_currency(d.get("Currency")), url=_abs_url(base, d.get("Url")),
-                date_from=_date(d.get("DateFrom")), date_to=_date(d.get("DateTo")),
-                note=" · ".join(x for x in (
-                    _clean(d.get("SubTitle")), _clean(d.get("PricePrefix")),
-                ) if x),
-                includes=_includes(_FLIGHT_INCLUDED, "מלון", d.get("SubTitle")) if is_package else [],
-                adults=_int(d.get("Adults")) if is_package else 0,
-                children=(_int(d.get("Childs")) + _int(d.get("Youth"))) if is_package else 0,
-            ))
-    return out
-
-
 def _scan_travelist() -> list[VacationDeal]:
     base = "https://www.travelist.co.il"
     with _client(Accept="application/json", Referer=f"{base}/") as c:
@@ -753,7 +684,6 @@ _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
     ("השטיח המעופף", _scan_flying_carpet),
     ("גוליבר", _scan_gulliver),
     ("חוליו", _scan_hulyo),
-    ("לאסט מינט", _scan_lastminute),
     ("טרווליסט", _scan_travelist),
     ("טיסות סודיות", _scan_secret_flights),
 )
@@ -761,20 +691,37 @@ _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
 
 # ---- Orchestrator ----
 
-def _rank(deals: list[VacationDeal], top_n: int) -> list[VacationDeal]:
-    """Cheapest first: one row per (source, destination), max 3 per destination."""
-    cheapest: dict[tuple[str, str], VacationDeal] = {}
+def _rank(deals: list[VacationDeal], top_n: int,
+          max_three_star: Optional[int] = None) -> list[VacationDeal]:
+    """Cheapest first: one row per (source, destination, hotel tier), max 3 per destination.
+
+    3★ packages are held to a third: at most one of a destination's three
+    rows, and at most `max_three_star` rows overall (default: a third of
+    `top_n`). A skipped 3★ row leaves its place to the next 4–5★ one.
+    """
+    if max_three_star is None:
+        max_three_star = _three_star_cap(top_n)
+    cheapest: dict[tuple[str, str, bool], VacationDeal] = {}
     for d in deals:
-        key = (d.source, d.destination)
+        key = (d.source, d.destination, _is_three_star(d))
         if key not in cheapest or d.price < cheapest[key].price:
             cheapest[key] = d
     # Non-dollar prices can't be compared without a rate, so they sort last.
     ordered = sorted(cheapest.values(), key=lambda d: (d.currency != "USD", d.price))
     per_destination: dict[str, int] = {}
+    three_per_destination: dict[str, int] = {}
+    three_total = 0
     out: list[VacationDeal] = []
     for d in ordered:
         if per_destination.get(d.destination, 0) >= _MAX_PER_DESTINATION:
             continue
+        if _is_three_star(d):
+            if (three_total >= max_three_star
+                    or three_per_destination.get(d.destination, 0)
+                    >= _three_star_cap(_MAX_PER_DESTINATION)):
+                continue
+            three_total += 1
+            three_per_destination[d.destination] = three_per_destination.get(d.destination, 0) + 1
         per_destination[d.destination] = per_destination.get(d.destination, 0) + 1
         out.append(d)
         if len(out) >= top_n:
@@ -819,16 +766,26 @@ def _select_asia(ranked: list[VacationDeal], limit: int) -> tuple[list[VacationD
     (chosen, English names of required countries with no deal)."""
     chosen: list[VacationDeal] = []
     missing: list[str] = []
+    three_cap = _three_star_cap(limit)
+
+    def _fits(d: VacationDeal) -> bool:
+        """False for a 3★ row once a third of the list is already 3★."""
+        return not _is_three_star(d) or sum(map(_is_three_star, chosen)) < three_cap
+
     for code in _ASIA_REQUIRED:
-        pick = next((d for d in ranked if _country_code(d) == code), None)
-        if pick is None:
+        in_country = [d for d in ranked if _country_code(d) == code]
+        if not in_country:
             missing.append(_continents.country_name(code))
-        elif len(chosen) < limit:
+            continue
+        # Prefer one that keeps 3★ within a third; if the country only has
+        # 3★ left, the Japan/Thailand rule wins over the 3★ share.
+        pick = next((d for d in in_country if _fits(d)), in_country[0])
+        if len(chosen) < limit:
             chosen.append(pick)
     for d in ranked:
         if len(chosen) >= limit:
             break
-        if not any(c is d for c in chosen):
+        if not any(c is d for c in chosen) and _fits(d):
             chosen.append(d)
     order = {id(d): i for i, d in enumerate(ranked)}
     return sorted(chosen, key=lambda d: order[id(d)]), missing
@@ -848,7 +805,8 @@ def _continent_groups(deals: list[VacationDeal], today: date) -> list[ContinentG
         ]
         group = ContinentGroup(continent=continent, limit=limit, window_days=days)
         if continent == _continents.ASIA:
-            ranked = _rank(candidates, len(candidates) or 1)
+            # Rank everything; _select_asia applies the 3★ share to its 4 rows.
+            ranked = _rank(candidates, len(candidates) or 1, max_three_star=len(candidates))
             group.deals, group.missing_required = _select_asia(ranked, limit)
         else:
             group.deals = _rank(candidates, limit)
@@ -882,7 +840,7 @@ def scan_and_report() -> VacationReport:
             live = [d for d in deals if d.price > 0 and _in_window(d)]
             kept = [d for d in live if _hotel_qualifies(d)]
             if len(kept) < len(live):
-                log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 4–5★)",
+                log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 3–5★)",
                          name, len(live) - len(kept),
                          sum(1 for d in live if d.kind == KIND_PACKAGE))
                 report.dropped_low_star += len(live) - len(kept)

@@ -78,14 +78,21 @@ def test_hotel_line_shows_half_stars():
 
 # --------------------------------------------------------------------------- filter
 
-@pytest.mark.parametrize("stars", [D("4"), D("4.5"), D("5"), "4", 4.5, 5])
-def test_four_to_five_star_packages_qualify(stars):
+@pytest.mark.parametrize("stars", [D("3"), D("3.5"), D("4"), D("4.5"), D("5"), "3", "4", 4.5, 5])
+def test_three_to_five_star_packages_qualify(stars):
     assert vac._hotel_qualifies(_pkg(stars))
 
 
-@pytest.mark.parametrize("stars", [D("3"), D("3.5"), D("3.9"), D("5.5"), D("6"), None, "garbage", 0])
+@pytest.mark.parametrize("stars", [D("2"), D("2.5"), D("2.9"), D("5.5"), D("6"), None, "garbage", 0])
 def test_low_missing_or_garbage_star_packages_are_rejected(stars):
     assert not vac._hotel_qualifies(_pkg(stars))
+
+
+@pytest.mark.parametrize("stars, three", [(D("3"), True), (D("3.5"), True), (D("4"), False),
+                                          (D("5"), False), (None, False)])
+def test_three_star_tier(stars, three):
+    assert vac._is_three_star(_pkg(stars)) is three
+    assert not vac._is_three_star(_flight())
 
 
 def test_flights_pass_without_a_rating():
@@ -217,50 +224,96 @@ def test_hulyo_stars_from_hotel_rating(monkeypatch):
     assert by_dest["אתונה"].kind == vac.KIND_FLIGHT and by_dest["אתונה"].stars is None
 
 
-def test_lastminute_packages_have_no_rating(monkeypatch):
-    feed = [{"Deals": [
-        {"Title": "טיסה+מלון לבודפשט", "ProductType": 1, "PriceActual": 260, "Currency": "$",
-         "Url": "dynamic/results?aport=bud", "Adults": 2},
-        {"Title": "טיסות לרומא", "ProductType": 0, "PriceActual": 120, "Currency": "$",
-         "Url": "flights/results?aport=rom"},
-    ]}]
-    _serve(monkeypatch, {"api/Deals/GetDeals": feed})
-
-    by_dest = {d.destination: d for d in vac._scan_lastminute()}
-
-    assert by_dest["בודפשט"].kind == vac.KIND_PACKAGE and by_dest["בודפשט"].stars is None
-    assert not vac._hotel_qualifies(by_dest["בודפשט"])
-    assert vac._hotel_qualifies(by_dest["רומא"])
-
-
 # --------------------------------------------------------------------------- scan_and_report
 
-def test_scan_and_report_drops_packages_without_a_verified_4_to_5_star_hotel(monkeypatch):
+def test_scan_and_report_drops_packages_without_a_verified_3_to_5_star_hotel(monkeypatch):
     monkeypatch.delenv("PW_DEALS_DAYS", raising=False)
     monkeypatch.delenv("PW_DEALS_TOP", raising=False)
     site_a = [
         _pkg(D("5"), source="A", destination="Rome", price="500"),
         _pkg(D("4.5"), source="A", destination="Paris", price="450"),
-        _pkg(D("3.5"), source="A", destination="Sofia", price="100"),  # cheapest, but 3.5★
+        _pkg(D("3.5"), source="A", destination="Sofia", price="100"),  # 3.5★ passes
+        _pkg(D("2.5"), source="A", destination="Prague", price="60"),  # 2.5★ doesn't
         _flight(source="A", destination="Rome", price="90"),
     ]
     site_b = [
         _pkg(D("4"), source="B", destination="Athens", price="300"),
         _pkg(None, source="B", destination="Baku", price="80"),        # no rating
-        _pkg(D("3"), source="B", destination="Varna", price="70"),
+        _pkg(D("2"), source="B", destination="Varna", price="70"),
     ]
     monkeypatch.setattr(vac, "_SOURCES", (("A", lambda: site_a), ("B", lambda: site_b)))
 
     report = vac.scan_and_report()
 
     assert report.status == "ok"
-    assert {d.destination for d in report.packages} == {"Rome", "Paris", "Athens"}
+    assert {d.destination for d in report.packages} == {"Rome", "Paris", "Athens", "Sofia"}
     assert all(vac._MIN_STARS <= d.stars <= vac._MAX_STARS for d in report.packages)
     assert [d.destination for d in report.flights] == ["Rome"]
     assert report.dropped_low_star == 3
     counts = {s.name: s.count for s in report.sources}
-    assert counts == {"A": 3, "B": 1}
-    assert report.total_found == 4
+    assert counts == {"A": 4, "B": 1}
+    assert report.total_found == 5
+
+
+# --------------------------------------------------------------------------- 3★ share
+
+def _ranked_stars(deals, top_n, **kw):
+    return [(d.destination, d.stars) for d in vac._rank(deals, top_n, **kw)]
+
+
+def test_one_three_star_row_per_destination_at_most():
+    deals = [
+        _pkg(D("3"), source="A", destination="Rome", price="100"),
+        _pkg(D("3.5"), source="B", destination="Rome", price="110"),  # second 3★: skipped
+        _pkg(D("4"), source="C", destination="Rome", price="200"),
+        _pkg(D("5"), source="D", destination="Rome", price="300"),
+        _pkg(D("4"), source="E", destination="Rome", price="400"),    # 4th Rome row: over the cap
+    ]
+    assert _ranked_stars(deals, 15, max_three_star=15) == [
+        ("Rome", D("3")), ("Rome", D("4")), ("Rome", D("5"))]
+
+
+def test_same_source_can_offer_a_three_and_a_four_star_row():
+    deals = [_pkg(D("3"), source="A", destination="Rome", price="100"),
+             _pkg(D("4"), source="A", destination="Rome", price="200"),
+             _pkg(D("4.5"), source="A", destination="Rome", price="250")]  # same source + tier as the 4★
+    assert _ranked_stars(deals, 15) == [("Rome", D("3")), ("Rome", D("4"))]
+
+
+def test_three_star_rows_are_capped_at_a_third_of_the_list():
+    cities = ["Rome", "Paris", "Athens", "Sofia", "Prague", "Vienna"]
+    three = [_pkg(D("3"), source="A", destination=c, price=str(100 + i)) for i, c in enumerate(cities)]
+    four = [_pkg(D("4"), source="B", destination=c, price=str(300 + i)) for i, c in enumerate(cities)]
+    ranked = vac._rank(three + four, 6)
+    assert len(ranked) == 6
+    assert sum(vac._is_three_star(d) for d in ranked) == 2  # 6 // 3
+    # The cheapest 3★ rows win their slots; 4–5★ rows fill the rest.
+    assert [d.destination for d in ranked if vac._is_three_star(d)] == ["Rome", "Paris"]
+
+
+def test_four_row_continent_gets_one_three_star_row():
+    deals = [_pkg(D("3"), source="A", destination=c, price=str(100 + i))
+             for i, c in enumerate(["Bangkok", "Tokyo", "Dubai"])]
+    deals += [_pkg(D("5"), source="B", destination=c, price=str(500 + i))
+              for i, c in enumerate(["Bangkok", "Tokyo", "Dubai"])]
+    ranked = vac._rank(deals, 4)
+    assert sum(vac._is_three_star(d) for d in ranked) == 1
+
+
+def test_asia_selection_keeps_the_three_star_share():
+    def asia(stars, dest, country, price):
+        d = _pkg(stars, destination=dest, price=price, source=dest)
+        d.country = country
+        return d
+
+    ranked = [asia(D("3"), "טוקיו", "יפן", "100"), asia(D("3"), "בנגקוק", "תאילנד", "110"),
+              asia(D("4"), "פוקט", "תאילנד", "300"), asia(D("4"), "דובאי", "", "310"),
+              asia(D("5"), "סינגפור", "", "320")]
+    chosen, missing = vac._select_asia(ranked, 4)
+    assert missing == []
+    assert sum(vac._is_three_star(d) for d in chosen) == 1
+    # Japan only has a 3★ deal, so it takes the 3★ slot; Thailand uses its 4★ one.
+    assert {d.destination for d in chosen} == {"טוקיו", "פוקט", "דובאי", "סינגפור"}
 
 
 def test_scan_and_report_source_with_only_unrated_packages_keeps_its_flights(monkeypatch):

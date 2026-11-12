@@ -7,7 +7,6 @@ Asia: always includes Japan and Thailand when they exist in the window.
 
 from __future__ import annotations
 
-import json
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -367,45 +366,3 @@ def test_report_without_groups_still_renders():
     vac.deals = vac.packages
     payload = email_sender.build_deals_payload(vac)
     assert "פראג" in payload.html_body and "פראג" in payload.text_body
-
-
-# ---------------------------------------------------------------- lastminute request
-
-def test_lastminute_asks_each_continent_with_its_window(monkeypatch):
-    captured = {}
-
-    class _Resp:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return []
-
-    class _Client:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def get(self, url, params=None):
-            captured["request"] = json.loads(params["request"])
-            return _Resp()
-
-    monkeypatch.setattr(V, "_client", lambda **kw: _Client())
-    assert V._scan_lastminute() == []
-    req = captured["request"]
-    for kind in ("flight", "dynamic"):
-        boxes = req[kind]
-        assert len(boxes) == 5
-        europe, japan, thailand, asia, other = boxes
-        assert "PRG" in europe["ArrivalCodes"] and "DXB" not in europe["ArrivalCodes"]
-        assert "SEZ" not in europe["ArrivalCodes"]
-        assert europe["MaxFromDate"].startswith((TODAY + timedelta(days=50)).isoformat())
-        # Japan and Thailand get their own boxes so the Asia rule can be met
-        assert {"NRT", "KIX"} <= set(japan["ArrivalCodes"])
-        assert {"BKK", "HKT", "USM"} <= set(thailand["ArrivalCodes"])
-        assert {"DXB", "AUH", "TAS"} <= set(asia["ArrivalCodes"])
-        assert {"JFK", "SEZ", "ZNZ", "MRU"} <= set(other["ArrivalCodes"])
-        for box in (japan, thailand, asia, other):
-            assert box["MaxFromDate"].startswith((TODAY + timedelta(days=365)).isoformat())

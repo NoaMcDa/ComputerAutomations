@@ -121,7 +121,7 @@ When you `add` a URL, tracking parameters (`utm_*`, `gclid`, `fbclid`, `ref`, �
 | Creatine | iHerb search (Israel store) | iHerb usually blocks plain requests, so this section needs Chromium. Powders only; first results page only. |
 | The Sims 4 | EA "all packs" store page | Only the first 50 packs the page serves are read; the email says so. |
 | Supermarket meat deals | Government-mandated price feeds: Shufersal, the chains on url.publishedprices.co.il, and Super Bareket (superbareket.binaprojects.com) | Stores in the enabled cities only — Herzliya and Ramat HaSharon by default (`PW_MEAT_CITIES`, or the `ON`/`OFF` column of `_REGIONS` in `supermarkets.py`). One table per category — one cut of one animal, fresh and frozen apart (e.g. "כנפיים עוף", "לשון בקר – קפוא") — with the `PW_TOP_PER_CATEGORY` cheapest deals (default 5), ranked by promo price per kg; each row shows the chain and its branches. Packaged items are converted by pack weight; deals whose weight is unknown, and catch-all groups such as "בשר – אחר", are counted but not ranked. A chain with no branch in the cities is listed as such. Each deal shows its end date. |
-| Vacation deals | Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Lastminute, Travelist, Secret Flights | See "Daily report and vacation deals". |
+| Vacation deals | Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Travelist, Secret Flights | See "Daily report and vacation deals". |
 | Facebook Marketplace | Marketplace search pages for `PW_FB_QUERIES` | Off (no section) while `PW_FB_QUERIES` is empty. Reports new listings and price drops of at least `PW_FB_MIN_DROP_ILS` ₪ and `PW_FB_MIN_DROP_PCT` %. Facebook often shows logged-out visitors a login wall; that is reported inside the section. Unverified against the live site; see `docs/facebook-marketplace.md`. |
 
 If a section's scan fails, the email says which one and why, and the subject line names the failed sections.
@@ -134,7 +134,7 @@ python -m price_watcher deals  [--dry-run] [--test]   # vacation deals only
 python -m price_watcher install-digest-schedule       # run `digest` daily at 09:00
 ```
 
-The daily report (`digest`) goes to `PW_EMAIL_TO` and ends with a vacation-deals section: the cheapest packages and flights from Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Lastminute, Travelist and Secret Flights (`src/price_watcher/vacations.py`).
+The daily report (`digest`) goes to `PW_EMAIL_TO` and ends with a vacation-deals section: the cheapest packages and flights from Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Travelist and Secret Flights (`src/price_watcher/vacations.py`). Packages need a 3–5★ hotel; 3★ hotels are at most one of each destination's rows and at most a third of each continent's rows.
 
 Packages and flights are each split by continent, in this order: Europe, Asia, North America, South America, Africa, Oceania. Within a continent the deals go cheapest first, with one deal per site and destination and at most 3 for the same destination.
 
