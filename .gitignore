@@ -1,0 +1,35 @@
+# Environment / secrets
+.env
+.env.local
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv
+.uv/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Local state (user-scoped data lives outside the repo, but just in case)
+price-watcher/state/
+price-watcher/logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
