@@ -18,7 +18,8 @@ SECRET = V._SECRET_FLIGHTS
 @pytest.fixture(autouse=True)
 def _clean_deal_env(monkeypatch):
     for var in ("PW_DEALS_DAYS", "PW_DEALS_TOP", "PW_DEALS_OTHER_TOP", "PW_DEALS_EUROPE_DAYS",
-                "PW_DEALS_OTHER_DAYS", "PW_DEALS_SECRET_FLIGHTS_DAYS"):
+                "PW_DEALS_OTHER_DAYS", "PW_DEALS_SECRET_FLIGHTS_DAYS",
+                "PW_DEALS_LEAD_DAYS", "PW_DEALS_MIN_NIGHTS", "PW_DEALS_MAX_NIGHTS"):
         monkeypatch.delenv(var, raising=False)
 
 

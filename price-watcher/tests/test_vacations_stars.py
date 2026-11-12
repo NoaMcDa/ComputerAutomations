@@ -39,17 +39,20 @@ def _serve(monkeypatch, routes: dict[str, object]) -> None:
 
 # Dated inside the Europe window: scan_and_report drops undated deals (#53).
 _SOON = date.today() + timedelta(days=10)
+# A 4-night trip: scan_and_report keeps only 3-5 night trips.
+_BACK = _SOON + timedelta(days=4)
 
 
 def _pkg(stars, source="src", destination="Athens", price="300") -> vac.VacationDeal:
     return vac.VacationDeal(source=source, kind=vac.KIND_PACKAGE, destination=destination,
                             price=D(price), url="https://example.invalid/", stars=stars,
-                            date_from=_SOON)
+                            date_from=_SOON, date_to=_BACK)
 
 
 def _flight(source="src", destination="Rome", price="150") -> vac.VacationDeal:
     return vac.VacationDeal(source=source, kind=vac.KIND_FLIGHT, destination=destination,
-                            price=D(price), url="https://example.invalid/", date_from=_SOON)
+                            price=D(price), url="https://example.invalid/",
+                            date_from=_SOON, date_to=_BACK)
 
 
 # --------------------------------------------------------------------------- parsing

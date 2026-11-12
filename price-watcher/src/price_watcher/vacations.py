@@ -20,9 +20,10 @@ South America, Africa, Oceania. Within a continent it ranks cheapest first,
 one deal per source and destination and at most `_MAX_PER_DESTINATION` rows
 for the same destination, and keeps:
 
-  Europe       departures today .. today + PW_DEALS_EUROPE_DAYS (50),
-               up to PW_DEALS_TOP deals (15)
-  elsewhere    departures today .. today + PW_DEALS_OTHER_DAYS (365),
+  Europe       departures today + PW_DEALS_LEAD_DAYS (2) ..
+               today + PW_DEALS_EUROPE_DAYS (50), up to PW_DEALS_TOP deals (15)
+  elsewhere    departures today + PW_DEALS_LEAD_DAYS (2) ..
+               today + PW_DEALS_OTHER_DAYS (365),
                PW_DEALS_OTHER_TOP deals per continent (4)
   Asia         its deals include the cheapest Japan and the cheapest
                Thailand deal whenever one exists in the window; a missing
@@ -37,8 +38,18 @@ Lastminute (lastminute.co.il) was dropped as a source on the owner's
 request: its packages carry no star rating and its reviews are poor.
 
 Secret Flights deals use their own window instead of the continent's:
-departures today .. today + PW_DEALS_SECRET_FLIGHTS_DAYS (90), since the
-site publishes deals 2-4 months ahead.
+departures today + PW_DEALS_LEAD_DAYS .. today + PW_DEALS_SECRET_FLIGHTS_DAYS
+(90), since the site publishes deals 2-4 months ahead.
+
+Trip rules, for packages and flights alike (owner's request):
+
+  length       PW_DEALS_MIN_NIGHTS (3) .. PW_DEALS_MAX_NIGHTS (5) nights,
+               inclusive (`VacationDeal.nights_or_computed`); a deal whose
+               length isn't known is left out. Dropped deals are counted in
+               `VacationReport.dropped_length`.
+  lead time    the first allowed departure is today + PW_DEALS_LEAD_DAYS (2),
+               i.e. at least 48 hours from now. Only the near end of each
+               window moves; the far end stays today + the window's days.
 
 Undated deals can't be placed in a window and are left out, as are deals
 whose destination can't be placed on a continent (logged and counted).
@@ -152,6 +163,32 @@ def source_windows() -> dict[str, int]:
     return {s: _source_days(s) for s in _SOURCE_WINDOWS}
 
 
+def _lead_days() -> int:
+    """Days from today to the first allowed departure (PW_DEALS_LEAD_DAYS, default 2 = 48 hours)."""
+    return _env_int("PW_DEALS_LEAD_DAYS", 2, 0)
+
+
+def _first_departure(today: date) -> date:
+    """Earliest departure date a deal may have. Windows still end at today + their days."""
+    return today + timedelta(days=_lead_days())
+
+
+def _min_nights() -> int:
+    """Shortest trip kept, in nights (PW_DEALS_MIN_NIGHTS, default 3)."""
+    return _env_int("PW_DEALS_MIN_NIGHTS", 3, 1)
+
+
+def _max_nights() -> int:
+    """Longest trip kept, in nights (PW_DEALS_MAX_NIGHTS, default 5); never below the minimum."""
+    return _env_int("PW_DEALS_MAX_NIGHTS", 5, _min_nights())
+
+
+def _length_ok(d: "VacationDeal") -> bool:
+    """True when the trip is MIN..MAX nights long (inclusive). Unknown length -> False."""
+    nights = d.nights_or_computed
+    return nights is not None and _min_nights() <= nights <= _max_nights()
+
+
 def _continent_limit(continent: str) -> int:
     return _top_n() if continent == _continents.EUROPE else _other_top()
 
@@ -262,6 +299,9 @@ class VacationReport:
 
     # Packages dropped because the hotel isn't a verified 3–5★ (#52).
     dropped_low_star: int = 0
+    # Deals dropped because the trip isn't PW_DEALS_MIN_NIGHTS..MAX_NIGHTS
+    # nights long (or its length isn't known).
+    dropped_length: int = 0
 
     @property
     def deals(self) -> list[VacationDeal]:
@@ -843,13 +883,14 @@ def _select_asia(ranked: list[VacationDeal], limit: int) -> tuple[list[VacationD
 def _continent_groups(deals: list[VacationDeal], today: date) -> list[ContinentGroup]:
     """One kind's deals (continent already set) -> a group per continent, in order."""
     groups: list[ContinentGroup] = []
+    first = _first_departure(today)
     for continent in _continents.CONTINENT_ORDER:
         days = _continent_days(continent)
         limit = _continent_limit(continent)
         candidates = [
             d for d in deals
-            if d.continent == continent and d.date_from is not None
-            and today <= d.date_from <= today + timedelta(days=_deal_days(d, continent))
+            if d.continent == continent and d.date_from is not None and _length_ok(d)
+            and first <= d.date_from <= today + timedelta(days=_deal_days(d, continent))
         ]
         group = ContinentGroup(continent=continent, limit=limit, window_days=days)
         if continent == _continents.ASIA:
@@ -870,11 +911,13 @@ def scan_and_report() -> VacationReport:
     # The longest continent or site window (each is already capped by PW_DEALS_DAYS).
     last_day = today + timedelta(days=max(
         _europe_days(), _other_days(), *source_windows().values()))
+    # Departures start PW_DEALS_LEAD_DAYS (48 hours) out; the far end is unchanged.
+    first_day = _first_departure(today)
     report = VacationReport(days_ahead=days)
 
     def _in_window(d: VacationDeal) -> bool:
         # Undated deals can't be placed in a window.
-        return d.date_from is not None and today <= d.date_from <= last_day
+        return d.date_from is not None and first_day <= d.date_from <= last_day
 
     def _one(source: tuple[str, Callable[[], list[VacationDeal]]]):
         name, fn = source
@@ -887,6 +930,12 @@ def scan_and_report() -> VacationReport:
     with ThreadPoolExecutor(max_workers=len(_SOURCES)) as pool:
         for name, deals, error in pool.map(_one, _SOURCES):
             live = [d for d in deals if d.price > 0 and _in_window(d)]
+            sized = [d for d in live if _length_ok(d)]
+            if len(sized) < len(live):
+                log.info("Vacation scan: %s: dropped %d of %d deals (trip not %d-%d nights)",
+                         name, len(live) - len(sized), len(live), _min_nights(), _max_nights())
+                report.dropped_length += len(live) - len(sized)
+            live = sized
             kept = [d for d in live if _hotel_qualifies(d)]
             if len(kept) < len(live):
                 log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 3–5★)",
