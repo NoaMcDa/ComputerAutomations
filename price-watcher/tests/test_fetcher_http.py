@@ -187,9 +187,12 @@ def test_shopify_out_of_stock_variant(server):
 
 
 def test_shopify_no_variant_reads_default(server):
+    # Merge note: PR #57 deliberately tracks the FIRST variant when none is
+    # pinned (not the first available one), with that variant's own stock
+    # flag, so the tracked item never switches between runs.
     _shopify(server)
     r = _fetch(server.base + "/products/25-610navy")
-    assert r.price == Decimal("250")  # first available variant
+    assert (r.price, r.in_stock) == (Decimal("300"), False)
 
 
 def test_shopify_missing_pinned_variant_is_not_found(server):
@@ -220,12 +223,16 @@ def test_blocked_shopify_rescued_with_cart_currency(server):
     assert r.currency == "ILS"
 
 
-def test_blocked_shopify_currency_from_meta_json(server):
+def test_blocked_shopify_currency_not_guessed_from_meta_json(server):
+    # Merge note: PR #57 reads the currency from /cart.js only. /meta.json
+    # holds the shop's BASE currency, which is not necessarily the one the
+    # .js prices are in (multi-market shops), so it is never used.
     _shopify(server, page_status=403, page="denied")
     server.route("/meta.json", '{"name": "Shop", "currency": "usd"}', **JSON)
     r = _fetch(server.base + "/products/25-610navy?variant=62803155976563")
     assert r.status == FetchStatus.OK
-    assert r.currency == "USD"
+    assert r.currency is None
+    assert "/meta.json" not in server.hits
 
 
 def test_blocked_shopify_without_currency_endpoints(server):

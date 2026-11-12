@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from typing import Optional
 
 import typer
@@ -17,11 +19,34 @@ app = typer.Typer(
 console = Console()
 
 
+def _fail(message: str, code: int = 2) -> "typer.Exit":
+    typer.echo(f"Error: {message}", err=True)
+    return typer.Exit(code)
+
+
+@contextmanager
+def _friendly_errors():
+    """Turn configuration errors into a one-line message + non-zero exit."""
+    from price_watcher.config import ConfigError
+    try:
+        yield
+    except ConfigError as exc:
+        raise _fail(str(exc)) from None
+
+
 @app.callback()
 def _root(
-    log_level: str = typer.Option("INFO", "--log-level", help="DEBUG, INFO, WARNING, ERROR"),
+    log_level: str = typer.Option(
+        None, "--log-level",
+        help="DEBUG, INFO, WARNING, ERROR (default: $PW_LOG_LEVEL, else INFO)",
+    ),
 ) -> None:
-    configure_logging(log_level)
+    from price_watcher import config as _config  # loads .env
+    level = log_level or os.environ.get("PW_LOG_LEVEL") or "INFO"
+    try:
+        configure_logging(level)
+    except ValueError as exc:
+        raise _fail(str(exc)) from None
 
 
 @app.command()
@@ -70,7 +95,7 @@ def add(
     promo: bool = typer.Option(True, "--promo/--no-promo", help=_PROMO_HELP),
     excluded_from_promo: bool = typer.Option(False, "--excluded-from-promo", help=_EXCLUDED_HELP),
 ) -> None:
-    """Add a URL to the watch list."""
+    """Add a URL to the watch list (exit code 1 if it is already watched)."""
     from price_watcher.watchlist import add as _add
 
     options: dict = {}
@@ -83,7 +108,8 @@ def add(
         options["track_promo"] = False
     if excluded_from_promo:
         options["excluded_from_promo"] = True
-    _add(url=url, name=name, selector=selector, **options)
+    if not _add(url=url, name=name, selector=selector, **options):
+        raise typer.Exit(1)
 
 
 @app.command(name="set")
@@ -174,22 +200,31 @@ def check(
     """Fetch, compare, notify and save state for every watched URL.
 
     Exit code: 0 = all links read (and any change email sent), 1 = at least
-    one link could not be fetched or read, 3 = a change email could not be
-    sent (the changes are retried on the next run).
+    one link could not be fetched or read, 2 = configuration error (a real
+    run needs the SMTP settings), 3 = a change email could not be sent (the
+    changes are retried on the next run).
     """
+    from price_watcher import config as _config
     from price_watcher.scheduler import run_check
-    raise typer.Exit(run_check(dry_run=dry_run))
+    with _friendly_errors():
+        if not dry_run:
+            _config.load()  # a real run needs SMTP settings: fail fast, one line
+        rc = run_check(dry_run=dry_run)
+    raise typer.Exit(rc)
 
 
 @app.command(name="test-email")
 def test_email() -> None:
     """Send a sample email to verify the SMTP setup."""
     from price_watcher.email_sender import send_test_email
-    try:
-        send_test_email()
-    except Exception as exc:
-        console.print(f"[red]Test email failed:[/red] {type(exc).__name__}: {exc}")
-        raise typer.Exit(1)
+    with _friendly_errors():
+        try:
+            send_test_email()
+        except Exception as exc:
+            from price_watcher.config import ConfigError
+            if isinstance(exc, ConfigError):
+                raise
+            raise _fail(f"Test email failed: {type(exc).__name__}: {exc}", 1) from None
     console.print("[green]Test email sent.[/green] Check your inbox (and spam folder).")
 
 
@@ -217,13 +252,26 @@ def status() -> None:
 @app.command()
 def digest(
     dry_run: bool = typer.Option(False, "--dry-run", help="Collect + print, but do not email"),
+    test: bool = typer.Option(False, "--test", help="Email only PW_EMAIL_TO (skip the deals-only recipients) and save nothing"),
 ) -> None:
-    """Send the daily report: site promos, creatine, Sims 4, supermarket meat.
-
-    Exit code: 0 = sent (or dry run), 1 = the email could not be sent.
-    """
+    """Send the daily report (site promos, creatine, Sims 4, meat, vacation deals)."""
     from price_watcher.digest import run_digest
-    raise typer.Exit(run_digest(dry_run=dry_run))
+    with _friendly_errors():
+        rc = run_digest(dry_run=dry_run, test=test)
+    raise typer.Exit(rc)
+
+
+@app.command()
+def deals(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Collect + print, but do not email"),
+    test: bool = typer.Option(False, "--test", help="Send the deals-only email to PW_EMAIL_TO instead of PW_DEALS_EMAIL_TO"),
+    days: int = typer.Option(None, "--days", help="Only deals departing within this many days (overrides PW_DEALS_DAYS; 0 = no limit)"),
+) -> None:
+    """Scan vacation deals and send the deals-only email to PW_DEALS_EMAIL_TO."""
+    from price_watcher.digest import run_deals
+    with _friendly_errors():
+        rc = run_deals(dry_run=dry_run, test=test, days=days)
+    raise typer.Exit(rc)
 
 
 @app.command(name="install-digest-schedule")

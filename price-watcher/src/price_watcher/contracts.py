@@ -115,10 +115,16 @@ class ChangeEvent:
     diff: Optional[Decimal] = None
     reason: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
-    # The promotion / estimated final price stored before this run, so the
-    # email can say what changed (e.g. "promotion ended").
+    # Secondary changes carried by the same event (e.g. a PRICE_CHANGED that
+    # also went out of stock, or a RECOVERED whose price moved meanwhile).
+    stock_changed: bool = False
+    promo_changed: bool = False
     old_promo: Optional[PromoInfo] = None
+    # The estimated final price stored before this run, so the email can say
+    # what changed (e.g. "promotion ended").
     old_estimated_price: Optional[Decimal] = None
+    # Set when the price is compared across a currency switch.
+    old_currency: Optional[str] = None
 
 
 # ---- Email ----

@@ -86,3 +86,19 @@ def test_condition_phrases():
 
 def test_unused_helpers_removed():
     assert not hasattr(myprotein, "_RE_CONDITION")
+
+
+# ---- Merge: PR #56 behaviour ported into the PR #57 extractor ----------------
+
+def test_conditions_from_another_offer_are_not_borrowed():
+    body = ('<div class="promo">30% off everything | Extra 10% on orders over ₪200 '
+            'with code: TEN10</div>')
+    r = extractor.extract(body, URL, ok("100"))
+    assert (r.promo.code, r.promo.discount_pct) == (None, Decimal("30"))
+    assert "200" not in (r.promo.condition or "")
+
+
+def test_code_next_to_a_non_discount_percentage_is_not_a_promo():
+    r = extractor.extract('<div class="promo">Impact Whey: 80% protein | code: WHEY80</div>',
+                          URL, ok("100"))
+    assert r.promo is None

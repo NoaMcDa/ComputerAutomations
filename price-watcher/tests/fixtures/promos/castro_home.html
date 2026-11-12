@@ -1,0 +1,253 @@
+<!-- Excerpt of https://www.castro.com/, captured 2026-11-11; trimmed to the promo markup plus nearby noise. -->
+<html><head><style>
+@media screen and (max-width: 767px) {
+                    img {
+
+  animation: fadeInFix 1s ease forwards;
+
+}
+
+@keyframes fadeInFix {
+
+  from { opacity: 0.99; }
+
+  to { opacity: 1; }
+
+}
+
+
+.idus_popup_widget_newsletter_popup .modal-inner-wrap .modal-content .idus-newsletter-intro .idus-newsletter-title {
+
+        font-size: 1.25rem;
+
+        padding-bottom: 0;
+
+}
+
+
+
+.idus_popup_widget_newsletter_popup .modal-inner-wrap .modal-content .idus-newsletter-content {
+
+    
+
+        margin-top: 0;
+
+}
+
+
+
+
+.castro-success-page.castro-success-page {
+
+    
+
+    background: url('/images/checkout/MOB-TNX.jpg') no-repeat center;
+
+    background-size: cover;
+
+}
+.cms-business-giftcard .page-heading-wrapper.page-heading-title_layout-default .page-heading .page-heading-cover{
+
+    
+
+    background-repeat: no-repeat;
+
+    background-size: contain;
+
+    background-position: center;
+
+}
+
+.voucher-view-index .page-heading-wrapper.page-heading-title_layout-default .page-heading .page-heading-cover{
+
+    
+
+    background-size: contain;
+
+    background-position: center;
+
+    background-repeat: no-repeat;
+
+    padding-bottom: 100%;
+
+}   
+                }</style><style>.store-app .edit-bottom-note .acc
+</style></head><body>
+<div class="header_wrapper"><div class="timer"><div class="header__widget header_widget">
+	<div data-timer-cache-validation="2026-11-13 10:00,countdown" style="color: #FFFFFF;--color: #FFFFFF;background-color: #000000;--background-color: #000000" class="idus-timer header_sale_timer " data-state="countdown" data-done-action="hide">
+
+			<button class="close-timer" onclick="closeTimer()" aria-label="סגירת באנר">
+			<span>
+			Close Timer			</span>
+		</button>
+	
+			<a href="/">
+							<div class="idus-timer-content ">
+									<div class="idus-timer-content-title">
+						<div>EXTRA 11% על כל האתר כולל כפל מבצעים❗</div>
+					</div>
+													<div class="idus-timer-content-desc">
+						<div>בהקלדת קוד קופון: OFF11</div>
+					</div>
+							</div>
+				<div class="idus-timer-countdown">
+			<div class="idus-timer-countdown-inner" dir="ltr">
+									<span class="ticker days"></span><span class="delimiter">:</span>					<span class="ticker hours"></span><span class="delimiter">:</span>					<span class="ticker minutes"></span><span class="delimiter">:</span>					<span class="ticker seconds"></span>							</div>
+		</div>
+				</a>
+	</div>
+
+<!-- Inline scripting... -->
+<script>
+	const timerClasses = "header_sale_timer";
+	const timer = document.querySelector(`.${timerClasses}`);
+	var finishAction = "hide";
+	var timerState = "countdown";
+	var timerAllowClosed = "1"
+	var finishDate = new Date("2026-11-13 10:00".replace(/-/g, '/'));
+	var timerDiff = Math.floor((finishDate.getTime() - Date.now()) / 1000);
+	var replaceText = "";
+	var timerEl = document.querySelector('.idus-timer');
+	var timerFormat = "dd:hh:mm:ss";
+	var timerPageHeader = timerEl.closest('.page-header');
+	if (!timerPageHeader) timerPageHeader= timerEl.closest('.page-wrapper');
+	var body = document.querySelector('body');
+
+	var paddingAmount = {
+
+		seconds: ((timerFormat.match(/s/g) || []).length) || 2,
+		minutes: ((timerFormat.match(/m/g) || []).length) || 2,
+		hours: ((timerFormat.match(/h/g) || []).length) || 2,
+		days: ((timerFormat.match(/d/g) || []).length) || 3
+	};
+	if (timerState !== 'finish') {
+
+		timerEl.classList.add('counting');
+		timerPageHeader.classList.add('timer-counting');
+		var timerString = calcTimer();
+		if (!timerString) finishTimer();
+		else {
+
+			var timerInterval = setInterval(function() {
+
+				timerString = calcTimer();
+				if (!timerString) {
+
+					finishTimer();
+					clearInterval(timerInterval);
+					timerInterval = false;
+				}
+			}, 1000);
+		}
+	} else {
+
+		finishTimer();
+	}
+
+	function calcTimer() {
+
+		if (timerDiff <= 0 && finishAction !== 'show') return false;
+		timerDiff--;
+
+		var days = {
+			el: timerEl.querySelector('.days'),
+			val: Math.floor(timerDiff / (60 * 60 * 24))
+		};
+		if (days.el) days.len = days.el.innerText.length;
+
+		var hours = {
+			el: timerEl.querySelector('.hours'),
+			val: Math.floor((timerDiff - days.val * 60 * 60 * 24) / (60 * 60))
+		};
+		if (hours.el) hours.len = hours.el.innerText.length;
+
+		var minutes = {
+			el: timerEl.querySelector('.minutes'),
+			val: Math.floor((timerDiff - days.val * 60 * 60 * 24 - hours.val * 60 * 60) / 60)
+		};
+		if (minutes.el) minutes.len = minutes.el.innerText.length;
+
+		var seconds = {
+			el: timerEl.querySelector('.seconds'),
+			val: Math.floor(timerDiff - days.val * 60 * 60 * 24 - hours.val * 60 * 60 - minutes.val * 60)
+		};
+		if (seconds.el) seconds.len = seconds.el.innerText.length;
+
+		if (timerDiff <= 0 && finishAction === 'show') {
+
+			days.val = 0;
+			hours.val = 0;
+			minutes.val = 0;
+			seconds.val = 0;
+		}
+
+		if (seconds.el) seconds.el.innerText = pad(seconds.val, seconds.len || paddingAmount.seconds);
+		if (minutes.el) minutes.el.innerText = pad(minutes.val, minutes.len || paddingAmount.minutes);
+		if (hours.el) hours.el.innerText = pad(hours.val, hours.len || paddingAmount.hours);
+		if (days.el) days.el.innerText = pad(days.val, days.len || paddingAmount.days);
+
+		if (timerDiff <= 0 && finishAction === 'show') return false;
+
+		return true;
+	}
+
+	function finishTimer() {
+
+		timerEl.classList.remove('counting');
+		timerPageHeader.classList.remove('timer-counting');
+		timerEl.classList.add('done');
+		timerEl.setAttribute('data-state', 'finish');
+
+		switch (finishAction) {
+
+			case 'hide':
+				timerEl.classList.add('hide');
+				break;
+			case 'show':
+				document.querySelectorAll('.ticker').forEach(function(ticker) {
+					ticker.innerText = '0';
+				});
+				break;
+			case 'replace':
+
+				if (replaceText.trim() !== '') {
+
+					timerEl.querySelector('.idus-timer-content').classList.add('hide');
+					timerEl.querySelector('.idus-timer-countdown-inner').innerHTML = replaceText;
+				}
+				break;
+		}
+	}
+
+	function pad(n, width, z) {
+		z = z || '0';
+		n = n + '';
+		return n.length >= width ? n : new Array(width - n.length + 1).join(z) + n;
+	}
+
+			function timerIsClosed() {
+		
+		
+			storgeVal = sessionStorage.getItem(timerClasses);
+			if (storgeVal === "hidden") {
+				timer.setAttribute("class" , "hide");
+				timerPageHeader.classList.remove('timer-counting');
+			}
+		} 
+	
+		timerIsClosed();
+		function closeTimer () {
+		
+		timer.setAttribute("class", "hide");
+		sessionStorage.setItem( timerClasses, 'hidden' );
+		timerPageHeader.classList.remove('timer-counting');
+		timerPageHeader.style.setProperty('--timerHeight', '0px');
+		body.style.setProperty('--timerHeight', '0px');
+		jQuery('body').trigger('contentUpdated');
+	}
+
+	var timerHeight = timerEl.clientHeight;
+	timerPageHeader.style.setProperty('--timerHeight', timerHeight + 'px');
+	body.style.setProperty('--timerHeight', timerHeight + 'px');
+</script>
+</div></div></body></html>

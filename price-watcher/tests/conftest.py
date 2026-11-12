@@ -1,11 +1,12 @@
-"""Shared pytest fixtures for Price Watcher.
+"""Shared test setup: every test runs offline against a throwaway data directory.
 
 Every test runs with the per-user data/log folders redirected to a temporary
 directory, so nothing touches the real state file, and SMTP is never reached.
 """
+
 from __future__ import annotations
 
-import os
+import smtplib
 import sys
 from pathlib import Path
 
@@ -18,19 +19,42 @@ if str(SRC) not in sys.path:
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
+class _NoSMTP:
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("tests must not open a real SMTP connection; patch _send_via_smtp")
+
+
 @pytest.fixture(autouse=True)
-def _isolated_app_dirs(tmp_path, monkeypatch):
-    """Point every app-data / log path at a temp folder."""
-    data = tmp_path / "appdata"
-    data.mkdir()
+def _isolated_environment(tmp_path, monkeypatch):
+    """Point the app's data/log dirs at tmp_path and provide dummy SMTP settings."""
+    for var in ("APPDATA", "LOCALAPPDATA", "XDG_DATA_HOME", "XDG_STATE_HOME"):
+        target = tmp_path / var.lower()
+        target.mkdir()
+        monkeypatch.setenv(var, str(target))
+    # macOS resolves its data folder under ~/Library.
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("XDG_DATA_HOME", str(data))
-    monkeypatch.setenv("XDG_STATE_HOME", str(data / "state"))
-    monkeypatch.setenv("APPDATA", str(data))
-    monkeypatch.setenv("LOCALAPPDATA", str(data))
     for var in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
-    yield data
+    monkeypatch.setenv("PW_SMTP_HOST", "smtp.invalid")
+    monkeypatch.setenv("PW_SMTP_PORT", "587")
+    monkeypatch.setenv("PW_SMTP_USER", "tester")
+    monkeypatch.setenv("PW_SMTP_PASSWORD", "not-a-real-password")
+    monkeypatch.setenv("PW_EMAIL_FROM", "from@example.invalid")
+    monkeypatch.setenv("PW_EMAIL_TO", "to@example.invalid")
+    monkeypatch.setattr(smtplib, "SMTP", _NoSMTP)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", _NoSMTP)
+    yield
+
+
+@pytest.fixture
+def _isolated_app_dirs(_isolated_environment, tmp_path):
+    """The temp folder the app-data / log paths were redirected to.
+
+    Every test is isolated by the autouse fixture above; this one only hands a
+    test the folder (its parent is the test's tmp_path).
+    """
+    data = tmp_path / "appdata"
+    return data
 
 
 @pytest.fixture

@@ -1,118 +1,127 @@
-"""Issues #41 (Hebrew code phrasings), #47 (no_promo rendering), #40 (dead code)."""
+"""digest.extract_promos: real homepage banners + synthetic false positives (#20, #21)."""
+
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
-from price_watcher import digest as dg
-from price_watcher import email_sender as es
-from price_watcher.contracts import PromoInfo
+from price_watcher import digest
 
-ISSUE_41 = [
-    ("קוד הנחה: VIP20 – 20% הנחה על כל האתר", "VIP20", 20),
-    ("20% הנחה על כל האתר בקוד הנחה VIP20", "VIP20", 20),
-    ("10% הנחה עם קוד הטבה: WELCOME10", "WELCOME10", 10),
-    ("קוד מבצע SALE15 - 15% הנחה", "SALE15", 15),
-    ("15% הנחה | קוד הנחה: SALE15", "SALE15", 15),
-    ("20% off with discount code VIP20", "VIP20", 20),
-]
+FIXTURES = Path(__file__).parent / "fixtures" / "promos"
 
 
-@pytest.mark.parametrize("text, code, pct", ISSUE_41)
-def test_issue_41_code_and_pct_detected(text, code, pct):
-    promos = dg.extract_promos(text)
-    assert [(p.code, p.discount_pct) for p in promos] == [(code, Decimal(pct))]
+def _load(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("text, code, pct", ISSUE_41)
-def test_issue_41_inside_a_banner_element(text, code, pct):
-    html = f'<html><body><div class="promo-bar">{text}</div></body></html>'
-    promos = dg.extract_promos(html)
-    assert [(p.code, p.discount_pct) for p in promos] == [(code, Decimal(pct))]
-    assert all(p.code for p in promos), "must not be reported as a code-less discount"
+def _pairs(html: str) -> set[tuple[str | None, int]]:
+    return {(p.code, int(p.discount_pct)) for p in digest.extract_promos(html)}
 
 
-def test_existing_phrasings_still_work():
-    assert [(p.code, int(p.discount_pct)) for p in dg.extract_promos(
-        "EXTRA 11% הנחה על כל האתר <div>x</div> קוד קופון: OFF11")] == [("OFF11", 11)]
-    assert [(p.code, int(p.discount_pct)) for p in dg.extract_promos(
-        "Get 25% off everything")] == [(None, 25)]
+def _page(body: str) -> str:
+    return f"<html><body>{body}</body></html>"
 
 
-def test_hebrew_prefixed_word_is_not_a_keyword():
-    # "מקודם" (promoted) contains "קוד" but is not the word "code"
-    assert dg.extract_promos("20% הנחה מקודם ABC12") == []
+# --- Real homepages captured 2026-11-11 -------------------------------------
+
+def test_castro_banner_split_over_two_divs():
+    # "EXTRA 11% על כל האתר ..." and "בהקלדת קוד קופון: OFF11" sit in sibling divs.
+    promos = digest.extract_promos(_load("castro_home.html"))
+    assert [(p.code, p.discount_pct) for p in promos] == [("OFF11", Decimal(11))]
+    assert "על כל האתר" in promos[0].condition
 
 
-def test_dead_code_removed():
-    for name in ("_extract_bare_promos", "_PCT_BARE_PAT", "_COND_PAT_AFTER"):
-        assert not hasattr(dg, name), name
-    assert "everything!" not in dg._SITEWIDE_BARE_PAT.pattern
-    assert not hasattr(es, "build_digest_payload")
-    assert not hasattr(es, "send_digest_email")
+def test_myprotein_home_offers_paired_with_their_own_percentage():
+    assert _pairs(_load("myprotein_home.html")) == {
+        (None, 30),       # "30% OFF EVERYTHING", no code
+        ("NEWMYP", 10),   # "Extra 10% on first order | Code: NEWMYP"
+        ("APP5", 5),      # "EXTRA 5% OFF | USE CODE: APP5"
+    }
 
 
-def test_user_agent_is_shared():
-    from price_watcher.http_headers import USER_AGENT
-    assert dg._HEADERS["User-Agent"] == USER_AGENT
-    assert USER_AGENT.startswith("Mozilla/5.0") and "Chrome/" in USER_AGENT
+def test_myprotein_newmyp_condition_mentions_first_order():
+    newmyp = next(p for p in digest.extract_promos(_load("myprotein_home.html")) if p.code == "NEWMYP")
+    assert "first order" in newmyp.condition
 
 
-# ---- #47 no_promo ----------------------------------------------------------
-
-def _report(*digests):
-    return dg.DailyReport(site_digests=list(digests))
-
-
-def _site(status, promos=(), error=None):
-    return dg.SiteDigest(host="seestarz.com", display_name="Seestarz",
-                         homepage_url="https://seestarz.com/", status=status,
-                         promos=list(promos), error=error)
+def test_terminalx_banner_inside_script_json():
+    html = _load("terminalx_home.html")
+    assert "<img" not in html  # the only copy of the banner is the JSON blob
+    promos = digest.extract_promos(html)
+    assert [(p.code, p.discount_pct) for p in promos] == [("SINGLES20", Decimal(20))]
 
 
-def test_no_promo_is_not_rendered_as_error():
-    p = es.build_daily_payload(_report(_site("no_promo")))
-    assert "לא זוהה מבצע כלל-אתרי" in p.text_body
-    assert "לא זוהה מבצע כלל-אתרי" in p.html_body
-    assert "no_promo" not in p.text_body and "no_promo" not in p.html_body
-    assert "#c33" not in p.html_body
+def test_seestarz_has_no_promo():
+    assert digest.extract_promos(_load("seestarz_home.html")) == []
 
 
-def test_status_he_has_no_promo():
-    assert es._status_he("no_promo") == "לא זוהה מבצע כלל-אתרי"
+def test_myprotein_product_page_banner():
+    assert _pairs(_load("myprotein_product.html")) == {(None, 30), ("APP5", 5)}
 
 
-def test_real_failure_still_red():
-    p = es.build_daily_payload(_report(_site("blocked", error="HTTP 403")))
-    assert "האתר חסם את הבקשה" in p.text_body
-    assert '<div style="margin-top:8px;color:#c33"><b>האתר חסם את הבקשה:</b> HTTP 403</div>' in p.html_body
+# --- Pairing inside multi-offer banners (#20) --------------------------------
+
+@pytest.mark.parametrize("body, expected", [
+    (
+        '<div class="strip">30% OFF EVERYTHING<br>APP EXCLUSIVE | EXTRA 5% OFF | USE CODE APP5</div>',
+        {(None, 30), ("APP5", 5)},
+    ),
+    (
+        '<div class="usp">Extra 10% on first order | Code: NEWMYP</div>'
+        '<div class="usp">App Exclusive | Extra 5% - USE CODE: APP5</div>',
+        {("NEWMYP", 10), ("APP5", 5)},
+    ),
+    (
+        '<div class="promo">EXTRA 11% על כל האתר | קוד קופון: OFF11</div>',
+        {("OFF11", 11)},
+    ),
+    (
+        # several percentages in one segment: the code takes the nearest one
+        '<p>Up to 70% off + extra 10% with code WINTER10</p>',
+        {("WINTER10", 10)},
+    ),
+])
+def test_codes_pair_within_their_offer(body, expected):
+    assert _pairs(_page(body)) == expected
 
 
-def test_promos_rendered_and_escaped():
-    promo = PromoInfo(code="VIP20", discount_pct=Decimal(20), condition="<b>all</b>")
-    p = es.build_daily_payload(_report(_site("ok", [promo])))
-    assert "20% הנחה  —  קוד: VIP20" in p.text_body
-    assert "&lt;b&gt;all&lt;/b&gt;" in p.html_body
-    assert "VIP20" in p.subject
+def test_code_does_not_borrow_from_a_segment_that_has_its_own_code():
+    body = "<p>20% OFF CODE: AAA20 | USE CODE: BBB</p>"
+    assert _pairs(_page(body)) == {("AAA20", 20)}
 
 
-def test_terminal_output_no_promo(capsys):
-    dg._print_digests([_site("no_promo")])
-    out = capsys.readouterr().out
-    assert "לא זוהה מבצע כלל-אתרי" in out and "no_promo" not in out
+# --- False positives (#21) ---------------------------------------------------
+
+@pytest.mark.parametrize("html", [
+    # CSS percentage + JSON keys/values in scripts
+    '<html><head><style>.a{width:50%}</style><script>var cfg={"sale":true,'
+    '"code":"currency","off":1};</script></head><body></body></html>',
+    # lower-case word after "code"
+    _page('<div class="promo">20% off sale! Use the code below at checkout</div>'),
+    # neighbouring JSON fields are not combined; lower-case value is not a code
+    '<html><body><script>{"discount":"25% off","sku_code":"ABC123",'
+    '"coupon code":"abc"}</script></body></html>',
+    # "150%" is not 50%
+    _page('<div class="promo">Earn 150% off points. Site rewards</div>'),
+    # "website" is not "site"
+    _page("<p>Get 10% off when you sign up on our website newsletter</p>"),
+    # non-discount percentages
+    _page("<p>100% plant-based</p><p>Clothing is subject to a 10% tax rate</p>"),
+    _page('<div class="banner">Impact Whey: 80% protein per serving | code: WHEY80</div>'),
+    # "postcode" is not "code"
+    _page('<div class="banner">15% off for students. Enter your postcode AB12 below</div>'),
+    # markup attributes are not text
+    _page('<div data-x="20% off everything code: ATTR20" class="promo-code"></div>'),
+])
+def test_false_positives_are_ignored(html):
+    assert digest.extract_promos(html) == []
 
 
-def test_collect_digest_marks_no_promo(monkeypatch):
-    monkeypatch.setattr(dg, "_unique_hosts", lambda: ["seestarz.com"])
-    monkeypatch.setattr(dg, "_fetch_homepage", lambda host: ("<html>hi</html>", "ok", None))
-    [site] = dg.collect_digest()
-    assert site.status == "no_promo" and not site.failed
+def test_up_to_is_not_reported_as_sitewide():
+    assert digest.extract_promos(_page("<p>Up to 70% off everything</p>")) == []
 
 
-def test_run_digest_exit_code_on_email_failure(monkeypatch):
-    monkeypatch.setattr(dg, "collect_daily_report", lambda: _report(_site("no_promo")))
-    monkeypatch.setattr(es, "send_daily_email", lambda report: False)
-    assert dg.run_digest() == 1
-    monkeypatch.setattr(es, "send_daily_email", lambda report: True)
-    assert dg.run_digest() == 0
+def test_hebrew_sitewide_without_code():
+    assert _pairs(_page("<p>30% הנחה על כל האתר</p>")) == {(None, 30)}

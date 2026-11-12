@@ -259,9 +259,33 @@ def test_collect_daily_report_hook(monkeypatch):
     from price_watcher import digest
 
     monkeypatch.setattr(digest, "collect_digest", lambda: [])
+    monkeypatch.setattr(digest, "collect_vacations", lambda: None)  # offline
     for mod in ("creatine", "sims4", "supermarkets"):
         m = __import__(f"price_watcher.{mod}", fromlist=["x"])
         monkeypatch.setattr(m, "scan_and_report", lambda: None)
     sentinel = _report_with([])
     monkeypatch.setattr(mp, "scan_and_report", lambda: sentinel)
     assert digest.collect_daily_report().marketplace is sentinel
+
+
+def test_daily_email_marketplace_failure_in_subject_and_styles_in_head():
+    """Merged: a fully failed Marketplace scan is named in the subject like the
+    other sections, and row styles come from one <style> block in <head>."""
+    from price_watcher.digest import DailyReport
+    from price_watcher.email_sender import build_daily_payload
+
+    fail = mp.QueryResult(mp.SearchQuery("chair"), mp.STATUS_LOGIN_WALL, error="login wall")
+    failed = mp.MarketplaceReport(status="failed", results=[fail])
+    p = build_daily_payload(DailyReport(marketplace=failed))
+    assert "Marketplace" in p.subject and "סריקה נכשלה" in p.subject
+    assert "«chair»" in p.text_body and "«chair»" in p.html_body
+
+    d = mp.Deal("new", "2", "Chair", Decimal("80"), "https://www.facebook.com/marketplace/item/2/", None, "bike")
+    ok = build_daily_payload(DailyReport(marketplace=_report_with([d])))
+    assert "Marketplace" not in ok.subject
+    head = ok.html_body.split("</head>")[0]
+    assert mp.style_tag() in head
+    assert 'class="mp"' in ok.html_body and "padding:6px 8px" not in ok.html_body.split("</head>")[1]
+
+    off = build_daily_payload(DailyReport())
+    assert mp.style_tag() not in off.html_body

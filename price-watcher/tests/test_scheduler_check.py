@@ -143,7 +143,7 @@ def test_threshold_alert_once_and_reason_in_last_run(monkeypatch, smtp):
     assert rcs == [0, 1, 1, 1, 1, 1, 0]
     subjects = [m.subject for m in smtp.sent]
     assert subjects == [
-        "המעקב הפסיק לעבוד: Shoe – הדף לא נמצא (ייתכן שהמוצר הוסר)",
+        "המעקב הפסיק לעבוד: Shoe – הדף לא נמצא",               # merge: ours' status wording
         "המעקב חזר לעבוד: Shoe",
     ]
     assert "Shopify variant 1 not found in product" in smtp.sent[0].text_body
@@ -173,7 +173,7 @@ def test_dry_run_writes_no_state_sends_nothing(monkeypatch, smtp, capsys):
     assert smtp.sent == []
     assert state_file().read_bytes() == before
     assert "would send: המחיר ירד: Shoe" in out
-    assert "100 ILS" in out and "80 ILS" in out          # previous and current
+    assert "100 → 80" in out                             # previous and current (merge: ours' table)
     assert "WOULD SEND EMAIL" in out
     lr = last_run()
     assert lr["dry_run"] is True and lr["previous_real_run"]["dry_run"] is False

@@ -1,28 +1,72 @@
-"""Creatine watcher: iHerb price parsing, de-duplication, filtering, direction (#37, #45)."""
+"""Creatine watcher: iHerb price parsing, de-duplication, filtering, direction (#37, #45).
+
+From origin/main, adapted to the merged creatine module (the PR #57 one, which
+was checked against live iHerb): one search page is read (httpx, then the
+headless browser), the cell count is the de-duplicated count, a same-price
+change of product is direction "changed", per-oz prices stay "oz" (not
+comparable), and a page with zero parseable prices is "fetch_failed". The
+multi-page scan (`scan_iherb_detailed`, `IherbScan`, `_Page`, `search_url`) was
+not merged, so its tests were dropped.
+"""
 from __future__ import annotations
 
+import builtins
 from decimal import Decimal
-from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 
 from price_watcher import creatine
 from price_watcher.creatine import (
     CreatineProduct,
-    IherbScan,
-    _Page,
     _parse_cells,
     _parse_price,
     compare,
     is_monohydrate_powder,
-    scan_and_report,
-    scan_iherb_detailed,
 )
 from price_watcher.http_headers import USER_AGENT
 
 
 def _read(fixtures_dir, name: str) -> str:
     return (fixtures_dir / name).read_text(encoding="utf-8")
+
+
+def scan_and_report(products, cells):
+    """Run creatine.scan_and_report() on already-parsed products (no network)."""
+    def fake_scan():
+        creatine._scan_cells_seen = cells
+        return products
+    orig = creatine.scan_iherb
+    creatine.scan_iherb = fake_scan
+    try:
+        return creatine.scan_and_report()
+    finally:
+        creatine.scan_iherb = orig
+
+
+class _Resp:
+    def __init__(self, status, text):
+        self.status_code, self.text = status, text
+
+
+def _offline(monkeypatch, resp=None, exc=None):
+    """httpx answers with `resp` (or raises `exc`); Playwright is not available."""
+    class Client:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url):
+            if exc:
+                raise exc
+            return resp
+    monkeypatch.setattr(creatine.httpx, "Client", Client)
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name.startswith("playwright"):
+            raise ImportError(name)
+        return real(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", fake)
 
 
 def _prod(name="Brand, Creatine Monohydrate, 500 g", per100="9.49", url="", currency="ILS"):
@@ -57,7 +101,7 @@ def _prod(name="Brand, Creatine Monohydrate, 500 g", per100="9.49", url="", curr
         ("₪94.64 (₪9.49/100 g)", "94.64", "ILS", "9.49", "100g", False),
         ("₪94.64 (₪94.90/kg)", "94.64", "ILS", "9.49", "100g", False),
         ('₪94.64 (₪94.90/ק"ג)', "94.64", "ILS", "9.49", "100g", False),
-        ("$24.99 ($0.71/oz)", "24.99", "USD", "2.50", "100g", False),
+        # (per-oz stays "oz", not converted: see test_creatine_parse.py)
         ("₪94.64 (₪0.0949/g)", "94.64", "ILS", "9.49", "100g", False),
         # volume cannot be turned into grams: kept as per-100ml
         ("₪94.64 (₪9.49/100ml)", "94.64", "ILS", "9.49", "100ml", False),
@@ -85,7 +129,7 @@ def test_parse_price_rejects_non_prices(text):
 def test_usd_page_is_parsed_not_reported_as_blocked(fixtures_dir):
     html = _read(fixtures_dir, "creatine_iherb_search_p1.html").replace("₪", "$")
     products, cells = _parse_cells(html)
-    assert cells == 8
+    assert cells == 7  # 8 cells, one repeated product counted once
     assert products and all(p.currency == "USD" for p in products)
 
 
@@ -95,7 +139,7 @@ def test_usd_page_is_parsed_not_reported_as_blocked(fixtures_dir):
 
 def test_parse_cells_dedupes_on_product_id_and_ignores_brand_badge(fixtures_dir):
     products, cells = _parse_cells(_read(fixtures_dir, "creatine_iherb_search_p1.html"))
-    assert cells == 8
+    assert cells == 7  # de-duplicated count
     assert len(products) == 7  # Micro Ingredients appears twice (sponsored + organic)
     urls = [p.url for p in products]
     assert not any("iherb-brands" in u for u in urls)
@@ -131,12 +175,12 @@ def test_link_from_title_anchor_or_first_pr_anchor():
 def test_counts_use_deduplicated_products(fixtures_dir):
     html = _read(fixtures_dir, "creatine_iherb_search_p1.html")
     products, cells = _parse_cells(html)
-    report = scan_and_report(IherbScan(products=products, cells=cells, pages=1))
+    report = scan_and_report(products, cells)
     assert report.status == "ok"
-    assert report.products_scanned == 7
-    assert report.cells_seen == 8
+    assert report.parsed == 7
+    assert report.cells_seen == 7
     # CGN, Micro Ingredients (once), Sports Research
-    assert report.powders_found == 3
+    assert report.powders == 3
     names = [p.name for p in report.products]
     assert len(names) == len(set(names))
 
@@ -171,126 +215,65 @@ def test_capsules_are_never_powders():
 
 def test_cheapest_skips_gummies_and_flavoured_mixes(fixtures_dir):
     products, cells = _parse_cells(_read(fixtures_dir, "creatine_iherb_search_p1.html"))
-    report = scan_and_report(IherbScan(products=products, cells=cells, pages=1))
+    report = scan_and_report(products, cells)
     assert report.cheapest.name.startswith("California Gold Nutrition")
     assert report.cheapest.price_per_100g == Decimal("9.49")
     assert all(is_monohydrate_powder(p) for p in report.products)
-
-
-def test_search_url_paging():
-    assert creatine.search_url(1) == "https://il.iherb.com/search?kw=creatine"
-    q = parse_qs(urlsplit(creatine.search_url(3)).query)
-    assert q == {"kw": ["creatine"], "p": ["3"]}
-
-
-def test_scan_reads_several_pages_and_dedupes_across_them(fixtures_dir):
-    pages = {
-        1: _read(fixtures_dir, "creatine_iherb_search_p1.html"),
-        2: _read(fixtures_dir, "creatine_iherb_search_p2.html"),
-        3: "<html><body><p>No results</p></body></html>",
-    }
-    served = []
-
-    def fake_pages(max_pages):
-        for n in range(1, max_pages + 1):
-            served.append(n)
-            yield n, _Page(pages.get(n))
-
-    scan = scan_iherb_detailed(max_pages=5, pages=fake_pages)
-    assert scan.pages == 3
-    assert served == [1, 2, 3]  # stops at the empty page
-    assert len(scan.products) == 8  # 7 from p1 + 1 new from p2 (CGN repeat dropped)
-    report = scan_and_report(scan)
-    assert report.cheapest.url.endswith("/555")
-    assert report.cheapest.price_per_100g == Decimal("8.75")  # 87.50/kg
-
-
-def test_iter_pages_falls_back_to_browser_and_follows_pages(monkeypatch, fixtures_dir):
-    challenge = _read(fixtures_dir, "creatine_iherb_challenge.html")
-    p1 = _read(fixtures_dir, "creatine_iherb_search_p1.html")
-    p2 = _read(fixtures_dir, "creatine_iherb_search_p2.html")
-    httpx_calls, browser_calls = [], []
-
-    def fake_httpx(url):
-        httpx_calls.append(url)
-        return _Page(None, blocked=True, error="HTTP 403")
-
-    class FakeBrowser:
-        closed = False
-
-        def __enter__(self):
-            return self
-
-        def get(self, url):
-            browser_calls.append(url)
-            page = parse_qs(urlsplit(url).query).get("p", ["1"])[0]
-            return _Page({"1": p1, "2": p2}.get(page, challenge.replace("cf-challenge", "x")))
-
-        def __exit__(self, *a):
-            FakeBrowser.closed = True
-
-    monkeypatch.setattr(creatine, "_fetch_html_httpx", fake_httpx)
-    monkeypatch.setattr(creatine, "_BrowserSession", FakeBrowser)
-    scan = scan_iherb_detailed(max_pages=4)
-    assert httpx_calls == [creatine.search_url(1)]  # httpx is not retried once blocked
-    assert browser_calls[:2] == [creatine.search_url(1), creatine.search_url(2)]
-    assert len(scan.products) == 8
-    assert FakeBrowser.closed
 
 
 # ---------------------------------------------------------------------------
 # #37 part 2b: blocked vs parsed 0 of N vs no powders
 # ---------------------------------------------------------------------------
 
-def _one_page(html, blocked=False, error=None):
-    def pages(max_pages):
-        yield 1, _Page(html, blocked=blocked, error=error)
-    return pages
-
-
-def test_status_blocked():
-    scan = scan_iherb_detailed(pages=_one_page(None, blocked=True, error="HTTP 403"))
-    report = scan_and_report(scan)
+def test_status_blocked(monkeypatch):
+    _offline(monkeypatch, _Resp(403, "x"))
+    report = creatine.scan_and_report()
     assert report.status == "blocked"
     assert "403" in report.error
 
 
-def test_status_challenge_page_counts_as_blocked(fixtures_dir):
-    scan = scan_iherb_detailed(pages=_one_page(_read(fixtures_dir, "creatine_iherb_challenge.html")))
-    assert scan_and_report(scan).status == "blocked"
+def test_status_challenge_page_counts_as_blocked(monkeypatch, fixtures_dir):
+    _offline(monkeypatch, _Resp(200, _read(fixtures_dir, "creatine_iherb_challenge.html")))
+    assert creatine.scan_and_report().status == "blocked"
 
 
-def test_status_fetch_failed():
-    report = scan_and_report(scan_iherb_detailed(pages=_one_page(None, error="ConnectTimeout")))
+def test_status_fetch_failed(monkeypatch):
+    _offline(monkeypatch, exc=httpx.ConnectTimeout("t"))
+    report = creatine.scan_and_report()
     assert report.status == "fetch_failed"
     assert "ConnectTimeout" in report.error
 
 
-def test_status_parsed_zero_of_n_cells():
+def test_status_parsed_zero_of_n_cells(monkeypatch):
     html = "".join(
         f'<div class="product-cell"><div class="product-title">Creatine {i}</div>'
         f'<div class="product-price">see price in cart</div></div>'
         for i in range(5)
     )
-    report = scan_and_report(scan_iherb_detailed(pages=_one_page(html)))
-    assert report.status == "parse_failed"
-    assert "0" in report.error and "5" in report.error
+    _offline(monkeypatch, _Resp(200, html))
+    report = creatine.scan_and_report()
+    assert report.status == "fetch_failed"  # a parsing problem, not a block
+    assert "5" in report.error and "חסם" not in report.error
     assert report.cells_seen == 5
 
 
-def test_status_no_products_on_page():
-    report = scan_and_report(scan_iherb_detailed(pages=_one_page("<html><body>nothing</body></html>")))
-    assert report.status == "no_products"
+def test_status_no_products_on_page(monkeypatch):
+    # A 200 page without product cells is most likely a Cloudflare challenge.
+    _offline(monkeypatch, _Resp(200, "<html><body>nothing</body></html>"))
+    report = creatine.scan_and_report()
+    assert report.status == "blocked"
+    assert "ללא מוצרים" in report.error
 
 
-def test_status_no_powder():
+def test_status_no_powder(monkeypatch):
     html = (
         '<div class="product-cell"><a href="/pr/x/1"><div class="product-title">Creatine, 120 Capsules</div></a>'
         '<div class="product-price">₪61.87 (₪0.26/count)</div></div>'
     )
-    report = scan_and_report(scan_iherb_detailed(pages=_one_page(html)))
+    _offline(monkeypatch, _Resp(200, html))
+    report = creatine.scan_and_report()
     assert report.status == "no_powder"
-    assert report.products_scanned == 1 and report.powders_found == 0
+    assert report.parsed == 1 and report.powders == 0
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +283,7 @@ def test_status_no_powder():
 def test_same_price_different_product_is_not_rose():
     prev = _prod(name="Brand A, Creatine Monohydrate, 500 g", url="https://il.iherb.com/pr/a/1")
     new = _prod(name="Brand B, Creatine Monohydrate, 500 g", url="https://il.iherb.com/pr/b/2")
-    assert compare(prev, new) == (True, "same_price")
+    assert compare(prev, new) == (True, "changed")
 
 
 @pytest.mark.parametrize("new_price, direction", [("8.00", "dropped"), ("10.00", "rose")])
@@ -321,7 +304,7 @@ def test_same_product_renamed_by_language_is_unchanged():
 
 
 def test_currency_change_has_no_direction():
-    assert compare(_prod(per100="9.49"), _prod(per100="2.50", currency="USD")) == (True, None)
+    assert compare(_prod(per100="9.49"), _prod(per100="2.50", currency="USD")) == (True, "changed")
 
 
 def test_daily_email_does_not_say_rose_at_identical_price(fixtures_dir):
@@ -331,16 +314,17 @@ def test_daily_email_does_not_say_rose_at_identical_price(fixtures_dir):
     prev = _prod(name="Brand A, Creatine Monohydrate, 500 g", url="https://il.iherb.com/pr/a/1")
     creatine._save_state({"schema_version": 1, "cheapest": creatine._product_to_dict(prev)})
     new = _prod(name="Brand B, Creatine Monohydrate, 500 g", url="https://il.iherb.com/pr/b/2")
-    report = scan_and_report(IherbScan(products=[new], cells=1, pages=1))
-    assert report.changed and report.direction == "same_price"
+    report = scan_and_report([new], 1)
+    assert report.changed and report.direction == "changed"
 
     payload = email_sender.build_daily_payload(DailyReport(creatine=report))
     assert payload is not None
     text = "\n".join([payload.subject, payload.text_body, payload.html_body])
     assert "עלה" not in text
-    assert "נשאר זהה" in text
+    assert "אותו מחיר" in text
 
 
 def test_shared_user_agent():
     assert creatine._HEADERS["User-Agent"] == USER_AGENT
+    assert creatine._BROWSER_UA == USER_AGENT
     assert "Chrome/" in USER_AGENT

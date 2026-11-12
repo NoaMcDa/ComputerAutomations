@@ -15,10 +15,14 @@ def _env_dir() -> Path:
 load_dotenv(_env_dir() / ".env")
 
 
+class ConfigError(RuntimeError):
+    """Invalid or missing configuration (reported as a one-line CLI error)."""
+
+
 def _get(name: str, default: str | None = None) -> str:
     val = os.environ.get(name, default)
-    if val is None:
-        raise RuntimeError(f"Missing required env var: {name}")
+    if val is None or (default is None and val == ""):
+        raise ConfigError(f"Missing required env var: {name}")
     return val
 
 
@@ -26,14 +30,20 @@ def _get_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError:
+        raise ConfigError(f"Invalid value for {name}: {raw!r} (expected an integer)") from None
 
 
 def _get_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
-    return float(raw)
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigError(f"Invalid value for {name}: {raw!r} (expected a number)") from None
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,8 @@ class EmailConfig:
     smtp_password: str
     email_from: str
     email_to: str
+    # Extra recipients who get ONLY the vacation-deals email (never the daily report).
+    deals_email_to: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,16 +89,28 @@ def load_check() -> CheckConfig:
     )
 
 
-def load() -> AppConfig:
-    """Load config from env + .env file. Raises if required values are missing."""
+def load(require_email: bool = True) -> AppConfig:
+    """Load config from env + .env file. Raises ConfigError if invalid.
+
+    With require_email=False the SMTP settings may be missing (they are then
+    empty strings); used by dry runs that never send mail.
+    """
+    def _opt(name: str) -> str:
+        return os.environ.get(name, "") if not require_email else _get(name)
+
     return AppConfig(
         email=EmailConfig(
             smtp_host=_get("PW_SMTP_HOST", "smtp.gmail.com"),
             smtp_port=_get_int("PW_SMTP_PORT", 587),
-            smtp_user=_get("PW_SMTP_USER"),
-            smtp_password=_get("PW_SMTP_PASSWORD"),
-            email_from=_get("PW_EMAIL_FROM"),
-            email_to=_get("PW_EMAIL_TO"),
+            smtp_user=_opt("PW_SMTP_USER"),
+            smtp_password=_opt("PW_SMTP_PASSWORD"),
+            email_from=_opt("PW_EMAIL_FROM"),
+            email_to=_opt("PW_EMAIL_TO"),
+            deals_email_to=tuple(
+                addr.strip()
+                for addr in os.environ.get("PW_DEALS_EMAIL_TO", "").split(",")
+                if addr.strip()
+            ),
         ),
         check=load_check(),
         log_level=os.environ.get("PW_LOG_LEVEL", "INFO"),

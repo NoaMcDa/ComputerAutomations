@@ -3,19 +3,26 @@
 Reads the promo/offer banner from MyProtein pages and computes an
 estimated final price by applying the discount percentage.
 
-Outcomes, in order of preference across the banner candidates:
+Banner parsing is shared with the daily digest (``digest.parse_offers``):
+the banner is split into offers on ``|`` and line breaks, and a code is only
+paired with a percentage from the same offer. A percentage needs a discount
+word next to it ("off", "extra", "הנחה"), so "100% Whey" or "80% protein"
+are never discounts, and codes must be upper-case after a code keyword.
 
-- a readable percentage (with or without a code): ``PromoInfo`` with that
-  percentage and ``estimated_final_price = price × (1 − pct)``;
-- a tiered "up to N%" banner: ``PromoInfo(discount_pct=0)`` — not computable,
-  the estimate stays at the displayed price;
-- a code is advertised but no percentage can be read (unreadable banner):
-  ``PromoInfo(code=..., discount_pct=0)`` — same fallback;
-- nothing: the base result unchanged.
+Which offer becomes the PromoInfo when a banner lists several, e.g.
+"30% Off EVERYTHING | Applies as Basket | Extra 5% on App using code: APP5":
+  1. A site-wide offer without a code (30%, code=None) wins: it applies
+     automatically at the basket, so it is what the shopper actually pays.
+     Extra coded offers on top (app-only / first-order) are not applied.
+  2. Otherwise the first offer with a code, paired from the same segment.
+  3. Otherwise an "up to N%" banner gives discount 0 (not computable).
+  4. Otherwise a code advertised without a readable percentage ("Use code
+     SPRING at checkout") also gives discount 0: a promotion exists, but the
+     estimate stays at the displayed price.
 
-A ``discount_pct`` of 0 therefore means "a promotion exists but no estimate
-can be made"; the state store never treats it as a change and the email says
-the displayed price is shown as is.
+Stated conditions (minimum spend, selected items, end date) found in banner
+segments that hold no offer of their own ("45% ... code SAVE45X | over
+₪200 | until 30.11") are added to the chosen offer's condition.
 """
 
 from __future__ import annotations
@@ -23,39 +30,23 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
 from urllib.parse import urlparse
+from typing import Optional
 
 from bs4 import BeautifulSoup
 
 from price_watcher.contracts import FetchResult, PromoInfo
-from price_watcher.digest import _CODE_KEYWORD
+from price_watcher.digest import (
+    _codes,
+    _discount_pcts,
+    _segments,
+    element_text,
+    has_up_to_discount,
+    parse_offers,
+)
 from price_watcher.logging_setup import get
 
 log = get(__name__)
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-# "Up to N%" or the Hebrew equivalent "עד N%"
-_RE_UP_TO = re.compile(
-    r"(?:up\s+to|עד)\s+\d{1,2}\s*%",
-    re.IGNORECASE | re.UNICODE,
-)
-
-# Standalone discount percentage. Not part of a bigger number ("100%").
-_RE_PCT = re.compile(r"(?<![\d.,])(\d{1,2})\s*%", re.UNICODE)
-
-# Promo code: a code keyword (shared with the digest: "code", "קוד",
-# "קוד הנחה", "בקוד הטבה", ...) then the code itself in capitals.
-_RE_CODE = re.compile(
-    r"(?i:" + _CODE_KEYWORD + r")[^A-Za-z0-9]{0,20}([A-Z][A-Z0-9]{2,19})(?![A-Za-z0-9])",
-    re.UNICODE,
-)
-
-# Words that follow "code" in ordinary sentences and are not codes.
-_FALSE_POSITIVES = {"SAVE", "OFFER", "SALE", "FREE", "NEW", "BUY", "CODE", "THE", "AT", "HERE"}
 
 # Stated conditions of a promotion: minimum spend, selected items, end date.
 _RE_CONDITIONS = [
@@ -72,40 +63,33 @@ _RE_CONDITIONS = [
 ]
 
 
-def _extract_pct(text: str) -> Optional[Decimal]:
-    """Return the first non-'up-to' percentage found in *text*, or None."""
-    # First remove all "up to N%" / "עד N%" spans so they don't match below.
-    cleaned = _RE_UP_TO.sub("", text)
-    for m in _RE_PCT.finditer(cleaned):
-        pct = int(m.group(1))
-        if 1 <= pct <= 99:
-            return Decimal(pct)
-    return None
-
-
-def _is_up_to(text: str) -> bool:
-    """True if the banner only advertises an "up to N%" (tiered) discount."""
-    return bool(_RE_UP_TO.search(text)) and _extract_pct(text) is None
-
-
-def _extract_code(text: str) -> Optional[str]:
-    """Return the promo code extracted from *text*, or None."""
-    for m in _RE_CODE.finditer(text):
-        code = m.group(1)
-        if code not in _FALSE_POSITIVES:
-            return code
-    return None
-
-
 def _extract_condition(text: str) -> Optional[str]:
     """Return the stated conditions (minimum spend, selected items, end date)."""
     found: list[str] = []
     for pat in _RE_CONDITIONS:
         for m in pat.finditer(text):
-            cond = re.sub(r"\s+", " ", m.group(0)).strip()
+            cond = re.sub(r"\s+", " ", m.group(0)).strip(" .,;")
             if cond and cond not in found:
                 found.append(cond)
     return "; ".join(found)[:200] if found else None
+
+
+def _with_banner_conditions(promo: PromoInfo, raw_text: str) -> PromoInfo:
+    """Add conditions stated in the banner's offer-less segments to *promo*."""
+    extra = _extract_condition(
+        " | ".join(seg for seg in _segments(raw_text) if not _discount_pcts(seg))
+    )
+    if not extra:
+        return promo
+    parts = [c for c in extra.split("; ") if c not in (promo.condition or "")]
+    if not parts:
+        return promo
+    condition = "; ".join([promo.condition, *parts] if promo.condition else parts)
+    return replace(promo, condition=condition[:250])
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _candidate_texts(soup: BeautifulSoup) -> list[str]:
@@ -116,7 +100,7 @@ def _candidate_texts(soup: BeautifulSoup) -> list[str]:
     for tag in soup.find_all(attrs={"data-component": True}):
         val: str = tag.get("data-component", "")
         if any(kw in val.lower() for kw in ("promo", "offer", "code")):
-            txt = tag.get_text(" ", strip=True)
+            txt = element_text(tag)
             if txt:
                 candidates.append(txt)
 
@@ -128,14 +112,14 @@ def _candidate_texts(soup: BeautifulSoup) -> list[str]:
         '[class*="code"]',
     ):
         for tag in soup.select(selector):
-            txt = tag.get_text(" ", strip=True)
+            txt = element_text(tag)
             if txt:
                 candidates.append(txt)
 
     # 3. The header area
     header = soup.find("header")
     if header:
-        txt = header.get_text(" ", strip=True)
+        txt = element_text(header)
         if txt:
             candidates.append(txt)
 
@@ -177,66 +161,96 @@ class MyProteinExtractor:
 
     def _extract(self, html: str, url: str, base_result: FetchResult) -> FetchResult:
         soup = BeautifulSoup(html, "lxml")
-        fallback: Optional[PromoInfo] = None  # tiered or unreadable banner
+        candidates = _candidate_texts(soup)
 
-        for raw_text in _candidate_texts(soup):
+        sitewide: Optional[PromoInfo] = None
+        coded: Optional[PromoInfo] = None
+        up_to_source: Optional[str] = None
+        code_only: Optional[PromoInfo] = None
+        for raw_text in candidates:
+            # Truncate source_text to 200 chars as spec requires
             source_text = raw_text[:200]
-            pct = _extract_pct(raw_text)
-            code = _extract_code(raw_text)
+            for offer in parse_offers(raw_text):
+                offer = _with_banner_conditions(
+                    replace(offer, source_text=source_text), raw_text
+                )
+                if offer.code is None and sitewide is None:
+                    sitewide = offer
+                elif offer.code is not None and coded is None:
+                    coded = offer
+            if up_to_source is None and has_up_to_discount(raw_text):
+                up_to_source = source_text
+            # A banner with a percentage that is not a discount ("80% protein
+            # | code: WHEY80") is not an "unreadable" promotion.
+            if code_only is None and "%" not in raw_text:
+                for seg in _segments(raw_text):
+                    seg_codes = _codes(seg)
+                    if seg_codes:
+                        code_only = PromoInfo(
+                            code=seg_codes[0][0],
+                            discount_pct=Decimal("0"),
+                            condition=seg[:250],
+                            source_text=source_text,
+                        )
+                        break
+            if sitewide is not None:
+                break
 
-            if pct is None:
-                if fallback is None and _is_up_to(raw_text):
-                    log.info(
-                        "MyProtein: 'up to' promo detected, not computing discount. "
-                        "url=%s source=%r", url, source_text,
-                    )
-                    fallback = PromoInfo(
-                        code=code,
-                        discount_pct=Decimal("0"),
-                        condition=_extract_condition(raw_text),
-                        source_text=source_text,
-                    )
-                elif fallback is None and code is not None:
-                    log.info(
-                        "MyProtein: code %s advertised but no percentage readable. "
-                        "url=%s source=%r", code, url, source_text,
-                    )
-                    fallback = PromoInfo(
-                        code=code,
-                        discount_pct=Decimal("0"),
-                        condition=_extract_condition(raw_text),
-                        source_text=source_text,
-                    )
-                continue
-
-            promo = PromoInfo(
-                code=code,
-                discount_pct=pct,
-                condition=_extract_condition(raw_text),
-                source_text=source_text,
-            )
-
-            # Compute estimated final price only when base price is available
-            estimated: Optional[Decimal] = None
-            if base_result.price is not None:
-                estimated = (
-                    base_result.price
-                    * (Decimal("100") - pct)
-                    / Decimal("100")
-                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
+        promo = sitewide or coded
+        if promo is None and up_to_source is not None:
+            # "Up to N%" — log and return a no-compute PromoInfo
             log.info(
-                "MyProtein: promo applied. code=%s pct=%s estimated=%s url=%s",
-                code, pct, estimated, url,
+                "MyProtein: 'up to' promo detected, not computing discount. "
+                "url=%s source=%r",
+                url,
+                up_to_source,
             )
-            return replace(base_result, promo=promo, estimated_final_price=estimated)
-
-        if fallback is not None:
+            promo = PromoInfo(
+                code=None,
+                discount_pct=Decimal("0"),
+                condition=None,
+                source_text=up_to_source,
+            )
             return replace(
-                base_result, promo=fallback, estimated_final_price=base_result.price
+                base_result,
+                promo=promo,
+                estimated_final_price=base_result.price,
             )
-        # No promo found — return base result unchanged
-        return base_result
+        if promo is None and code_only is not None:
+            # A code is advertised but no percentage can be read: a promotion
+            # exists, the estimate stays at the displayed price.
+            log.info(
+                "MyProtein: code %s advertised but no percentage readable. url=%s",
+                code_only.code,
+                url,
+            )
+            return replace(
+                base_result,
+                promo=code_only,
+                estimated_final_price=base_result.price,
+            )
+        if promo is None:
+            # No promo found — return base result unchanged
+            return base_result
+
+        pct = promo.discount_pct
+        # Compute estimated final price only when base price is available
+        estimated: Optional[Decimal] = None
+        if base_result.price is not None:
+            estimated = (
+                base_result.price
+                * (Decimal("100") - pct)
+                / Decimal("100")
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        log.info(
+            "MyProtein: promo applied. code=%s pct=%s estimated=%s url=%s",
+            promo.code,
+            pct,
+            estimated,
+            url,
+        )
+        return replace(base_result, promo=promo, estimated_final_price=estimated)
 
 
 # ---------------------------------------------------------------------------

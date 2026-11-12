@@ -1,4 +1,10 @@
-"""Issue #51: one cut of one animal per category; catch-alls are not ranked."""
+"""Issue #51: one cut of one animal per category; catch-alls are not ranked.
+
+Adapted to the scanner's category names (merge of PR #56 into #57): the
+labels are those of `supermarkets._CATEGORY_RULES` ("גרון / צוואר הודו",
+"צלעות כבש", ...) and a frozen item goes to the " – קפוא" twin of its
+category, so the expected values below are the merged scanner's.
+"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -16,15 +22,18 @@ def _promo(name: str, desc: str = "") -> sm.MeatPromo:
     )
 
 
+_FROZEN = sm._FROZEN_SUFFIX
+
+
 # Real item names from the 2026-11-11 scan quoted in the issue.
 @pytest.mark.parametrize("name,category", [
     # was all "הודו"
-    ("גרון הודו קפוא", "גרון הודו"),
+    ("גרון הודו קפוא", "גרון / צוואר הודו" + _FROZEN),
     ("כנפיים הודו טרי", "כנפיים הודו"),
-    ("גרון הודו טרי", "גרון הודו"),
+    ("גרון הודו טרי", "גרון / צוואר הודו"),
     ("שוקיים הודו טרי", "שוקיים הודו"),
     ("חזה הודו טרי", "חזה הודו"),
-    ("שישליק הודו טרי", "שישליק הודו"),
+    ("שישליק הודו טרי", "שישליק / נתחי הודו"),
     ("הודו אדום טרי", "הודו אדום"),
     # species-less poultry cuts were "אחר"
     ("כנפיים טרי", "כנפיים עוף"),
@@ -35,49 +44,48 @@ def _promo(name: str, desc: str = "") -> sm.MeatPromo:
     ("רוסטביף", "רוסטביף"),
     ("דנבר טרי", "דנבר"),
     # neck / ribs split by animal
-    ("גרון עוף", "גרון עוף"),
-    ("צוואר בקר", "גרון בקר"),
-    ("צוואר טלה", "צוואר טלה"),
+    ("גרון עוף", "גרון / צוואר עוף"),
+    ("צוואר בקר", "גרון / צוואר בקר"),
+    ("צוואר טלה", "צוואר כבש"),
     ("צלעות בקר", "צלעות בקר"),
-    ("צלעות טלה", "צלעות טלה"),
-    ("צלעות עגל", "צלעות עגל"),
+    ("צלעות טלה", "צלעות כבש"),
+    ("צלעות עגל", "צלעות בקר"),      # veal is ranked with beef
     # lamb split by cut
-    ("כתף טלה", "כתף טלה"),
-    ("חזה כבש", "חזה טלה"),
-    ("רבע טלה אחורי", "רבע טלה"),
+    ("כתף טלה", "כתף כבש"),
+    ("חזה כבש", "חזה כבש"),
+    ("רבע טלה אחורי", "כבש – אחר"),  # a quarter mixes cuts: catch-all
     # goose / duck split by cut
     ("חזה אווז", "חזה אווז"),
     ("כנפיים אווז", "כנפיים אווז"),
-    ("שוקיים ברווז", "שוקיים ברווז"),
+    ("שוקיים ברווז", "שוק ברווז"),
     ("חזה ברווז", "חזה ברווז"),
     # chicken
-    ("חזה עוף טרי", "חזה עוף"),
+    ("חזה עוף טרי", "חזה / פילה עוף"),
     ("פרגיות טריות", "פרגיות"),
     ("כבד עוף", "כבד עוף"),
-    ("עוף שלם טרי", "עוף שלם"),
+    ("עוף שלם טרי", "עוף שלם / חצי עוף"),
     # beef
     ("אנטריקוט בקר טרי", "אנטריקוט"),
-    ("לשון בקר קפואה", "לשון בקר"),
-    ("בשר בקר טחון", "בקר טחון"),
-    ("בקר נתח מס' 8", "נתח מס' 8"),
-    ("טי-בון", "טי בון"),
+    ("לשון בקר קפואה", "לשון בקר" + _FROZEN),
+    ("בשר בקר טחון", "טחון בקר"),
+    ("בקר נתח מס' 8", "שריר / זרוע"),   # cut number 8 = foreshank
+    ("טי-בון", "טי-בון"),
     # catch-alls
     ("קצוות כנפיים עוף", "עוף – אחר"),
-    ("חצי עוף", "עוף – אחר"),
     ("בשר ראש", "בשר ראש"),
-    ("סטייק בקר", "בשר – אחר"),
 ])
 def test_category(name, category):
     assert sm._categorize(_promo(name)) == category
 
 
 def test_no_ranked_category_mixes_animals():
-    for cat in sm.CATEGORY_ORDER:
-        animals = [a for a in ("עוף", "הודו", "אווז", "ברווז", "טלה", "עגל") if a in cat.split()]
+    labels = [label for label, _kws in sm._CATEGORIES]
+    for cat in labels:
+        animals = [a for a in ("עוף", "הודו", "אווז", "ברווז", "טלה", "כבש") if a in cat.split()]
         assert len(animals) <= 1, cat
-    assert "הודו" not in sm.CATEGORY_ORDER
-    assert "אווז וברווז" not in sm.CATEGORY_ORDER
-    assert "כבש / טלה" not in sm.CATEGORY_ORDER
+    assert "הודו" not in labels
+    assert "אווז וברווז" not in labels
+    assert "כבש / טלה" not in labels
 
 
 @pytest.mark.parametrize("name", ["סטרצ'טלה 200 גרם", "סטרצ׳טלה", "גבינת סטרציאטלה"])
@@ -86,28 +94,38 @@ def test_stracciatella_is_not_meat(name):
 
 
 @pytest.mark.parametrize("name", ["כנפיים טרי", "כרעיים טרי ארוז", "שוקיים מחפוד טרי",
-                                  "שייטל טרי", "רוסטביף", "דנבר טרי", "חזה אווז"])
+                                  "שייטל טרי", "דנבר טרי", "חזה אווז"])
 def test_new_cuts_pass_the_meat_filter(name):
     assert sm._is_meat_product(name)
 
 
+def test_roastbeef_needs_a_fresh_signal():
+    # "רוסטביף" alone is also sliced deli roast beef: it needs a weighed item
+    # or a freshness word (the scanner's two-gate classifier).
+    assert not sm._is_meat_product("רוסטביף")
+    weighed = sm._FeedItem(name="רוסטביף", price=Decimal("129.90"), weighted=True)
+    assert sm._is_meat_product("רוסטביף", item=weighed)
+    assert sm._is_meat_product("רוסטביף טרי")
+
+
 def test_catch_alls_are_not_ranked():
-    for cat in sm.CATCH_ALL_CATEGORIES:
-        assert not sm.is_ranked_category(cat)
-    assert sm.is_ranked_category("חזה הודו")
-    assert sm.is_ranked_category("לשון בקר · קפוא")
+    for cat in ("עוף – אחר", "בשר – אחר", "אחר", "כבש – אחר"):
+        assert sm._is_catch_all(cat)
+    assert not sm._is_catch_all("חזה הודו")
+    assert not sm._is_catch_all("לשון בקר" + _FROZEN)
+    assert sm._is_catch_all("עוף – אחר" + _FROZEN)
 
 
-@pytest.mark.parametrize("name,freshness", [
-    ("גרון הודו קפוא", "frozen"), ("לשון בקר קפואה", "frozen"),
-    ("לשון בקר טרייה", "fresh"), ("כנפיים טרי", "fresh"), ("רוסטביף", ""),
+@pytest.mark.parametrize("name,frozen", [
+    ("גרון הודו קפוא", True), ("לשון בקר קפואה", True),
+    ("לשון בקר טרייה", False), ("כנפיים טרי", False), ("רוסטביף", False),
 ])
-def test_freshness(name, freshness):
-    assert sm._freshness(name) == freshness
+def test_freshness(name, frozen):
+    assert sm._is_frozen(name) is frozen
 
 
 def test_frozen_gets_its_own_table():
-    assert sm._category_label(_promo("לשון בקר קפואה")) == "לשון בקר · קפוא"
-    assert sm._category_label(_promo("לשון בקר טרייה")) == "לשון בקר"
-    # catch-alls are not split
-    assert sm._category_label(_promo("קצוות כנפיים עוף קפוא")) == "עוף – אחר"
+    assert sm._categorize(_promo("לשון בקר קפואה")) == "לשון בקר" + _FROZEN
+    assert sm._categorize(_promo("לשון בקר טרייה")) == "לשון בקר"
+    # a frozen catch-all is still a catch-all (not ranked, not shown)
+    assert sm._is_catch_all(sm._categorize(_promo("קצוות כנפיים עוף קפוא")))

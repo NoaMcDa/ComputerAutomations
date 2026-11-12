@@ -712,42 +712,56 @@ def section_text(report: Optional[MarketplaceReport]) -> list[str]:
 
 _F = ("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif")
 
+# Row styles live in one <style> block (see style_tag) instead of being repeated
+# on every cell, to keep the daily email under Gmail's ~102 KB clipping limit.
+_MP_CSS = (
+    ".mp{border-collapse:collapse;width:100%;font-size:14px}"
+    ".mp th{padding:6px 8px;text-align:right;background:#f9fafb}"
+    ".mp td{padding:6px 8px;border-bottom:1px solid #e5e7eb;text-align:right}"
+    ".mp a{color:#2563eb;text-decoration:none}"
+    ".mp .w{color:#6b7280;text-decoration:line-through}"
+    ".mp .d{color:#dc2626}.mp .n{color:#059669;font-size:12px}"
+    ".mp .l{color:#6b7280;font-size:13px}"
+)
 
-def section_html(report: Optional[MarketplaceReport]) -> str:
-    """HTML block (heading included) for the daily email. "" when off."""
+
+def style_tag() -> str:
+    """The <style> block the HTML section relies on (goes in the email <head>)."""
+    return f"<style>{_MP_CSS}</style>"
+
+
+def section_html(report: Optional[MarketplaceReport], heading: bool = True) -> str:
+    """HTML block for the daily email ("" when off). ``heading=False`` leaves
+    the section title to the caller."""
     if report is None:
         return ""
-    parts = [
-        '<h3 style="margin:28px 0 12px;font-size:16px;color:#111827;text-align:right;'
-        f'padding:6px 0 4px;border-bottom:2px solid #111827">{escape(SECTION_TITLE)}</h3>'
-    ]
+    parts = []
+    if heading:
+        parts.append(
+            '<h3 style="margin:28px 0 12px;font-size:16px;color:#111827;text-align:right;'
+            f'padding:6px 0 4px;border-bottom:2px solid #111827">{escape(SECTION_TITLE)}</h3>'
+        )
     if report.deals:
         rows = []
         for d in report.deals:
             if d.kind == "drop":
+                # line-through stays inline too: some clients drop <style> blocks
                 price_html = (
-                    f'<span dir="ltr" style="color:#6b7280;text-decoration:line-through">{escape(_money(d.prev_price))}</span>'
+                    f'<span dir="ltr" class="w" style="text-decoration:line-through">'
+                    f'{escape(_money(d.prev_price))}</span>'
                     f' <b dir="ltr">{escape(_money(d.price))}</b>'
-                    f' <span dir="ltr" style="color:#dc2626">({d.delta_pct}%)</span>'
+                    f' <span dir="ltr" class="d">({d.delta_pct}%)</span>'
                 )
             else:
-                price_html = (f'<b dir="ltr">{escape(_money(d.price))}</b> '
-                              '<span style="color:#059669;font-size:12px">חדש</span>')
+                price_html = f'<b dir="ltr">{escape(_money(d.price))}</b> <span class="n">חדש</span>'
             rows.append(
-                '<tr>'
-                f'<td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;text-align:right">'
-                f'<a href="{escape(d.url)}" style="color:#2563eb;text-decoration:none">{escape(d.title)}</a></td>'
-                f'<td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;white-space:nowrap">{price_html}</td>'
-                f'<td style="padding:6px 8px;border-bottom:1px solid #e5e7eb;color:#6b7280;font-size:13px">'
-                f'{escape(d.location or "—")}</td>'
-                '</tr>'
+                f'<tr><td><a href="{escape(d.url)}">{escape(d.title)}</a></td>'
+                f'<td style="white-space:nowrap">{price_html}</td>'
+                f'<td class="l">{escape(d.location or "—")}</td></tr>'
             )
         parts.append(
-            f'<table dir="rtl" style="border-collapse:collapse;width:100%;font-family:{_F};font-size:14px">'
-            '<tr style="background:#f9fafb">'
-            '<th style="padding:6px 8px;text-align:right">מודעה</th>'
-            '<th style="padding:6px 8px;text-align:right">מחיר</th>'
-            '<th style="padding:6px 8px;text-align:right">מיקום</th></tr>'
+            f'<table dir="rtl" class="mp" style="font-family:{_F}">'
+            '<tr><th>מודעה</th><th>מחיר</th><th>מיקום</th></tr>'
             + "".join(rows) + '</table>'
         )
         if report.hidden_deals:

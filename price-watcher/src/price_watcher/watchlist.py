@@ -10,7 +10,7 @@ import tempfile
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import unquote, unquote_plus, urlparse, urlunparse
 
 from rich.console import Console
 from rich.table import Table
@@ -23,12 +23,19 @@ console = Console()
 log = _get_logger(__name__)
 
 _SCHEMA_VERSION = 1
-# Query parameters that identify the product / variant; everything else
-# (utm_*, fbclid, gclid, ref, ...) is tracking and is dropped.
-_KEEP_PARAMS = {
-    "variant", "variation", "size", "sku", "color", "colour", "flavour",
-    "pid", "product_id", "id",
+# Known tracking / attribution params that never identify a product; everything
+# else in the query string is kept.
+_TRACKING_PARAMS = {
+    "gclid", "gclsrc", "dclid", "gbraid", "wbraid", "fbclid", "msclkid", "srsltid",
+    "yclid", "twclid", "ttclid", "igshid", "ref", "ref_", "ref_src", "mc_cid", "mc_eid",
+    "_ga", "_gl", "_hsenc", "_hsmi", "mkt_tok",
 }
+
+
+def _is_tracking_param(key: str) -> bool:
+    k = unquote_plus(key).strip().lower()
+    return k.startswith("utm_") or k in _TRACKING_PARAMS
+
 
 # A run of percent-encoded bytes >= 0x80, i.e. an encoded non-ASCII character.
 _PCT_NON_ASCII = re.compile(r"(?:%[89A-Fa-f][0-9A-Fa-f])+")
@@ -53,29 +60,28 @@ def _normalise_url(raw: str) -> str:
     parsed = urlparse(raw.strip())
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
         raise ValueError(f"Invalid URL (must be http(s) with a host): {raw!r}")
-    qs = parse_qs(parsed.query, keep_blank_values=True)
-    kept = {k: v for k, v in qs.items() if k in _KEEP_PARAMS}
-    new_query = urlencode(kept, doseq=True)
-    # Strip fragment; keep the path readable (non-ASCII shown as characters)
-    normalised = urlunparse(
-        (parsed.scheme, parsed.netloc, _readable_path(parsed.path), parsed.params, new_query, "")
+    # Keep the remaining query pairs verbatim (order and encoding preserved).
+    pairs = [p for p in parsed.query.split("&") if p and not _is_tracking_param(p.split("=", 1)[0])]
+    new_query = "&".join(pairs)
+    # Strip fragment; keep the path readable (non-ASCII shown as characters,
+    # so an encoded and a readable copy of one link are the same watch).
+    return urlunparse(
+        (parsed.scheme.lower(), parsed.netloc.lower(), _readable_path(parsed.path),
+         parsed.params, new_query, "")
     )
-    return normalised
 
 
-def _same_url(stored: str, normalised: str | None) -> bool:
-    if normalised is None:
-        return False
+def _make_id(normalised_url: str) -> str:
+    host = urlparse(normalised_url).netloc.lower().removeprefix("www.")
+    short = hashlib.sha1(normalised_url.encode()).hexdigest()[:8]
+    return f"{host}-{short}"
+
+
+def _same_url(stored: str, normalised: str) -> bool:
     try:
         return _normalise_url(stored) == normalised
     except ValueError:
         return stored == normalised
-
-
-def _make_id(normalised_url: str) -> str:
-    host = urlparse(normalised_url).netloc.lstrip("www.")
-    short = hashlib.sha1(normalised_url.encode()).hexdigest()[:8]
-    return f"{host}-{short}"
 
 
 class _Encoder(json.JSONEncoder):
@@ -179,8 +185,12 @@ def save_all(watches: list[Watch]) -> None:
         raise
 
 
-def add(url: str, name: str | None = None, selector: str | None = None, **options: Any) -> None:
-    """Add a watch. *options* are extra Watch settings (see set_options)."""
+def add(url: str, name: str | None = None, selector: str | None = None, **options: Any) -> bool:
+    """Add a watch. *options* are extra Watch settings (see set_options).
+
+    Returns False (and changes nothing) when the URL is already watched; the
+    CLI turns that into exit code 1.
+    """
     try:
         normalised = _normalise_url(url)
         opts = _check_options(options)
@@ -193,7 +203,7 @@ def add(url: str, name: str | None = None, selector: str | None = None, **option
 
     if any(w.id == watch_id or _same_url(w.url, normalised) for w in watches):
         console.print(f"[yellow]Already watching:[/yellow] {normalised}")
-        raise SystemExit(1)
+        return False
 
     from price_watcher.contracts import FetchStatus
     from price_watcher.fetcher import fetch
@@ -208,7 +218,12 @@ def add(url: str, name: str | None = None, selector: str | None = None, **option
         raise SystemExit(1)
 
     label = name or normalised
-    price_str = f"{result.price} {result.currency}" if result.price is not None else "unknown"
+    if result.price is None:
+        price_str = "unknown"
+    elif result.currency:
+        price_str = f"{result.price} {result.currency}"
+    else:
+        price_str = f"{result.price}"
     console.print(f"Added: {label} — current price: {price_str}")
 
     watch = Watch(
@@ -221,6 +236,7 @@ def add(url: str, name: str | None = None, selector: str | None = None, **option
     )
     watches.append(watch)
     save_all(watches)
+    return True
 
 
 def list_watches() -> None:
@@ -265,22 +281,27 @@ def remove(target: str) -> None:
         target_id = target
         normalised = None
 
-    removed = [
-        w for w in watches
-        if w.id in (target_id, target) or _same_url(w.url, normalised)
-    ]
+    def _matches(w: Watch) -> bool:
+        return (
+            w.id == target_id
+            or w.id == target
+            or w.url == normalised
+            or (normalised is not None and _same_url(w.url, normalised))
+        )
 
-    if not removed:
+    removed_ids = [w.id for w in watches if _matches(w)]
+    watches = [w for w in watches if not _matches(w)]
+
+    if not removed_ids:
         console.print(f"[yellow]Not found:[/yellow] {target!r}")
         raise SystemExit(1)
 
-    watches = [w for w in watches if w not in removed]
     save_all(watches)
 
     try:
         from price_watcher.state import drop_watch
-        for w in removed:
-            drop_watch(w.id)
+        for rid in removed_ids:
+            drop_watch(rid)
     except Exception:
         pass
 
@@ -328,7 +349,7 @@ def find(watches: list[Watch], target: str) -> Watch | None:
     except ValueError:
         normalised, target_id = None, target
     for w in watches:
-        if w.id in (target, target_id) or (normalised and w.url == normalised):
+        if w.id in (target, target_id) or (normalised and _same_url(w.url, normalised)):
             return w
     return None
 
@@ -336,8 +357,8 @@ def find(watches: list[Watch], target: str) -> Watch | None:
 def set_options(target: str, **options: Any) -> Watch:
     """Change settings of an existing watch (by URL or id). Returns the new Watch.
 
-    Options left as None are not changed; to clear a numeric setting pass
-    the CLI's "none" (handled by the CLI as ``clear=[...]``).
+    Options left as None are not changed; settings listed in ``clear`` are
+    reset to None (the CLI's "none").
     """
     clear = options.pop("clear", None) or []
     watches = load_all()

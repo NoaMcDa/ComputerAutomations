@@ -214,5 +214,40 @@ def test_jsonld_missing_variant_does_not_fall_through_to_meta():
 # Issue #40: _extract_from_html merged into _extract
 # ---------------------------------------------------------------------------
 
-def test_extract_from_html_duplicate_removed():
-    assert not hasattr(fetcher, "_extract_from_html")
+def test_extract_from_html_is_not_a_second_ladder(monkeypatch):
+    # Merge note: the PR #57 tests still call _extract_from_html, so it stays
+    # as a thin alias; what #40 asked for is that there is only ONE ladder.
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return "result"
+
+    monkeypatch.setattr(fetcher, "_extract", spy)
+    assert fetcher._extract_from_html("<html></html>", "u", "u", None, 200, None) == "result"
+    assert calls == [{"include_shopify": False}]
+
+
+# ---------------------------------------------------------------------------
+# Merge: edge cases ported from PR #56 into the PR #57 parser
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "₪100 – 200",          # currency before the first number: a range
+    "100 ₪ – 200 ₪",
+    "1–2 ₪",
+])
+def test_dash_between_priced_numbers_is_still_a_range(text):
+    with pytest.raises(ValueError):
+        _parse_price(text)
+
+
+def test_count_dash_price_reads_the_price():
+    assert _parse_price("2 יח' – ₪49.90") == (Decimal("49.90"), "ILS")
+
+
+def test_jsonld_offer_url_ids_are_matched_per_offer():
+    # Two offers of ONE Product, each with its own ?variant= url: the pinned
+    # one is read even though its sibling is cheaper.
+    r = _extract("jsonld_offers_url_ids.html", url="https://shop.example/p/tee?variant=501")
+    assert r.price == Decimal("59.90")

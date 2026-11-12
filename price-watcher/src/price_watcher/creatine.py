@@ -1,15 +1,16 @@
 """Creatine price watcher.
 
-Scrapes iHerb's creatine search results. A plain httpx request is tried first;
-when Cloudflare answers it with a challenge (or the page has no product cells)
-the pages are loaded in headless Chromium (Playwright) instead. iHerb
-pre-computes a per-unit price in each product cell ("₪9.49/100g", "$0.71/oz",
-"₪94.90/kg" ...); we normalise mass units to price-per-100g.
+Scrapes iHerb's creatine search page. iHerb sits behind Cloudflare, which as of
+2026-11-11 answers plain HTTP clients (httpx) with a 403 "Just a moment..."
+challenge, so a plain request usually fails. It is still tried first (it is
+cheap and sometimes works, depending on IP); on a 403 or an empty page the page
+is loaded in headless Chromium (Playwright) instead. When neither works the
+report says which step failed (blocked / browser not installed / challenge not
+passed). iHerb pre-computes price-per-100g in each product cell, so we don't
+need to parse pack sizes ourselves.
 
-Tracks the cheapest price-per-100g across plain creatine *monohydrate powder*
-products (gummies, capsules, blends and flavoured mixes are filtered out by
-name) and emails when it moves. Separate state file from the normal product
-watches, same SMTP path.
+Tracks the cheapest price-per-100g across powder products and emails when it
+moves. Separate state file from the normal product watches, same SMTP path.
 
 Designed to be extensible — `scan_iherb()` returns a list of CreatineProduct;
 adding another seller means adding another `scan_*()` function and merging.
@@ -24,8 +25,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Iterator, Optional
-from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -51,13 +51,13 @@ class CreatineProduct:
     price: Decimal
     currency: str
     price_per_100g: Optional[Decimal]  # None for capsule products (per-count instead)
-    unit: str  # "100g" / "count" / "100ml" / "unknown"
+    unit: str  # "100g" / "count"
     on_sale: bool
     seller: str
 
 
 # ---------------------------------------------------------------------------
-# Price-cell parsing
+# iHerb scraper
 # ---------------------------------------------------------------------------
 
 _HEADERS = {
@@ -67,118 +67,48 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-_IHERB_BASE = "https://il.iherb.com"
-_IHERB_SEARCH_PATH = "/search"
-_IHERB_KEYWORD = "creatine"
-# iHerb ranks search results by relevance, so "cheapest" on page 1 is only the
-# cheapest among the top hits and the set shifts as iHerb re-ranks. We read
-# several pages (``p=`` is iHerb's page parameter) and stop early once a page
-# adds no new products.
-IHERB_MAX_PAGES = 4
-# Optional extra query parameters, e.g. a sort order. iHerb's sort parameter
-# could not be verified offline, so none is sent by default; set this to
-# {"sr": "<value>"} once the price-sort value has been confirmed on the live site.
-IHERB_EXTRA_PARAMS: dict[str, str] = {}
-
-# Kept for callers / logs that refer to the first page.
-_IHERB_SEARCH = f"{_IHERB_BASE}{_IHERB_SEARCH_PATH}?kw={_IHERB_KEYWORD}"
+_IHERB_SEARCH = "https://il.iherb.com/search?kw=creatine"
 
 
-def search_url(page: int = 1) -> str:
-    """URL of results page ``page`` (1-based) of the iHerb creatine search."""
-    params: dict[str, str] = {"kw": _IHERB_KEYWORD}
-    params.update(IHERB_EXTRA_PARAMS)
-    if page > 1:
-        params["p"] = str(page)
-    return f"{_IHERB_BASE}{_IHERB_SEARCH_PATH}?{urlencode(params)}"
+_BIDI_CHARS = dict.fromkeys(
+    [0x200E, 0x200F, 0x061C, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+     0x2066, 0x2067, 0x2068, 0x2069, 0x00A0, 0x202F], " ")
 
-
-# Bidi controls / invisible marks that iHerb's Hebrew pages sprinkle around
-# prices (LRM, RLM, ALM, embeddings, isolates, BOM).
-_BIDI_RE = re.compile("[‎‏؜‪-‮⁦-⁩﻿]")
-
-_CURRENCY_SYMBOLS = {
-    "₪": "ILS", "ils": "ILS", "nis": "ILS", "ש\"ח": "ILS", "ש״ח": "ILS",
-    "$": "USD", "usd": "USD", "us$": "USD",
-    "€": "EUR", "eur": "EUR",
-    "£": "GBP", "gbp": "GBP",
-}
-_CUR = r"(?:₪|US\$|\$|€|£|ILS|NIS|USD|EUR|GBP|ש\"ח|ש״ח)"
-# "1,234.56" (thousands commas), "19,99" (decimal comma, EU stores), "9.49".
-_NUM = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+,\d{1,2}(?![\d,])|\d+(?:\.\d+)?"
-
-# Per-unit price, with or without parentheses: "(₪9.49/100g)", "₪9.49 / 100 גרם",
-# "($0.71/oz)", "(₪94.90/kg)", "(₪0.26/count)".
+_CURRENCIES = {"₪": "ILS", "$": "USD", "€": "EUR", "£": "GBP"}
+_CUR = r"(?:US\s*\$|[₪$€£])"
+_NUM = r"\d[\d,]*(?:\.\d+)?"
+_AMOUNT_RE = re.compile(rf"(?:({_CUR})\s*({_NUM})|({_NUM})\s*({_CUR}))")
+# '(₪9.49/100g)', '($2.50 / 100 g)', '(₪22.21/100 גרם)', '(₪0.26/ליחידה)', '(₪95/kg)'
 _PER_UNIT_RE = re.compile(
-    rf"\(?\s*(?P<cur1>{_CUR})?\s*(?P<num>{_NUM})\s*(?P<cur2>{_CUR})?\s*/\s*"
-    r"(?P<unit>(?:\d+(?:\.\d+)?\s*)?(?:fl\.?\s*oz|[A-Za-z֐-׿\"״']+))\s*\)?",
+    rf"\(?\s*(?:({_CUR})\s*({_NUM})|({_NUM})\s*({_CUR}))\s*/\s*"
+    r"(?P<qty>\d+(?:\.\d+)?)?\s*"
+    r"(?P<unit>kg|ק\"ג|קילו|גרם|גר|ליחידה|יחידה|count|ct|oz|ml|מ\"ל|g)(?![A-Za-z])\s*\)?",
     re.IGNORECASE,
 )
-_AMOUNT_RE = re.compile(
-    rf"(?P<cur1>{_CUR})\s*(?P<n1>{_NUM})|(?P<n2>{_NUM})\s*(?P<cur2>{_CUR})",
-    re.IGNORECASE,
-)
-_BARE_AMOUNT_RE = re.compile(rf"(?<![\d.,])(?P<n>{_NUM})(?![\d.,]*\s*%)")
-
-_GRAMS_PER_UNIT = {
-    "g": Decimal(1), "gr": Decimal(1), "gram": Decimal(1), "grams": Decimal(1),
-    "גרם": Decimal(1), "ג": Decimal(1), "ג'": Decimal(1),
-    "kg": Decimal(1000), "kilo": Decimal(1000), "kilogram": Decimal(1000),
-    "ק\"ג": Decimal(1000), "ק״ג": Decimal(1000), "קילו": Decimal(1000), "קג": Decimal(1000),
-    "oz": Decimal("28.349523125"), "ounce": Decimal("28.349523125"),
-    "lb": Decimal("453.59237"), "lbs": Decimal("453.59237"), "pound": Decimal("453.59237"),
-}
-_ML_PER_UNIT = {
-    "ml": Decimal(1), "מ\"ל": Decimal(1), "מ״ל": Decimal(1), "מל": Decimal(1),
-    "l": Decimal(1000), "liter": Decimal(1000), "litre": Decimal(1000), "ליטר": Decimal(1000),
-    "fl oz": Decimal("29.5735295625"), "fl. oz": Decimal("29.5735295625"),
-    "floz": Decimal("29.5735295625"),
-}
-_COUNT_UNITS = {
-    "count", "ct", "unit", "serving", "servings", "capsule", "capsules", "caps",
-    "tablet", "tablets", "piece", "gummy", "gummies",
-    "ליחידה", "יחידה", "מנה", "למנה", "כמוסה", "קפסולה", "טבליה",
-}
-
-_CENT = Decimal("0.01")
+_SALE_MARK_RE = re.compile(r"\d+\s*%|הנחה|\boff\b", re.IGNORECASE)
 
 
-def _to_decimal(s: str) -> Optional[Decimal]:
-    if re.fullmatch(r"\d+,\d{1,2}", s):
-        s = s.replace(",", ".")  # decimal comma
+def _to_decimal(num: str) -> Optional[Decimal]:
+    if re.fullmatch(r"\d+,\d{1,2}", num):
+        num = num.replace(",", ".")  # decimal comma (EU stores): "19,99"
     try:
-        return Decimal(s.replace(",", ""))
+        return Decimal(num.replace(",", ""))
     except InvalidOperation:
         return None
 
 
-def _currency_of(sym: Optional[str]) -> Optional[str]:
-    if not sym:
-        return None
-    return _CURRENCY_SYMBOLS.get(sym.lower()) or _CURRENCY_SYMBOLS.get(sym)
+def _cur_code(sym: str) -> str:
+    return _CURRENCIES.get(sym.strip()[-1], "USD")
 
 
-def _normalise_unit(raw: str, per_unit: Decimal) -> tuple[Optional[Decimal], str]:
-    """Turn ``per_unit`` priced per ``raw`` into (price, canonical_unit).
-
-    Mass units become price-per-100g, volume units price-per-100ml, counts stay
-    as-is with unit "count". Unknown units are returned unchanged.
-    """
-    raw = raw.strip().lower()
-    m = re.match(r"(?:(\d+(?:\.\d+)?)\s*)?(.+)$", raw)
-    qty = Decimal(m.group(1)) if m and m.group(1) else Decimal(1)
-    word = (m.group(2) if m else raw).strip().rstrip(".")
-    if qty <= 0:
-        return per_unit, raw
-    if word in _GRAMS_PER_UNIT:
-        grams = qty * _GRAMS_PER_UNIT[word]
-        return (per_unit * 100 / grams).quantize(_CENT), "100g"
-    if word in _ML_PER_UNIT:
-        ml = qty * _ML_PER_UNIT[word]
-        return (per_unit * 100 / ml).quantize(_CENT), "100ml"
-    if word in _COUNT_UNITS:
-        return per_unit, "count"
-    return per_unit, word or "unknown"
+def _amounts(text: str) -> list[tuple[Decimal, str]]:
+    out = []
+    for m in _AMOUNT_RE.finditer(text):
+        sym, num = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3))
+        val = _to_decimal(num)
+        if val is not None:
+            out.append((val, _cur_code(sym)))
+    return out
 
 
 def _parse_price(text: str) -> Optional[tuple[Decimal, str, Optional[Decimal], str, bool]]:
@@ -188,78 +118,139 @@ def _parse_price(text: str) -> Optional[tuple[Decimal, str, Optional[Decimal], s
       '₪94.64 (₪9.49/100g)'
       '₪61.87 (₪0.26/count)'
       '₪78.64 (₪22.21/100g) 25% off ₪104.85'
-      '₪104.85 ₪78.64 (₪22.21/100g)'          (old + sale price)
-      'Price: $24.99 ($2.50/100 g)'
-      '‏₪94.64 (₪94.90/kg)'
+      '₪104.85 ₪78.64 (₪22.21/100g)'        (struck-through original first)
+      '$24.99 ($2.50/100 g)', '₪95 (₪9.5/kg)', '‏₪94.64 (₪9.49/100 גרם)'
 
-    Returns (price, currency, per_unit_price_or_none, unit, on_sale). Mass
-    units are normalised to "100g", volume units to "100ml".
+    Returns (price, currency, per_unit_price_or_none, unit, on_sale). Per-kg and
+    per-gram prices are normalised to per-100g.
     """
     if not text:
         return None
-    text = _BIDI_RE.sub("", text).replace("\xa0", " ").strip()
-    if not text:
-        return None
+    text = text.translate(_BIDI_CHARS)
+    text = re.sub(r"\s+", " ", text).strip()
 
-    currency: Optional[str] = None
     per_unit_price: Optional[Decimal] = None
     unit = "unknown"
+    head = text
+    pm = _PER_UNIT_RE.search(text)
+    if pm:
+        head = text[:pm.start()]
+        num = pm.group(2) if pm.group(1) else pm.group(3)
+        val = _to_decimal(num)
+        raw_unit = pm.group("unit").lower()
+        qty = _to_decimal(pm.group("qty") or "1")
+        if val is not None and qty:
+            if raw_unit in ("g", "גרם", "גר"):
+                per_unit_price = (val * 100 / qty).quantize(Decimal("0.01"))
+                unit = "100g"
+            elif raw_unit in ("kg", 'ק"ג', "קילו"):
+                per_unit_price = (val / (10 * qty)).quantize(Decimal("0.01"))
+                unit = "100g"
+            elif raw_unit in ("count", "ct", "ליחידה", "יחידה"):
+                per_unit_price, unit = val, "count"
+            elif raw_unit in ("ml", 'מ"ל'):
+                # per-100ml (not comparable with per-100g, but keeps the quantity)
+                per_unit_price = (val * 100 / qty).quantize(Decimal("0.01"))
+                unit = "100ml"
+            else:
+                per_unit_price, unit = val, raw_unit  # oz: kept, not comparable
 
-    per = _PER_UNIT_RE.search(text)
-    if per:
-        value = _to_decimal(per.group("num"))
-        if value is not None:
-            per_unit_price, unit = _normalise_unit(per.group("unit"), value)
-            currency = _currency_of(per.group("cur1") or per.group("cur2"))
-        head, tail = text[: per.start()], text[per.end():]
-    else:
-        head, tail = text, ""
-
-    # Amounts carrying a currency symbol; if the cell has none at all, fall
-    # back to bare numbers (never percentages).
-    def _amounts(s: str) -> list[tuple[Decimal, Optional[str]]]:
-        out = []
-        for m in _AMOUNT_RE.finditer(s):
-            v = _to_decimal(m.group("n1") or m.group("n2"))
-            if v is not None:
-                out.append((v, _currency_of(m.group("cur1") or m.group("cur2"))))
-        return out
-
-    before, after = _amounts(head), _amounts(tail)
-    if not before and not after:
-        bare = [_to_decimal(m.group("n")) for m in _BARE_AMOUNT_RE.finditer(head)]
-        before = [(v, None) for v in bare if v is not None]
-    if not before and not after:
+    # Prices before the per-unit group: either one price or (original, current).
+    # Anything after a '25% off' marker is the original price, not the price paid.
+    mark = _SALE_MARK_RE.search(head)
+    paid_zone = head[:mark.start()] if mark else head
+    found = _amounts(paid_zone)
+    if not found:
         return None
-
-    # The per-unit figure always follows the price it belongs to, so the
-    # amount right before it is the current (sale) price; any other amounts
-    # are the struck-through regular price.
-    if before:
-        price, cur = before[-1]
-    else:
-        price, cur = min(after, key=lambda a: a[0])
-    currency = cur or currency or next((c for _, c in before + after if c), None) or "ILS"
-
-    others = [v for v, _ in before + after if v != price]
-    lowered = text.lower()
-    on_sale = "% off" in lowered or "הנחה" in text or any(v > price for v in others)
+    price, currency = min(found, key=lambda a: a[0]) if len(found) > 1 else found[0]
+    on_sale = bool(mark) or len(found) > 1 or bool(_SALE_MARK_RE.search(text))
     return price, currency, per_unit_price, unit, on_sale
 
 
-# ---------------------------------------------------------------------------
-# Product filter: plain monohydrate powder only
-# ---------------------------------------------------------------------------
+_BROWSER_UA = USER_AGENT
 
-_CREATINE_RE = re.compile(r"creatin|קריאטין|creapure", re.IGNORECASE)
-_EXCLUDE_RE = re.compile(
-    r"gumm|chew|capsul|\bcaps\b|tablet|softgel|\bblend|complex|matrix|stack|"
-    r"pre[- ]?workout|electrolyte|beta[- ]?alanine|bcaa|glutamine|protein|"
-    r"\bhcl\b|hydrochloride|nitrate|ethyl ester|kre[- ]?alkalyn|buffered|chelate|"
-    r"malate|citrate|drink mix|\bmix\b|\+|"
-    r"גומי|סוכרי|כמוס|קפסול|טבלי|תערובת|חלבון|מסטיק|ללעיסה",
+
+# Why the last fetch attempt(s) failed, so the report can say "blocked by
+# Cloudflare" / "browser not installed" instead of a generic failure.
+# Keys: "httpx" and "browser" -> short reason code, reset by scan_iherb().
+_fetch_diag: dict[str, str] = {}
+
+
+def _fetch_html_httpx() -> Optional[str]:
+    try:
+        with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
+            resp = client.get(_IHERB_SEARCH)
+    except httpx.HTTPError as exc:
+        log.warning("iHerb creatine scan: %s", type(exc).__name__)
+        _fetch_diag["httpx"] = f"network:{type(exc).__name__}"
+        return None
+    if resp.status_code != 200:
+        log.warning("iHerb creatine scan: HTTP %s", resp.status_code)
+        _fetch_diag["httpx"] = f"http:{resp.status_code}"
+        return None
+    return resp.text
+
+
+def _fetch_html_browser() -> Optional[str]:
+    """Load the search page in headless Chromium.
+
+    iHerb's Cloudflare front answers plain HTTP clients with a 403 challenge
+    page; a real browser engine with an ordinary desktop identity gets the
+    normal page.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.warning("iHerb creatine scan: Playwright not installed, no browser fallback")
+        _fetch_diag["browser"] = "playwright_missing"
+        return None
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = browser.new_context(
+                    user_agent=_BROWSER_UA,
+                    locale="he-IL",
+                    viewport={"width": 1366, "height": 900},
+                ).new_page()
+                resp = page.goto(_IHERB_SEARCH, wait_until="domcontentloaded", timeout=45_000)
+                try:
+                    page.wait_for_selector(".product-cell", timeout=25_000)
+                except Exception:
+                    log.warning(
+                        "iHerb creatine scan (browser): no products, HTTP %s",
+                        resp.status if resp else "?",
+                    )
+                    _fetch_diag["browser"] = f"no_products:{resp.status if resp else '?'}"
+                    return None
+                return page.content()
+            finally:
+                browser.close()
+    except Exception as exc:
+        log.warning("iHerb creatine scan (browser) failed: %s: %s", type(exc).__name__, exc)
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc):
+            _fetch_diag["browser"] = "browser_not_installed"
+        else:
+            _fetch_diag["browser"] = f"error:{type(exc).__name__}"
+        return None
+
+
+# Name fragments of products that are not plain creatine powder; they can carry
+# a per-100g price but should not compete for "cheapest creatine powder".
+_NON_POWDER_RE = re.compile(
+    r"gumm|capsule|caps\b|tablet|chewable|chews?\b|softgel|liquid|drink|bar\b|"
+    r"כמוס|גומי|טבליות|לעיס|נוזל|חטיף|"
+    # blends, other creatine salts and mixes are not plain monohydrate powder
+    r"\bblend|complex|matrix|stack|pre[- ]?workout|electrolyte|beta[- ]?alanine|"
+    r"bcaa|glutamine|protein|\bhcl\b|hydrochloride|nitrate|ethyl ester|"
+    r"kre[- ]?alkalyn|buffered|chelate|malate|citrate|\bmix\b|\+|"
+    r"סוכרי|קפסול|טבלי|תערובת|חלבון|מסטיק",
     re.IGNORECASE,
 )
+# Flavoured mixes are left out unless the name says unflavoured.
 _FLAVOUR_RE = re.compile(r"flavou?r|בטעם|טעם", re.IGNORECASE)
 _UNFLAVOURED_RE = re.compile(
     r"un-?flavou?red|no flavou?r|flavou?rless|without flavou?r|ללא טעם|נטול טעם|בלי טעם",
@@ -267,103 +258,61 @@ _UNFLAVOURED_RE = re.compile(
 )
 
 
-def is_monohydrate_powder(p: CreatineProduct) -> bool:
-    """True for plain, unflavoured creatine monohydrate powder.
-
-    Requires a per-100g price (i.e. sold by weight), a creatine mention in the
-    name, and none of the gummy / capsule / blend / other-salt / flavoured-mix
-    markers.
-    """
-    if p.price_per_100g is None:
+def _is_powder(p: CreatineProduct) -> bool:
+    if p.price_per_100g is None or _NON_POWDER_RE.search(p.name):
         return False
-    name = p.name or ""
-    if not _CREATINE_RE.search(name):
-        return False
-    if _EXCLUDE_RE.search(name):
-        return False
-    if _FLAVOUR_RE.search(name) and not _UNFLAVOURED_RE.search(name):
-        return False
-    return True
+    return not (_FLAVOUR_RE.search(p.name) and not _UNFLAVOURED_RE.search(p.name))
 
 
-# ---------------------------------------------------------------------------
-# Search-page parsing
-# ---------------------------------------------------------------------------
-
-_PRODUCT_ID_RE = re.compile(r"/pr/(?:[^/?#]+/)*(\d+)(?:[/?#]|$)")
+# Public name (the product filter: plain, unflavoured creatine powder).
+is_monohydrate_powder = _is_powder
 
 
-def _product_key(url: str, name: str = "") -> str:
-    """Stable identity: the iHerb product id from ``/pr/.../<id>``, else the URL."""
-    if url:
-        m = _PRODUCT_ID_RE.search(url)
-        if m:
-            return f"iherb:{m.group(1)}"
-        parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
-    return f"name:{name.strip().lower()}"
-
-
-def _product_link(cell, title_el) -> str:
-    """The product page link of a cell: the title's own anchor, else ``/pr/``.
-
-    Never the first anchor of the cell: iHerb's own brands carry an
-    "iHerb brands" badge (``/iherb-brands``) before the product link.
-    """
-    candidates = []
-    if title_el is not None:
-        if title_el.name == "a":
-            candidates.append(title_el)
-        candidates.append(title_el.find_parent("a"))
-        candidates.append(title_el.select_one("a[href]"))
-    candidates.extend(cell.select('a[href*="/pr/"]'))
-    for a in candidates:
-        if a is None:
-            continue
-        href = (a.get("href") or "").strip()
-        if href and "/pr/" in href:
-            return urljoin(_IHERB_BASE + "/", href)
-    return ""
-
-
-def _cell_price_text(cell) -> Optional[str]:
-    for sel in [".product-price", ".price", "p.price", "span[class*='price']", "[class*='price']"]:
-        hit = cell.select_one(sel)
-        if hit:
-            txt = hit.get_text(" ", strip=True)
-            if re.search(r"\d", txt):
-                return txt
-    return None
-
-
-def _parse_cells(html: str, seen: Optional[set[str]] = None) -> tuple[list[CreatineProduct], int]:
-    """Parse product cells out of one search page.
-
-    Returns (new_products, number_of_cells). Products are de-duplicated on
-    their iHerb product id (sponsored + organic copies of the same product);
-    ``seen`` carries the keys across pages and is updated in place.
-    """
-    seen = set() if seen is None else seen
+def _parse_cells(html: str) -> tuple[list[CreatineProduct], int]:
+    """Parse product cells; returns (products, number_of_cells_seen)."""
     soup = BeautifulSoup(html, "lxml")
     cells = soup.select(".product-cell")
     products: list[CreatineProduct] = []
+    seen: set[str] = set()
+    duplicates = 0
     for cell in cells:
         title_el = cell.select_one(".product-title")
         if not title_el:
             continue
-        name = title_el.get_text(" ", strip=True)
-        if not name:
-            continue
-        parsed = _parse_price(_cell_price_text(cell) or "")
+        name = title_el.get_text(strip=True)
+
+        # Price text — try several candidate selectors
+        price_text = None
+        for sel in [".product-price", ".price", "p.price", "span[class*='price']"]:
+            hit = cell.select_one(sel)
+            if hit:
+                txt = hit.get_text(" ", strip=True)
+                if re.search(r"\d", txt):
+                    price_text = txt
+                    break
+        parsed = _parse_price(price_text or "")
         if parsed is None:
             continue
         price, currency, per_unit, unit, on_sale = parsed
 
-        href = _product_link(cell, title_el)
-        key = _product_key(href, name)
-        if key in seen:
-            continue
-        seen.add(key)
+        # The product link is the title's own anchor, else the first /pr/ link;
+        # iHerb's own brands carry an "/iherb-brands" badge anchor first.
+        link_el = (title_el.find_parent("a", href=True)
+                   or title_el.select_one("a[href]")
+                   or cell.select_one('a[href*="/pr/"]')
+                   or cell.select_one("a[href]"))
+        href = link_el.get("href", "") if link_el else ""
+        if href and not href.startswith("http"):
+            href = f"https://il.iherb.com{href}"
+
+        # iHerb repeats products (sponsored + organic): keep the first one.
+        m_id = re.search(r"/pr/[^?#]*?/(\d+)(?:[/?#]|$)", href)
+        key = m_id.group(1) if m_id else f"{href.split('?')[0].split('#')[0]}|{name}"
+        if href:
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
 
         products.append(CreatineProduct(
             name=name,
@@ -375,211 +324,33 @@ def _parse_cells(html: str, seen: Optional[set[str]] = None) -> tuple[list[Creat
             on_sale=on_sale,
             seller="iHerb",
         ))
-    return products, len(cells)
+    return products, len(cells) - duplicates
 
 
-# ---------------------------------------------------------------------------
-# Fetching
-# ---------------------------------------------------------------------------
-
-_BLOCK_MARKERS = (
-    "cf-challenge", "challenge-platform", "cf-chl-", "just a moment...",
-    "attention required! | cloudflare", "access denied",
-)
-
-
-def _looks_blocked(html: str) -> bool:
-    low = html[:20000].lower()
-    return any(m in low for m in _BLOCK_MARKERS)
-
-
-@dataclass
-class _Page:
-    """One fetched page: HTML or why there is none."""
-    html: Optional[str]
-    blocked: bool = False
-    error: Optional[str] = None
-
-
-def _fetch_html_httpx(url: str = _IHERB_SEARCH) -> _Page:
-    try:
-        with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
-            resp = client.get(url)
-    except httpx.HTTPError as exc:
-        log.warning("iHerb creatine scan: %s", type(exc).__name__)
-        return _Page(None, error=type(exc).__name__)
-    if resp.status_code != 200:
-        log.warning("iHerb creatine scan: HTTP %s", resp.status_code)
-        return _Page(
-            None,
-            blocked=resp.status_code in (401, 403, 429, 503),
-            error=f"HTTP {resp.status_code}",
-        )
-    if _looks_blocked(resp.text) and "product-cell" not in resp.text:
-        return _Page(None, blocked=True, error="challenge page")
-    return _Page(resp.text)
-
-
-class _BrowserSession:
-    """Headless Chromium kept open across several result pages.
-
-    iHerb's Cloudflare front answers plain HTTP clients with a 403 challenge
-    page; a real browser engine with an ordinary desktop identity gets the
-    normal page.
-    """
-
-    def __init__(self) -> None:
-        self._pw_cm = None
-        self._browser = None
-        self._page = None
-        self.error: Optional[str] = None
-
-    def __enter__(self) -> "_BrowserSession":
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            log.warning("iHerb creatine scan: Playwright not installed, no browser fallback")
-            self.error = "Playwright not installed"
-            return self
-        try:
-            self._pw_cm = sync_playwright()
-            pw = self._pw_cm.__enter__()
-            self._browser = pw.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            self._page = self._browser.new_context(
-                user_agent=USER_AGENT,
-                locale="he-IL",
-                viewport={"width": 1366, "height": 900},
-            ).new_page()
-        except Exception as exc:
-            log.warning("iHerb creatine scan (browser) failed: %s: %s", type(exc).__name__, exc)
-            self.error = f"{type(exc).__name__}"
-            self.__exit__(None, None, None)
-        return self
-
-    def get(self, url: str) -> _Page:
-        if self._page is None:
-            return _Page(None, error=self.error or "browser unavailable")
-        try:
-            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            status = resp.status if resp else None
-            try:
-                self._page.wait_for_selector(".product-cell", timeout=25_000)
-            except Exception:
-                html = self._page.content()
-                log.warning("iHerb creatine scan (browser): no products, HTTP %s", status or "?")
-                if (status in (401, 403, 429, 503)) or _looks_blocked(html):
-                    return _Page(None, blocked=True, error=f"HTTP {status or '?'} (browser)")
-                return _Page(html)
-            return _Page(self._page.content())
-        except Exception as exc:
-            log.warning("iHerb creatine scan (browser) failed: %s: %s", type(exc).__name__, exc)
-            return _Page(None, error=type(exc).__name__)
-
-    def __exit__(self, *exc_info) -> None:
-        try:
-            if self._browser is not None:
-                self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._pw_cm is not None:
-                self._pw_cm.__exit__(None, None, None)
-        except Exception:
-            pass
-        self._browser = self._page = self._pw_cm = None
-
-
-def _fetch_html_browser(url: str = _IHERB_SEARCH) -> Optional[str]:
-    """Single-page browser fetch (kept for ad-hoc use)."""
-    with _BrowserSession() as session:
-        return session.get(url).html
-
-
-@dataclass
-class IherbScan:
-    """Outcome of reading the iHerb search pages."""
-    products: list[CreatineProduct] = field(default_factory=list)  # de-duplicated
-    cells: int = 0          # product cells seen across all pages (incl. repeats)
-    pages: int = 0          # pages successfully read
-    blocked: bool = False   # first page refused by Cloudflare / iHerb
-    error: Optional[str] = None
-
-
-def _iter_pages(max_pages: int) -> Iterator[tuple[int, _Page]]:
-    """Yield (page_no, page): httpx first, headless browser once httpx fails."""
-    use_browser = False
-    browser: Optional[_BrowserSession] = None
-    try:
-        for page_no in range(1, max_pages + 1):
-            url = search_url(page_no)
-            page = _Page(None)
-            if not use_browser:
-                page = _fetch_html_httpx(url)
-                if page.html is None or "product-cell" not in page.html:
-                    if page_no == 1:
-                        log.info("iHerb creatine scan: retrying with headless browser")
-                        use_browser = True
-                    elif page.html is not None:
-                        # A later page with no products: end of results.
-                        yield page_no, page
-                        return
-            if use_browser:
-                if browser is None:
-                    browser = _BrowserSession().__enter__()
-                first_error = page
-                page = browser.get(url)
-                if page.html is None and page_no == 1:
-                    # Report the most telling reason: a block on either path.
-                    page.blocked = page.blocked or first_error.blocked
-                    page.error = page.error or first_error.error
-            yield page_no, page
-    finally:
-        if browser is not None:
-            browser.__exit__(None, None, None)
-
-
-def scan_iherb_detailed(
-    max_pages: int = IHERB_MAX_PAGES,
-    pages: Optional[Callable[[int], Iterator[tuple[int, _Page]]]] = None,
-) -> IherbScan:
-    """Read up to ``max_pages`` search pages and parse their product cells."""
-    result = IherbScan()
-    seen: set[str] = set()
-    page_iter = (pages or _iter_pages)(max_pages)
-    try:
-        _read_pages(page_iter, result, seen)
-    finally:
-        close = getattr(page_iter, "close", None)
-        if close is not None:
-            close()  # shuts the headless browser down promptly
-    return result
-
-
-def _read_pages(page_iter, result: IherbScan, seen: set[str]) -> None:
-    for page_no, page in page_iter:
-        if page.html is None:
-            if page_no == 1:
-                result.blocked = page.blocked
-                result.error = page.error
-            break
-        if page_no == 1 and _looks_blocked(page.html) and "product-cell" not in page.html:
-            result.blocked = True
-            result.error = "challenge page"
-            break
-        new, cells = _parse_cells(page.html, seen)
-        result.pages += 1
-        result.cells += cells
-        result.products.extend(new)
-        if not new:
-            break  # empty page or nothing but repeats: no more results
+_scan_cells_seen = 0
 
 
 def scan_iherb() -> list[CreatineProduct]:
-    """Fetch and parse iHerb's creatine search pages (de-duplicated)."""
-    return scan_iherb_detailed().products
+    """Fetch and parse iHerb's creatine search page.
+
+    Diagnostics for an empty result are left in `_fetch_diag` and
+    `_scan_cells_seen` for scan_and_report().
+    """
+    global _scan_cells_seen
+    _fetch_diag.clear()
+    _scan_cells_seen = 0
+    html = _fetch_html_httpx()
+    products: list[CreatineProduct] = []
+    if html is not None:
+        products, _scan_cells_seen = _parse_cells(html)
+        if _scan_cells_seen == 0:
+            _fetch_diag["httpx"] = "no_cells"  # 200 but not a product page (challenge?)
+    if not products and not _scan_cells_seen:
+        log.info("iHerb creatine scan: retrying with headless browser")
+        html = _fetch_html_browser()
+        if html is not None:
+            products, _scan_cells_seen = _parse_cells(html)
+    return products
 
 
 # ---------------------------------------------------------------------------
@@ -611,18 +382,18 @@ def _save_state(state: dict) -> None:
 # Core logic
 # ---------------------------------------------------------------------------
 
-def powders_of(products: list[CreatineProduct]) -> list[CreatineProduct]:
-    """Plain monohydrate powders, cheapest per 100g first."""
-    return sorted(
-        (p for p in products if is_monohydrate_powder(p)),
-        key=lambda p: p.price_per_100g,
-    )
-
-
 def pick_cheapest(products: list[CreatineProduct]) -> Optional[CreatineProduct]:
-    """Return the cheapest monohydrate powder by price-per-100g."""
-    powders = powders_of(products)
-    return powders[0] if powders else None
+    """Return the cheapest product by price-per-100g (powder only).
+
+    Only products in the most common currency compete, so a stray USD cell
+    cannot beat ILS prices.
+    """
+    powders = [p for p in products if _is_powder(p)]
+    if not powders:
+        return None
+    main_cur = max({p.currency for p in powders}, key=lambda c: sum(p.currency == c for p in powders))
+    powders = [p for p in powders if p.currency == main_cur]
+    return min(powders, key=lambda p: p.price_per_100g)
 
 
 def _product_to_dict(p: CreatineProduct) -> dict:
@@ -645,14 +416,17 @@ def _product_from_dict(d: dict) -> CreatineProduct:
     )
 
 
-def _same_product(a: CreatineProduct, b: CreatineProduct) -> bool:
-    """Same product? By iHerb product id when both have one, else by name.
+_PRODUCT_ID_RE = re.compile(r"/pr/[^?#]*?/(\d+)(?:[/?#]|$)")
 
-    The id survives the page coming back in another language, the name does not.
+
+def _same_product(a: CreatineProduct, b: CreatineProduct) -> bool:
+    """Same product? By iHerb product id when both links have one, else by name.
+
+    The id survives the page coming back in another language; the name does not.
     """
-    ka, kb = _product_key(a.url), _product_key(b.url)
-    if ka.startswith("iherb:") and kb.startswith("iherb:"):
-        return ka == kb
+    ma, mb = _PRODUCT_ID_RE.search(a.url or ""), _PRODUCT_ID_RE.search(b.url or "")
+    if ma and mb:
+        return ma.group(1) == mb.group(1)
     return a.name == b.name
 
 
@@ -661,23 +435,24 @@ def compare(
 ) -> tuple[bool, Optional[str]]:
     """(changed, direction) between the stored and the new cheapest product.
 
-    direction is "dropped" / "rose" / "same_price" (a different product at
-    the identical per-100g price) / None (first observation, or the currency
-    changed so the numbers are not comparable).
+    direction is "dropped" / "rose" / "changed" (same price per 100g but a
+    different product, or not comparable across currencies) / None (first
+    observation or unchanged).
     """
     if previous is None:
         return True, None  # first observation counts as "to be announced"
-    same_price = previous.price_per_100g == cheapest.price_per_100g
-    same_currency = previous.currency == cheapest.currency
-    if same_price and same_currency and _same_product(previous, cheapest):
+    if (previous.price_per_100g == cheapest.price_per_100g
+            and previous.currency == cheapest.currency
+            and _same_product(previous, cheapest)):
         return False, None
-    if not same_currency or previous.price_per_100g is None or cheapest.price_per_100g is None:
-        return True, None
-    if cheapest.price_per_100g < previous.price_per_100g:
-        return True, "dropped"
-    if cheapest.price_per_100g > previous.price_per_100g:
-        return True, "rose"
-    return True, "same_price"
+    if (previous.price_per_100g and cheapest.price_per_100g
+            and previous.currency == cheapest.currency):
+        if cheapest.price_per_100g < previous.price_per_100g:
+            return True, "dropped"
+        if cheapest.price_per_100g > previous.price_per_100g:
+            return True, "rose"
+        return True, "changed"  # same price, a different product is now cheapest
+    return True, "changed"
 
 
 def _print_table(products: list[CreatineProduct], cheapest: Optional[CreatineProduct]) -> None:
@@ -685,18 +460,24 @@ def _print_table(products: list[CreatineProduct], cheapest: Optional[CreatinePro
     table.add_column("#", width=3)
     table.add_column("Name")
     table.add_column("Price")
-    table.add_column("/100g")
+    table.add_column("₪/100g")
     table.add_column("Sale")
 
-    for i, p in enumerate(products[:10], 1):
+    # Top 10 by price/100g among powders, then up to 5 capsule/other
+    powders = sorted(
+        [p for p in products if _is_powder(p)],
+        key=lambda p: p.price_per_100g,
+    )[:10]
+
+    for i, p in enumerate(powders, 1):
         name_cell = p.name[:60]
         if cheapest and p is cheapest:
             name_cell = f"[bold green]{name_cell}[/bold green]"
         table.add_row(
             str(i),
             name_cell,
-            f"{p.price} {p.currency}",
-            f"{p.price_per_100g} {p.currency}",
+            f"₪{p.price}",
+            f"₪{p.price_per_100g}",
             "✓" if p.on_sale else "",
         )
 
@@ -706,78 +487,93 @@ def _print_table(products: list[CreatineProduct], cheapest: Optional[CreatinePro
 @dataclass
 class CreatineReport:
     """Result of a creatine scan — data only, no email side-effect."""
-    # "ok" / "blocked" / "fetch_failed" / "no_products" / "parse_failed" / "no_powder"
-    status: str
-    products: list[CreatineProduct] = field(default_factory=list)  # top 10 powders by price/100g
+    status: str  # "ok" / "no_powder" / "fetch_failed" / "blocked"
+    products: list[CreatineProduct] = field(default_factory=list)  # top 10 powders by ₪/100g
     cheapest: Optional[CreatineProduct] = None
     previous_cheapest: Optional[CreatineProduct] = None
     changed: bool = False
-    direction: Optional[str] = None  # "dropped" / "rose" / "same_price" / None
+    # "dropped" / "rose" / "changed" (same price per 100g, different product) / None
+    direction: Optional[str] = None
     error: Optional[str] = None
-    products_scanned: int = 0  # distinct products parsed (duplicates removed)
-    powders_found: int = 0     # of which plain monohydrate powders
-    cells_seen: int = 0        # raw product cells on the pages (incl. repeats)
-    pages_read: int = 0
+    cells_seen: int = 0  # product cells found on the page
+    parsed: int = 0      # cells whose price could be parsed
+    powders: int = 0     # parsed products counted as plain powder
 
 
-def scan_and_report(scan: Optional[IherbScan] = None) -> CreatineReport:
-    """Scan iHerb, compare against stored cheapest, return a report (no email, no save)."""
-    log.info("Scanning iHerb creatine")
-    if scan is None:
-        scan = scan_iherb_detailed()
-    counts = dict(
-        products_scanned=len(scan.products),
-        cells_seen=scan.cells,
-        pages_read=scan.pages,
+def _failure_report() -> CreatineReport:
+    """Explain why nothing could be scanned, from the fetch diagnostics."""
+    httpx_r = _fetch_diag.get("httpx", "")
+    browser_r = _fetch_diag.get("browser", "")
+    blocked = httpx_r in ("http:403", "http:429", "http:503", "no_cells") or browser_r.startswith("no_products")
+    parts: list[str] = []
+    if httpx_r in ("http:403", "http:429", "http:503"):
+        parts.append(f"iHerb חסם את הבקשה (Cloudflare, HTTP {httpx_r.split(':')[1]})")
+    elif httpx_r.startswith("http:"):
+        parts.append(f"iHerb החזיר שגיאת HTTP {httpx_r.split(':')[1]}")
+    elif httpx_r.startswith("network:"):
+        parts.append(f"שגיאת רשת בגישה ל-iHerb ({httpx_r.split(':')[1]})")
+    elif httpx_r == "no_cells":
+        parts.append("iHerb החזיר דף ללא מוצרים (כנראה אתגר Cloudflare)")
+    if browser_r == "playwright_missing":
+        parts.append("הדפדפן החלופי לא זמין: Playwright לא מותקן")
+    elif browser_r == "browser_not_installed":
+        parts.append("הדפדפן החלופי לא זמין: Chromium לא מותקן (יש להריץ: playwright install chromium)")
+    elif browser_r.startswith("no_products"):
+        parts.append("גם הדפדפן לא הצליח לטעון את רשימת המוצרים (אתגר Cloudflare לא נפתר)")
+    elif browser_r.startswith("error:"):
+        parts.append(f"הדפדפן החלופי נכשל ({browser_r.split(':', 1)[1]})")
+    if not parts:
+        parts.append("לא נמצאו מוצרים בעמוד של iHerb")
+    return CreatineReport(
+        status="blocked" if blocked else "fetch_failed",
+        error="; ".join(parts),
     )
 
-    if not scan.products:
-        if scan.blocked:
-            return CreatineReport(
-                status="blocked",
-                error=f"iHerb חסם את הבקשה ({scan.error or 'blocked'})",
-                **counts,
-            )
-        if scan.pages == 0:
+
+def scan_and_report() -> CreatineReport:
+    """Scan iHerb, compare against stored cheapest, return a report (no email, no save)."""
+    global _scan_cells_seen
+    log.info("Scanning iHerb creatine")
+    _fetch_diag.clear()
+    _scan_cells_seen = 0
+    products = scan_iherb()
+    cells = _scan_cells_seen
+    if not products:
+        if cells:
+            # The page had product cells but not one price could be read: a
+            # layout/currency change on our side, not a block.
             return CreatineReport(
                 status="fetch_failed",
-                error=f"לא ניתן היה לטעון את עמוד החיפוש של iHerb ({scan.error or 'unknown'})",
-                **counts,
+                cells_seen=cells,
+                error=f"נמצאו {cells} מוצרים בעמוד אך לא ניתן היה לפענח אף מחיר "
+                      "(ייתכן שפורמט המחיר בעמוד השתנה)",
             )
-        if scan.cells == 0:
-            return CreatineReport(
-                status="no_products",
-                error="העמוד נטען אך לא נמצאו בו מוצרים (ייתכן שמבנה העמוד השתנה)",
-                **counts,
-            )
-        return CreatineReport(
-            status="parse_failed",
-            error=f"פוענחו 0 מתוך {scan.cells} מוצרים בעמוד (ייתכן שתבנית המחיר השתנתה)",
-            **counts,
-        )
+        return _failure_report()
 
-    powders = powders_of(scan.products)
-    counts["powders_found"] = len(powders)
-    if not powders:
+    powders_all = [p for p in products if _is_powder(p)]
+    cheapest = pick_cheapest(products)
+    if cheapest is None:
         return CreatineReport(
-            status="no_powder",
-            error=f"נמצאו {len(scan.products)} מוצרים, אך אף אחד מהם אינו אבקת קריאטין מונוהידרט",
-            **counts,
+            status="no_powder", products=products, cells_seen=cells, parsed=len(products),
+            error=f"נמצאו {len(products)} מוצרים אך אף אחד מהם אינו אבקת קריאטין עם מחיר ל-100 גרם",
         )
-    cheapest = powders[0]
 
     state = _load_state()
     previous = _product_from_dict(state["cheapest"]) if state.get("cheapest") else None
     changed, direction = compare(previous, cheapest)
 
+    powders = sorted(powders_all, key=lambda p: p.price_per_100g)[:10]
+
     return CreatineReport(
         status="ok",
-        products=powders[:10],
+        products=powders,
         cheapest=cheapest,
         previous_cheapest=previous,
         changed=changed,
         direction=direction,
-        **counts,
+        cells_seen=cells,
+        parsed=len(products),
+        powders=len(powders_all),
     )
 
 
@@ -796,20 +592,14 @@ def print_report(report: CreatineReport) -> None:
     if report.status != "ok":
         console.print(f"[red]Creatine scan failed: {report.status}[/red]  {report.error or ''}")
         return
-    console.print(
-        f"[dim]{report.products_scanned} distinct products on {report.pages_read} page(s) "
-        f"({report.cells_seen} cells), {report.powders_found} monohydrate powders[/dim]"
-    )
     _print_table(report.products, report.cheapest)
-    cur = report.cheapest
     if report.previous_cheapest is None:
-        console.print(f"\n[bold]First observation:[/bold] {cur.name} @ {cur.price_per_100g} {cur.currency}/100g")
+        console.print(f"\n[bold]First observation:[/bold] {report.cheapest.name} @ ₪{report.cheapest.price_per_100g}/100g")
     elif report.changed:
         prev = report.previous_cheapest
-        label = {"same_price": "same price, different product"}.get(report.direction or "", report.direction or "changed")
         console.print(
-            f"\n[bold yellow]CHANGE ({label}):[/bold yellow] "
-            f"{prev.price_per_100g} {prev.currency}/100g → {cur.price_per_100g} {cur.currency}/100g"
+            f"\n[bold yellow]CHANGE ({report.direction}):[/bold yellow] "
+            f"₪{prev.price_per_100g}/100g → ₪{report.cheapest.price_per_100g}/100g"
         )
     else:
-        console.print(f"\n[dim]No change — still {cur.price_per_100g} {cur.currency}/100g.[/dim]")
+        console.print(f"\n[dim]No change — still ₪{report.cheapest.price_per_100g}/100g.[/dim]")

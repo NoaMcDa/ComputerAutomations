@@ -214,22 +214,27 @@ def test_out_of_stock_and_back_in_stock_are_stock_events():
 
 
 def test_price_zero_is_never_a_change():
+    # Merge note: a price of 0 is a deferred reading that counts as a failed
+    # fetch (it escalates to the failure alert), not a FAILED fetch result.
     w = watch()
     run(w, ok("100"))
     ev = run(w, ok("0"))
-    assert ev.type == ChangeType.FAILED
-    assert ev.fetch.status == FetchStatus.PRICE_NOT_FOUND
-    assert "0" in ev.fetch.error_message
-    assert state.load_state()["watches"]["shop-1"]["last_price"] == "100"
+    assert ev.type == ChangeType.SANITY_DEFERRED
+    assert "0" in ev.reason
+    ws = state.load_state()["watches"]["shop-1"]
+    assert ws["last_price"] == "100" and ws["consecutive_failures"] == 1
 
 
 def test_currency_change_rechecked_then_accepted():
+    # Merge note: a new currency is accepted once it persisted for
+    # failure_threshold runs (here 2: deferred once, then accepted).
     w = watch()
-    run(w, ok("100", currency="ILS"))
-    ev = run(w, ok("30", currency="USD"))
+    c = cfg(threshold=2)
+    run(w, ok("100", currency="ILS"), c)
+    ev = run(w, ok("30", currency="USD"), c)
     assert ev.type == ChangeType.SANITY_DEFERRED
     assert state.load_state()["watches"]["shop-1"]["last_price"] == "100"
-    ev = run(w, ok("30", currency="USD"))
+    ev = run(w, ok("30", currency="USD"), c)
     assert ev.type == ChangeType.PRICE_CHANGED and ev.pct_change is None
     assert state.load_state()["watches"]["shop-1"]["currency"] == "USD"
 

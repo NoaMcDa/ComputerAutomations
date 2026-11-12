@@ -36,8 +36,9 @@ def test_subject_keeps_agorot():
 
 
 def test_body_has_all_fields_text_and_html():
+    # Merge note: prices in the body always carry two decimals (499.00 ₪).
     p = es.build_payload([price_event()])
-    for needle in ("Shoe", "499 ₪", "449 ₪", "-50.00 ₪", "-10.0%", "ירד",
+    for needle in ("Shoe", "499.00 ₪", "449.00 ₪", "-50.00 ₪", "-10.0%", "ירד",
                    "https://shop.example/products/shoe", "2026-11-12 09:00"):
         assert needle in p.text_body, needle
         assert needle in p.html_body, needle
@@ -50,7 +51,8 @@ def test_rise_is_marked_as_rise():
 
 
 def test_fmt_price():
-    assert es._fmt_price(Decimal("499"), "₪") == "499 ₪"
+    # Merge note: body prices keep two decimals (the subject stays compact).
+    assert es._fmt_price(Decimal("499"), "₪") == "499.00 ₪"
     assert es._fmt_price(Decimal("1299.9"), "₪") == "1,299.90 ₪"
     assert es._fmt_price(Decimal("19.90"), "$") == "19.90 $"
     assert es._fmt_price(None, "₪") == "?"
@@ -75,7 +77,7 @@ def test_message_is_plain_text_with_html_alternative(monkeypatch):
     sent = []
 
     class FakeSMTPConn:
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kw):  # merge: the sender passes a timeout
             sent.append(("connect", host, port))
 
         def __enter__(self):
@@ -142,7 +144,7 @@ def test_threshold_alert_says_why_shopify_variant():
     ev = _threshold_event(fail(FetchStatus.NOT_FOUND, "Shopify variant 1 not found in product <x>"))
     p = es.build_payload([ev])
     for body in (p.text_body, p.html_body):
-        assert "הדף לא נמצא" in body
+        assert "הווריאציה" in body                         # merge: says the variant is gone
         assert "remove" in body and "add" in body          # re-add suggestion
     assert "Shopify variant 1 not found in product <x>" in p.text_body
     assert "Shopify variant 1 not found in product &lt;x&gt;" in p.html_body   # escaped
@@ -153,14 +155,17 @@ def test_threshold_alert_says_why_shopify_variant():
 def test_threshold_alert_blocked_includes_http_status():
     ev = _threshold_event(fail(FetchStatus.BLOCKED, "Blocked (HTTP 403)", 403))
     p = es.build_payload([ev])
-    assert "האתר חסם את הבקשה · HTTP 403 — Blocked (HTTP 403)" in p.text_body
+    # merge: the detail line reads "<status> (HTTP 403) – <advice> (<message>)"
+    assert "האתר חסם את הבקשה (HTTP 403)" in p.text_body
+    assert "Blocked (HTTP 403)" in p.text_body
     assert "HTTP 403" in p.html_body
 
 
 def test_threshold_alert_price_zero():
     ev = _threshold_event(ok("0"))
     p = es.build_payload([ev])
-    assert "המחיר לא נמצא בדף" in p.text_body and "price of 0" in p.text_body
+    # merge: a price of 0 is reported as such ("shown as 0")
+    assert "המחיר באתר הוצג כ-0" in p.text_body and "המחיר הוצג כ-0" in p.subject
 
 
 def test_describe_failure_404():
@@ -186,7 +191,8 @@ def test_estimate_wording_with_code():
     assert ev.type == ChangeType.PROMO_CHANGED
     p = es.build_payload([ev])
     assert "מבצע חדש" in p.subject and "X45" in p.subject
-    assert "מוצג 189 ₪, בערך 103.95 ₪ עם הקוד X45 (45%) (הערכה)" in p.text_body
+    # merge: the estimate is its own line, marked as an estimate
+    assert "מחיר סופי משוער: 103.95 ₪ (הערכה)" in p.text_body and "X45" in p.text_body
     assert "on orders over ₪200" in p.text_body
     assert "המחיר המוצג לא השתנה" in p.text_body
 
@@ -199,7 +205,7 @@ def test_promotion_ended_is_reported_as_such_not_as_price_rise():
     p = es.build_payload([ev])
     assert p.subject.startswith("המבצע הסתיים")
     assert "עלה" not in p.subject
-    assert "המבצע הסתיים (היה: הקוד VIP20 (20%))" in p.text_body
+    assert "המבצע הסתיים (היה: קוד: VIP20" in p.text_body   # merge: ours' wording
 
 
 def test_price_change_with_promo_states_what_changed():

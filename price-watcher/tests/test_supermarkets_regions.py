@@ -1,4 +1,9 @@
-"""Issue #46 (store → city matching) and #50 (scan area: Herzliya + Ramat HaSharon)."""
+"""Issue #46 (store → city matching) and #50 (scan area: Herzliya + Ramat HaSharon).
+
+Adapted in the merge of PR #56 into #57: the scan area setting is
+PW_MEAT_CITIES (PW_MEAT_REGIONS is still read as its older name) and
+`_enabled_cities()` returns the cities in table order (a tuple).
+"""
 from __future__ import annotations
 
 import pytest
@@ -67,16 +72,20 @@ def test_neighbourhoods(name, city):
 
 
 def test_cbs_code_still_wins():
-    assert sm._region_for_store(_row("תל אביב", "תל אביב 1", "6400")) == ("השרון", "הרצליה")
+    # The code beats the address...
+    assert sm._region_for_store(_row("סניף מרכז", "תל אביב 1", "6400")) == ("השרון", "הרצליה")
     assert sm._region_for_store(_row("הרצליה", "", "4000")) is None  # Haifa code
+    # ...but not a store NAME that names another listed city: chains mistype
+    # codes (Fresh Market's "סופר יודה רמת השרון" carries Holon's code).
+    assert sm._region_for_store(_row("תל אביב", "תל אביב 1", "6400")) == ("תל אביב", "תל אביב")
 
 
 # ---- #50: only Herzliya + Ramat HaSharon by default, switchable via PW_MEAT_REGIONS ----
 
 def test_default_scan_area(monkeypatch):
     monkeypatch.delenv("PW_MEAT_REGIONS", raising=False)
-    assert sm._enabled_cities() == {"הרצליה", "רמת השרון"}
-    assert sm.scan_area_label() == "הרצליה, רמת השרון"
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
+    assert sm._enabled_cities() == ("הרצליה", "רמת השרון")
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -86,11 +95,17 @@ def test_default_scan_area(monkeypatch):
     ("rishon", {"ראשון לציון", "נס ציונה", "באר יעקב", "בית דגן", "חולון", "בת ים"}),
 ])
 def test_meat_regions_env(monkeypatch, value, expected):
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
     monkeypatch.setenv("PW_MEAT_REGIONS", value)
-    assert sm._enabled_cities() == expected
+    assert set(sm._enabled_cities()) == expected
+    # the current name takes the same values and wins over the old one
+    monkeypatch.setenv("PW_MEAT_CITIES", value)
+    monkeypatch.setenv("PW_MEAT_REGIONS", "atlantis")
+    assert set(sm._enabled_cities()) == expected
 
 
 def test_meat_regions_all_and_sharon(monkeypatch):
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
     monkeypatch.setenv("PW_MEAT_REGIONS", "all")
     assert len(sm._enabled_cities()) == len(sm._CITY_ORDER)
     monkeypatch.setenv("PW_MEAT_REGIONS", "sharon")
@@ -98,18 +113,21 @@ def test_meat_regions_all_and_sharon(monkeypatch):
 
 
 def test_meat_regions_unknown_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
     monkeypatch.setenv("PW_MEAT_REGIONS", "atlantis")
-    assert sm._enabled_cities() == {"הרצליה", "רמת השרון"}
+    assert set(sm._enabled_cities()) == {"הרצליה", "רמת השרון"}
 
 
 def test_parse_stores_fixture_default_area(monkeypatch, fixtures_dir):
     monkeypatch.delenv("PW_MEAT_REGIONS", raising=False)
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
     raw = (fixtures_dir / "supermarkets" / "Stores-chain.xml").read_bytes()
     stores = {s.store_id: s.city for s in sm._parse_stores(raw)}
     assert stores == {31: "הרצליה", 32: "הרצליה", 33: "רמת השרון", 34: "רמת השרון"}
 
 
 def test_parse_stores_fixture_all_cities(monkeypatch, fixtures_dir):
+    monkeypatch.delenv("PW_MEAT_CITIES", raising=False)
     monkeypatch.setenv("PW_MEAT_REGIONS", "all")
     raw = (fixtures_dir / "supermarkets" / "Stores-chain.xml").read_bytes()
     stores = {s.store_id: s.city for s in sm._parse_stores(raw)}
