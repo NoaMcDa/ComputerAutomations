@@ -10,6 +10,7 @@ pages and merges them into one ranked list:
   חוליו            hulyo.co.il catalogue files
   טרווליסט         travelist.co.il flight-deal file
   טיסות סודיות     secretflights.co.il deal feed
+  הולידיי פיינדר   holidayfinder.co.il "secret deals" lists (offers feed)
 
 Every source is plain HTTP, runs independently, and a failing source never
 sinks the others. Prices are per person as each site states them.
@@ -20,9 +21,10 @@ South America, Africa, Oceania. Within a continent it ranks cheapest first,
 one deal per source and destination and at most `_MAX_PER_DESTINATION` rows
 for the same destination, and keeps:
 
-  Europe       departures today .. today + PW_DEALS_EUROPE_DAYS (50),
-               up to PW_DEALS_TOP deals (15)
-  elsewhere    departures today .. today + PW_DEALS_OTHER_DAYS (365),
+  Europe       departures today + PW_DEALS_LEAD_DAYS (2) ..
+               today + PW_DEALS_EUROPE_DAYS (50), up to PW_DEALS_TOP deals (15)
+  elsewhere    departures today + PW_DEALS_LEAD_DAYS (2) ..
+               today + PW_DEALS_OTHER_DAYS (365),
                PW_DEALS_OTHER_TOP deals per continent (4)
   Asia         its deals include the cheapest Japan and the cheapest
                Thailand deal whenever one exists in the window; a missing
@@ -37,8 +39,18 @@ Lastminute (lastminute.co.il) was dropped as a source on the owner's
 request: its packages carry no star rating and its reviews are poor.
 
 Secret Flights deals use their own window instead of the continent's:
-departures today .. today + PW_DEALS_SECRET_FLIGHTS_DAYS (90), since the
-site publishes deals 2-4 months ahead.
+departures today + PW_DEALS_LEAD_DAYS .. today + PW_DEALS_SECRET_FLIGHTS_DAYS
+(90), since the site publishes deals 2-4 months ahead.
+
+Trip rules, for packages and flights alike (owner's request):
+
+  length       PW_DEALS_MIN_NIGHTS (3) .. PW_DEALS_MAX_NIGHTS (5) nights,
+               inclusive (`VacationDeal.nights_or_computed`); a deal whose
+               length isn't known is left out. Dropped deals are counted in
+               `VacationReport.dropped_length`.
+  lead time    the first allowed departure is today + PW_DEALS_LEAD_DAYS (2),
+               i.e. at least 48 hours from now. Only the near end of each
+               window moves; the far end stays today + the window's days.
 
 Undated deals can't be placed in a window and are left out, as are deals
 whose destination can't be placed on a continent (logged and counted).
@@ -55,7 +67,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -152,6 +164,32 @@ def source_windows() -> dict[str, int]:
     return {s: _source_days(s) for s in _SOURCE_WINDOWS}
 
 
+def _lead_days() -> int:
+    """Days from today to the first allowed departure (PW_DEALS_LEAD_DAYS, default 2 = 48 hours)."""
+    return _env_int("PW_DEALS_LEAD_DAYS", 2, 0)
+
+
+def _first_departure(today: date) -> date:
+    """Earliest departure date a deal may have. Windows still end at today + their days."""
+    return today + timedelta(days=_lead_days())
+
+
+def _min_nights() -> int:
+    """Shortest trip kept, in nights (PW_DEALS_MIN_NIGHTS, default 3)."""
+    return _env_int("PW_DEALS_MIN_NIGHTS", 3, 1)
+
+
+def _max_nights() -> int:
+    """Longest trip kept, in nights (PW_DEALS_MAX_NIGHTS, default 5); never below the minimum."""
+    return _env_int("PW_DEALS_MAX_NIGHTS", 5, _min_nights())
+
+
+def _length_ok(d: "VacationDeal") -> bool:
+    """True when the trip is MIN..MAX nights long (inclusive). Unknown length -> False."""
+    nights = d.nights_or_computed
+    return nights is not None and _min_nights() <= nights <= _max_nights()
+
+
 def _continent_limit(continent: str) -> int:
     return _top_n() if continent == _continents.EUROPE else _other_top()
 
@@ -161,6 +199,12 @@ _ASIA_REQUIRED = ("JP", "TH")
 
 
 # ---- Data model ----
+
+# Luggage states of a deal (VacationDeal.luggage).
+LUGGAGE_SUITCASE = "suitcase"   # checked suitcase included (a carry-on may be too)
+LUGGAGE_CARRY_ON = "carry_on"   # only a carry-on / trolley included
+LUGGAGE_NONE = "none"           # the site says no luggage is included
+LUGGAGE_UNKNOWN = "unknown"     # the site doesn't say
 
 @dataclass
 class VacationDeal:
@@ -184,6 +228,18 @@ class VacationDeal:
 
     # Hotel star rating as the site states it (4, 4.5, 5…); None when not given (#52).
     stars: Optional[Decimal] = None
+
+    # Luggage as the site states it: LUGGAGE_SUITCASE / LUGGAGE_CARRY_ON /
+    # LUGGAGE_NONE, or LUGGAGE_UNKNOWN when the site doesn't say.
+    luggage: str = LUGGAGE_UNKNOWN
+    # Add-on price per person the site quotes when luggage is not included
+    # (e.g. "trolley $25 per leg"), as free text; "" when not given.
+    luggage_extra: str = ""
+
+    @property
+    def has_luggage(self) -> bool:
+        """True when at least a carry-on is included (a trolley is enough)."""
+        return self.luggage in (LUGGAGE_SUITCASE, LUGGAGE_CARRY_ON)
 
     @property
     def party_size(self) -> int:
@@ -244,6 +300,9 @@ class VacationReport:
 
     # Packages dropped because the hotel isn't a verified 3–5★ (#52).
     dropped_low_star: int = 0
+    # Deals dropped because the trip isn't PW_DEALS_MIN_NIGHTS..MAX_NIGHTS
+    # nights long (or its length isn't known).
+    dropped_length: int = 0
 
     @property
     def deals(self) -> list[VacationDeal]:
@@ -386,6 +445,35 @@ def _includes(*parts: object) -> list[str]:
     return out
 
 
+# Luggage states from least to most included; a trip gets what every leg has.
+_LUGGAGE_ORDER = (LUGGAGE_NONE, LUGGAGE_CARRY_ON, LUGGAGE_SUITCASE)
+
+
+def _leg_luggage(suitcase: Optional[bool], trolley: Optional[bool]) -> Optional[str]:
+    """Luggage state of one flight leg; None when the site leaves it open.
+
+    `suitcase` / `trolley`: True = included, False = not included, None = not stated.
+    """
+    if suitcase:
+        return LUGGAGE_SUITCASE
+    if suitcase is False:
+        if trolley:
+            return LUGGAGE_CARRY_ON
+        if trolley is False:
+            return LUGGAGE_NONE
+    return None
+
+
+def _trip_luggage(legs: list[Optional[str]]) -> str:
+    """Only what holds on every leg: a suitcase out but nothing back is LUGGAGE_NONE.
+
+    LUGGAGE_UNKNOWN when there are no legs or any leg is not stated.
+    """
+    if not legs or any(leg is None for leg in legs):
+        return LUGGAGE_UNKNOWN
+    return min(legs, key=_LUGGAGE_ORDER.index)
+
+
 def _abs_url(base: str, href: object) -> str:
     """Join + percent-encode (some sites put brackets / spaces / Hebrew in links)."""
     return quote(urljoin(base, str(href or "")), safe=":/?&=%#+,;@~")
@@ -398,6 +486,12 @@ def _client(**extra_headers: str) -> httpx.Client:
 
 
 # ---- Sources ----
+#
+# Luggage: only Flying Carpet (_flying_luggage), Hulyo (_hulyo_luggage) and
+# Holiday Finder (_hf_luggage) state it per deal in the data scanned here. Issta's cards and links,
+# Eshet's promotions, Gulliver's hot deals, Travelist and Secret Flights carry
+# no luggage field, so their deals stay LUGGAGE_UNKNOWN. (Eshet's page has a
+# general sale blurb about luggage, but nothing tied to a deal.)
 
 def _scan_issta() -> list[VacationDeal]:
     base = "https://www.issta.co.il"
@@ -486,6 +580,62 @@ def _scan_eshet() -> list[VacationDeal]:
     return out
 
 
+def _positive(value: object) -> Optional[bool]:
+    """'20' / 25 -> True, '0' / 0 -> False, missing or unreadable -> None."""
+    d = _dec(value)
+    return None if d is None else d > 0
+
+
+def _money(symbol: str, value: object) -> str:
+    return f"{symbol}{_dec(value)}"
+
+
+def _flying_luggage(deal: dict) -> tuple[str, str]:
+    """(luggage, luggage_extra) of a Flying Carpet package.
+
+    Each flight leg gives the most it allows (FL_Max_Weight = suitcase kg,
+    FL_Max_Weight_Trolley = trolley kg; "0" = none; the site's own page shows
+    the suitcase from FL_Max_Weight). `chargedBaggagePrices` holds, per
+    direction and per passenger, what the site charges to add a trolley
+    (carryOnBaggage) or a suitcase (checkinBaggage): a price there means that
+    item is not in the package. FL_Max_Weight_Hand (a small handbag) does not
+    count as a carry-on.
+    """
+    flights = (deal.get("roundTripFlight") or {}).get("FlightDetail") or []
+    charged = {bool(b.get("returningLeg")): b
+               for b in deal.get("chargedBaggagePrices") or [] if isinstance(b, dict)}
+    if flights:
+        # One-way = one leg; otherwise the first half goes out, the rest comes back.
+        legs = [(f, i >= (len(flights) + 1) // 2) for i, f in enumerate(flights)]
+    else:
+        legs = [({}, returning) for returning in sorted(charged)]
+    states = []
+    for flight, returning in legs:
+        bag = charged.get(returning) or {}
+        suitcase = False if _positive(bag.get("checkinBaggage")) else _positive(flight.get("FL_Max_Weight"))
+        trolley = False if _positive(bag.get("carryOnBaggage")) else _positive(flight.get("FL_Max_Weight_Trolley"))
+        states.append(_leg_luggage(suitcase, trolley))
+    luggage = _trip_luggage(states)
+    if luggage == LUGGAGE_SUITCASE:
+        return luggage, ""
+    symbol = _clean(deal.get("currenySymbol")) or "$"
+    per_leg = []
+    for returning in (False, True):
+        bag = charged.get(returning) or {}
+        per_leg.append(", ".join(x for x in (
+            f"טרולי {_money(symbol, bag['carryOnBaggage'])}" if _positive(bag.get("carryOnBaggage")) else "",
+            f"מזוודה {_money(symbol, bag['checkinBaggage'])}" if _positive(bag.get("checkinBaggage")) else "",
+        ) if x))
+    out_text, back_text = per_leg
+    if out_text == back_text:
+        extra = f"{out_text} לכיוון" if out_text else ""
+    else:
+        extra = " · ".join(x for x in (
+            f"הלוך: {out_text}" if out_text else "", f"חזור: {back_text}" if back_text else "",
+        ) if x)
+    return luggage, extra
+
+
 def _scan_flying_carpet() -> list[VacationDeal]:
     base = "https://www.flying.co.il"
     api = "https://apipck.flyingisr.com/api"
@@ -523,18 +673,11 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             transfers = f"העברות: {transfers}"
         elif "without transfers" in _he(d.get("subjectName")).lower():
             transfers = "ללא העברות"
-        bag = next((b for b in d.get("chargedBaggagePrices") or []
-                    if b.get("carryOnBaggage") or b.get("checkinBaggage")), None)
-        baggage = ""
-        if bag:
-            baggage = "כבודה בתוספת תשלום לכיוון: " + ", ".join(x for x in (
-                f"טרולי ${bag['carryOnBaggage']}" if bag.get("carryOnBaggage") else "",
-                f"מזוודה ${bag['checkinBaggage']}" if bag.get("checkinBaggage") else "",
-            ) if x)
+        luggage, luggage_extra = _flying_luggage(d)
         out.append(VacationDeal(
             source="השטיח המעופף", kind=KIND_PACKAGE, destination=destination, price=price,
             currency=_currency(d.get("currenySymbol")),
-            url=_abs_url(base, d.get("selectedPackageUrl")),
+            url=_flying_deal_url(base, d),
             country=_he(d.get("destinationCountryName")).title(),
             date_from=_date(d.get("departureDate")), date_to=_date(d.get("arrivalDate")),
             nights=d.get("nights") or None,
@@ -542,13 +685,40 @@ def _scan_flying_carpet() -> list[VacationDeal]:
             note=_clean(d.get("priceRemark")),
             includes=_includes(
                 _FLIGHT_INCLUDED, _hotel_line(hotel, stars), _he(d.get("boardBasisName")),
-                _he(d.get("roomTypeName")), transfers, baggage,
+                _he(d.get("roomTypeName")), transfers,
             ),
             adults=_int(d.get("adult")), children=_int(d.get("child")),
             total_price=_dec((d.get("discountedPrice") or {}).get("price")),
             stars=stars,
+            luggage=luggage, luggage_extra=luggage_extra,
         ))
     return out
+
+
+def _flying_deal_url(base: str, d: dict) -> str:
+    """Link to one Flying Carpet deal, in the format the site's own deal cards use.
+
+    The API's `selectedPackageUrl` (product-page?packId=…&laId=…) is an older
+    format: the site now opens it as an empty product page. The home page links
+    deals as product-page?packCateg=…&packageDates=from,to&hotelCode=…&packageIds=….
+    Falls back to the API's link when a needed field is missing.
+    """
+    first, last = _date(d.get("departureDate")), _date(d.get("arrivalDate"))
+    needed = (d.get("categoryId"), first, last, d.get("flightDestinationCode"),
+              d.get("hotelId"), d.get("packageId"), d.get("id"))
+    if not all(needed):
+        return _abs_url(base, d.get("selectedPackageUrl"))
+    params = {
+        "packCateg": d["categoryId"],
+        "packageDates": f"{first.isoformat()},{last.isoformat()}",
+        "hotelSupplier": "FlyingCarpet",
+        "flightDestCode": d["flightDestinationCode"],
+        "hotelCode": d["hotelId"],
+        "paxByRoom": f"{_int(d.get('adult')) or 2},{_int(d.get('child'))},{_int(d.get('infant'))}",
+        "packageIds": d["packageId"],
+        "dealId": d["id"],
+    }
+    return f"{base}/product-page?" + urlencode(params, safe=",")
 
 
 def _scan_gulliver() -> list[VacationDeal]:
@@ -602,17 +772,37 @@ def _scan_gulliver() -> list[VacationDeal]:
     return out
 
 
-def _hulyo_baggage(product: dict) -> str:
-    """'מזוודה לא כלולה · טרולי כלול' — only what holds on every flight leg."""
-    legs = [leg.get("baggageAllowance") or {} for leg in product.get("legRefs") or []]
-    parts = []
-    for key, label, suffix in (("baggage", "מזוודה", "ה"), ("trolley", "טרולי", "")):
-        values = {leg.get(key) for leg in legs}
-        if values == {"include"}:
-            parts.append(f"{label} כלול{suffix}")
-        elif values == {"notInclude"}:
-            parts.append(f"{label} לא כלול{suffix}")
-    return " · ".join(parts)
+_HULYO_INCLUDED = {"include": True, "notInclude": False}
+
+
+def _hulyo_luggage(product: dict) -> str:
+    """Luggage of a Hulyo product from each leg's baggageAllowance.
+
+    {"baggage": suitcase, "trolley": carry-on}, each "include" / "notInclude".
+    Only what holds on every leg counts (see _trip_luggage). Hulyo quotes no
+    add-on prices in this data, so there is no luggage_extra.
+    """
+    states = []
+    for leg in product.get("legRefs") or []:
+        allowance = leg.get("baggageAllowance") or {}
+        states.append(_leg_luggage(_HULYO_INCLUDED.get(allowance.get("baggage")),
+                                   _HULYO_INCLUDED.get(allowance.get("trolley"))))
+    return _trip_luggage(states)
+
+
+def _hulyo_deal_url(base: str, product_id: object, kind: str) -> str:
+    """Link to one Hulyo deal, as the site's own cards link it; home page without an id.
+
+    Packages: /product?id=…&category=packages. Round-trip flights:
+    /product?id=…&category=flights&subcategory=rt. Without `category` the
+    page stays empty.
+    """
+    pid = _clean(product_id)
+    if not pid:
+        return f"{base}/"
+    params = {"id": pid, "category": "packages"} if kind == KIND_PACKAGE else \
+        {"id": pid, "category": "flights", "subcategory": "rt"}
+    return f"{base}/product?" + urlencode(params)
 
 
 def _scan_hulyo() -> list[VacationDeal]:
@@ -643,7 +833,8 @@ def _scan_hulyo() -> list[VacationDeal]:
                 out.append(VacationDeal(
                     source="חוליו", kind=kind, destination=destination, price=price,
                     currency=_currency(selling.get("currency") or "USD"),
-                    url=f"{base}/", country=_clean(item.get("countryName")),
+                    url=_hulyo_deal_url(base, item.get("productId"), kind),
+                    country=_clean(item.get("countryName")),
                     date_from=_date(product.get("fromDate") or item.get("fromDate")),
                     date_to=_date(product.get("toDate")),
                     nights=product.get("nights") or base_product.get("nights") or None,
@@ -651,11 +842,12 @@ def _scan_hulyo() -> list[VacationDeal]:
                     note=board,
                     includes=_includes(
                         _FLIGHT_INCLUDED, _hotel_line(hotel.get("name"), hotel.get("rating")),
-                        board, room, _hulyo_baggage(product),
+                        board, room,
                     ) if kind == KIND_PACKAGE else [],
                     adults=pax.count("A") if kind == KIND_PACKAGE else 0,
                     children=pax.count("C") if kind == KIND_PACKAGE else 0,
                     stars=_stars(hotel.get("rating")) if kind == KIND_PACKAGE else None,
+                    luggage=_hulyo_luggage(product),
                 ))
     return out
 
@@ -709,6 +901,124 @@ def _scan_secret_flights() -> list[VacationDeal]:
     return out
 
 
+_HOLIDAY_FINDER = "הולידיי פיינדר"
+_HF_BOARDS = {
+    "RO": "לינה בלבד", "BB": "לינה וארוחת בוקר", "HB": "חצי פנסיון",
+    "FB": "פנסיון מלא", "AI": "הכל כלול",
+}
+
+
+def _hf_luggage(stickers: object) -> str:
+    """Luggage of a Holiday Finder offer from its stickers.
+
+    luggageIncluded = suitcase, carryOnTrolleyIncluded = trolley, both for
+    every passenger both ways (the deal page shows "טרולי כלול" or the trolley
+    add-on price to match). A missing flag means the deal doesn't say.
+    """
+    if not isinstance(stickers, dict):
+        return LUGGAGE_UNKNOWN
+    return _trip_luggage([_leg_luggage(stickers.get("luggageIncluded"),
+                                       stickers.get("carryOnTrolleyIncluded"))])
+
+
+def _hf_offer(item: dict, base: str) -> Optional[VacationDeal]:
+    """One Holiday Finder offer -> VacationDeal (None when price or destination is missing)."""
+    offer = item.get("offer") or {}
+    dest = item.get("destinationData") or {}
+    hotel = item.get("hotel") or {}
+    flight = item.get("flight") or {}
+    stickers = offer.get("stickers") or {}
+    total = _dec(offer.get("price"))  # whole package for the priced party
+    destination = _clean(dest.get("name"))
+    if total is None or not destination:
+        return None
+    capacity = offer.get("capacity") or {}
+    adults, children = _int(capacity.get("adult")), _int(capacity.get("child"))
+    party = adults + children
+    stars = _stars(hotel.get("rating"))
+    name = _clean(hotel.get("name"))
+    board = _HF_BOARDS.get(_clean(stickers.get("boardType")).upper(), "")
+    url = str(offer.get("packageDeeplinkUrl") or "")
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return VacationDeal(
+        source=_HOLIDAY_FINDER, kind=KIND_PACKAGE, destination=destination,
+        price=_dec(total / party) if party else total,
+        currency=_currency(offer.get("currency") or "USD"),
+        url=_abs_url(base, url) if url else f"{base}/in/the-secret-deals",
+        country=_clean(dest.get("atlas_top") or dest.get("atlas_top_en")),
+        date_from=_date(offer.get("outboundDate")), date_to=_date(offer.get("inboundDate")),
+        nights=_int(offer.get("duration")) or None,
+        hotel=name + (_star_label(stars) if name else ""),
+        note=" · ".join(x for x in (
+            board, "טיסה ישירה" if stickers.get("direct") else "", _clean(flight.get("company_name")),
+        ) if x),
+        includes=_includes(
+            _FLIGHT_INCLUDED, _hotel_line(name, stars), board, hotel.get("roomName"),
+        ),
+        adults=adults, children=children, total_price=total if party else None,
+        stars=stars, luggage=_hf_luggage(stickers),
+    )
+
+
+def _scan_holiday_finder() -> list[VacationDeal]:
+    """Holiday Finder's "secret deals" (holidayfinder.co.il/in/the-secret-deals).
+
+    The page reads its deal lists (offer ids) from partner-data, then prices
+    each list with an offers call for two adults from TLV, as the page does.
+    Lists are priced one call each: the server fails (500) on a call that
+    mixes ids from different lists. A failing list is skipped and logged; the
+    source fails only when every list does. The rest of the site is a date
+    search and isn't scanned.
+    """
+    base = "https://www.holidayfinder.co.il"
+    out: list[VacationDeal] = []
+    seen: set[str] = set()
+    with _client(Accept="application/json", Referer=f"{base}/in/the-secret-deals",
+                 Origin=base) as c:
+        lists = c.get(f"{base}/api/v-6/v6-release/partner-data",
+                      params={"name": "the-secret-deals"})
+        lists.raise_for_status()
+        payload = lists.json() or {}
+        if "lists" not in payload:
+            payload = payload.get("data") or {}
+        id_lists = [ids for ids in (
+            list(dict.fromkeys(i for i in lst.get("hfOfferIds") or [] if i))
+            for lst in payload.get("lists") or [] if isinstance(lst, dict)
+        ) if ids]
+        if not id_lists:
+            raise ValueError("no deal ids in the secret-deals lists")
+        last_error: Optional[Exception] = None
+        priced = 0
+        for ids in id_lists:
+            body = {"data": {
+                "locale": "he", "market": 4, "currency": "USD",
+                "limit": max(100, len(ids)), "offset": 0,
+                "hfOffers": [{"id": i, "offerId": i,
+                              "capacity": {"adult": 2, "child": 0, "childAges": [], "room": 1},
+                              "airports": ["TLV"], "filters": []} for i in ids],
+            }}
+            try:
+                r = c.post(f"{base}/api_no_auth/holiday_finder/offers/", json=body)
+                r.raise_for_status()
+                items = ((r.json() or {}).get("data") or {}).get("offers") or []
+            except (httpx.HTTPError, ValueError) as e:
+                log.warning("Holiday Finder: a deal list of %d ids failed: %s", len(ids), e)
+                last_error = e
+                continue
+            priced += 1
+            for item in items:
+                key = str(((item.get("offer") or {}).get("hfOfferId")) or id(item)) \
+                    if isinstance(item, dict) else ""
+                deal = _hf_offer(item, base) if key and key not in seen else None
+                if deal:
+                    seen.add(key)
+                    out.append(deal)
+    if not priced and last_error is not None:
+        raise last_error
+    return out
+
+
 _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
     ("איסתא", _scan_issta),
     ("אשת טורס", _scan_eshet),
@@ -717,6 +1027,7 @@ _SOURCES: tuple[tuple[str, Callable[[], list[VacationDeal]]], ...] = (
     ("חוליו", _scan_hulyo),
     ("טרווליסט", _scan_travelist),
     ("טיסות סודיות", _scan_secret_flights),
+    (_HOLIDAY_FINDER, _scan_holiday_finder),
 )
 
 
@@ -825,13 +1136,14 @@ def _select_asia(ranked: list[VacationDeal], limit: int) -> tuple[list[VacationD
 def _continent_groups(deals: list[VacationDeal], today: date) -> list[ContinentGroup]:
     """One kind's deals (continent already set) -> a group per continent, in order."""
     groups: list[ContinentGroup] = []
+    first = _first_departure(today)
     for continent in _continents.CONTINENT_ORDER:
         days = _continent_days(continent)
         limit = _continent_limit(continent)
         candidates = [
             d for d in deals
-            if d.continent == continent and d.date_from is not None
-            and today <= d.date_from <= today + timedelta(days=_deal_days(d, continent))
+            if d.continent == continent and d.date_from is not None and _length_ok(d)
+            and first <= d.date_from <= today + timedelta(days=_deal_days(d, continent))
         ]
         group = ContinentGroup(continent=continent, limit=limit, window_days=days)
         if continent == _continents.ASIA:
@@ -852,11 +1164,13 @@ def scan_and_report() -> VacationReport:
     # The longest continent or site window (each is already capped by PW_DEALS_DAYS).
     last_day = today + timedelta(days=max(
         _europe_days(), _other_days(), *source_windows().values()))
+    # Departures start PW_DEALS_LEAD_DAYS (48 hours) out; the far end is unchanged.
+    first_day = _first_departure(today)
     report = VacationReport(days_ahead=days)
 
     def _in_window(d: VacationDeal) -> bool:
         # Undated deals can't be placed in a window.
-        return d.date_from is not None and today <= d.date_from <= last_day
+        return d.date_from is not None and first_day <= d.date_from <= last_day
 
     def _one(source: tuple[str, Callable[[], list[VacationDeal]]]):
         name, fn = source
@@ -869,6 +1183,12 @@ def scan_and_report() -> VacationReport:
     with ThreadPoolExecutor(max_workers=len(_SOURCES)) as pool:
         for name, deals, error in pool.map(_one, _SOURCES):
             live = [d for d in deals if d.price > 0 and _in_window(d)]
+            sized = [d for d in live if _length_ok(d)]
+            if len(sized) < len(live):
+                log.info("Vacation scan: %s: dropped %d of %d deals (trip not %d-%d nights)",
+                         name, len(live) - len(sized), len(live), _min_nights(), _max_nights())
+                report.dropped_length += len(live) - len(sized)
+            live = sized
             kept = [d for d in live if _hotel_qualifies(d)]
             if len(kept) < len(live):
                 log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 3–5★)",

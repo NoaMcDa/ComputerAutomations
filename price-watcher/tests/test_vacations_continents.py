@@ -1,7 +1,8 @@
 """Vacation deals grouped by continent (issue #53).
 
-Europe: departures today..today+50, up to PW_DEALS_TOP deals.
-Other continents: departures today..today+365, PW_DEALS_OTHER_TOP (4) each.
+Europe: departures today+2..today+50, up to PW_DEALS_TOP deals.
+Other continents: departures today+2..today+365, PW_DEALS_OTHER_TOP (4) each.
+(The lead-time and 3-5 night rules have their own tests: test_vacations_trip_rules.py.)
 Asia: always includes Japan and Thailand when they exist in the window.
 """
 
@@ -22,7 +23,8 @@ TODAY = date.today()
 @pytest.fixture(autouse=True)
 def _clean_deal_env(monkeypatch):
     for var in ("PW_DEALS_DAYS", "PW_DEALS_TOP", "PW_DEALS_OTHER_TOP",
-                "PW_DEALS_EUROPE_DAYS", "PW_DEALS_OTHER_DAYS"):
+                "PW_DEALS_EUROPE_DAYS", "PW_DEALS_OTHER_DAYS",
+                "PW_DEALS_LEAD_DAYS", "PW_DEALS_MIN_NIGHTS", "PW_DEALS_MAX_NIGHTS"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -127,8 +129,9 @@ def test_europe_day_50_included_day_51_excluded(monkeypatch):
     assert europe.window_days == 50
 
 
-def test_europe_today_included_past_excluded(monkeypatch):
-    report = _scan(monkeypatch, [_deal("פראג", 0, 300), _deal("רומא", -1, 200)])
+def test_europe_first_allowed_day_included_past_excluded(monkeypatch):
+    # The window opens at today + PW_DEALS_LEAD_DAYS (2): departures 48 hours out.
+    report = _scan(monkeypatch, [_deal("פראג", 2, 300), _deal("רומא", -1, 200)])
     assert _dests(report.packages) == ["פראג"]
 
 
