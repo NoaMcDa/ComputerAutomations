@@ -93,6 +93,20 @@ When you `add` a URL, tracking parameters (`utm_*`, `gclid`, `fbclid`, `ref`, â€
 
 If a section's scan fails, the email says which one and why, and the subject line names the failed sections.
 
+### Daily report and vacation deals
+
+```
+python -m price_watcher digest [--dry-run] [--test]   # full daily report
+python -m price_watcher deals  [--dry-run] [--test]   # vacation deals only
+python -m price_watcher install-digest-schedule       # run `digest` daily at 09:00
+```
+
+The daily report (`digest`) goes to `PW_EMAIL_TO` and ends with a vacation-deals section: the cheapest packages and flights from Issta, Eshet Tours, Flying Carpet, Gulliver, Hulyo, Lastminute, Travelist and Secret Flights (`src/price_watcher/vacations.py`).
+
+Addresses in `PW_DEALS_EMAIL_TO` (comma-separated) get a separate email with **only** the vacation deals each time `digest` runs. They never get the rest of the report.
+
+`--test` is for trying things out: `digest --test` emails only `PW_EMAIL_TO` and saves nothing; `deals --test` sends the deals-only email to `PW_EMAIL_TO` instead of the deals-only recipients.
+
 ## Known limits
 
 - Checks only happen while the computer is on and awake. A closed laptop means no checks until it's opened again. On Windows the scheduled tasks are set to run on battery power as well.

@@ -458,6 +458,7 @@ class DailyReport:
     creatine: Optional["object"] = None     # CreatineReport
     sims4: Optional["object"] = None        # Sims4Report
     supermarkets: Optional["object"] = None # SupermarketReport
+    vacations: Optional["object"] = None    # VacationReport
 
 
 def collect_daily_report() -> DailyReport:
@@ -482,7 +483,18 @@ def collect_daily_report() -> DailyReport:
         report.supermarkets = _supermarkets.scan_and_report()
     except Exception as exc:
         log.error("Supermarket stage failed: %s: %s", type(exc).__name__, exc)
+    report.vacations = collect_vacations()
     return report
+
+
+def collect_vacations():
+    """Run the vacation-deal stage. Returns a VacationReport, or None on a crash."""
+    try:
+        from price_watcher import vacations as _vacations
+        return _vacations.scan_and_report()
+    except Exception as exc:
+        log.error("Vacation stage failed: %s: %s", type(exc).__name__, exc)
+        return None
 
 
 def _print_daily_report(report: DailyReport) -> None:
@@ -500,23 +512,50 @@ def _print_daily_report(report: DailyReport) -> None:
         console.print("\n[bold underline]Supermarket meat discounts[/bold underline]")
         from price_watcher import supermarkets as _sm
         _sm.print_report(report.supermarkets)
+    if report.vacations is not None:
+        console.print("\n[bold underline]Vacation deals[/bold underline]")
+        from price_watcher import vacations as _vac
+        _vac.print_report(report.vacations)
 
 
-def run_digest(dry_run: bool = False) -> int:
-    """Run the combined daily report: sales digest + creatine + sims4."""
-    log.info("Running daily report")
+def _deals_only_recipients(require_email: bool = True) -> tuple[str, ...]:
+    from price_watcher import config as _config
+    return _config.load(require_email=require_email).email.deals_email_to
+
+
+def run_digest(dry_run: bool = False, test: bool = False) -> int:
+    """Run the combined daily report and email it.
+
+    The full report goes to PW_EMAIL_TO. The vacation deals also go, as a
+    separate deals-only email, to PW_DEALS_EMAIL_TO. With `test=True` only
+    PW_EMAIL_TO is emailed and nothing is saved.
+    """
+    log.info("Running daily report%s", " (test: owner only)" if test else "")
     report = collect_daily_report()
     _print_daily_report(report)
 
     if dry_run:
-        from price_watcher.email_sender import build_daily_payload
+        from price_watcher.email_sender import build_daily_payload, build_deals_payload
         payload = build_daily_payload(report)
         if payload is not None:
             console.print(f"\n[bold]WOULD SEND EMAIL[/bold] — Subject: {payload.subject}")
+        deals_payload = build_deals_payload(report.vacations)
+        if deals_payload is not None:
+            console.print(
+                f"[bold]WOULD SEND DEALS-ONLY EMAIL[/bold] to "
+                f"{len(_deals_only_recipients(require_email=False))} extra recipient(s) — "
+                f"Subject: {deals_payload.subject}"
+            )
         return 0
 
-    from price_watcher.email_sender import send_daily_email
+    from price_watcher.email_sender import send_daily_email, send_deals_email
     sent = send_daily_email(report)
+    if test:
+        console.print("[yellow]Test run: deals-only recipients were not emailed.[/yellow]")
+        return 0 if sent else 1
+    # Independent of the main email: a failure there must not hold back the
+    # deals-only recipients.
+    send_deals_email(report.vacations, _deals_only_recipients())
     if sent:
         if report.creatine is not None:
             from price_watcher import creatine as _creatine
@@ -527,4 +566,46 @@ def run_digest(dry_run: bool = False) -> int:
         if report.supermarkets is not None:
             from price_watcher import supermarkets as _sm
             _sm.persist(report.supermarkets)
+    return 0 if sent else 1
+
+
+def run_deals(dry_run: bool = False, test: bool = False, days: Optional[int] = None) -> int:
+    """Scan vacation deals only and send the deals-only email.
+
+    Normal run: goes to PW_DEALS_EMAIL_TO. `test=True`: goes to PW_EMAIL_TO only.
+    `days` limits the scan to departures within that many days (overrides
+    PW_DEALS_DAYS for this run).
+    """
+    import os
+    if days is not None:
+        os.environ["PW_DEALS_DAYS"] = str(max(0, days))
+    from price_watcher import config as _config
+    from price_watcher import vacations as _vac
+    from price_watcher.email_sender import build_deals_payload, send_deals_email
+
+    report = collect_vacations()
+    if report is None:
+        console.print("[red]Vacation scan crashed — see the log.[/red]")
+        return 1
+    _vac.print_report(report)
+    payload = build_deals_payload(report)
+    if payload is None:
+        console.print("[yellow]No deals found — nothing to send.[/yellow]")
+        return 1
+    cfg = _config.load(require_email=not dry_run).email
+    recipients = (cfg.email_to,) if test else cfg.deals_email_to
+    if dry_run:
+        console.print(
+            f"\n[bold]WOULD SEND DEALS-ONLY EMAIL[/bold] to {len(recipients)} "
+            f"recipient(s) — Subject: {payload.subject}"
+        )
+        return 0
+    if not recipients:
+        console.print("[yellow]PW_DEALS_EMAIL_TO is empty — nothing sent.[/yellow]")
+        return 1
+    sent = send_deals_email(report, recipients)
+    console.print(
+        f"[green]Deals email sent to {len(recipients)} recipient(s).[/green]" if sent
+        else "[red]Deals email failed — see the log.[/red]"
+    )
     return 0 if sent else 1
