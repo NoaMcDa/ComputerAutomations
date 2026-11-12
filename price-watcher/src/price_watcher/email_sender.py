@@ -1623,6 +1623,10 @@ def _windows_summary(vac) -> str:
     if other is not None:
         parts.append(f"שאר היבשות: עד {other.limit} דילים לכל יבשת, "
                      f"יציאה ב-{other.window_days} הימים הקרובים")
+    if parts:
+        from price_watcher.vacations import source_windows
+        for site, days in source_windows().items():
+            parts.append(f"{site}: יציאה ב-{days} הימים הקרובים")
     return " · ".join(parts)
 
 
