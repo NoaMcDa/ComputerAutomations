@@ -298,6 +298,8 @@ def test_install_schedule_on_mac_writes_plist(monkeypatch, tmp_path):
     plist = tmp_path / "LaunchAgents" / "x.plist"
     monkeypatch.setattr(scheduler.sys, "platform", "darwin")
     monkeypatch.setattr(scheduler, "_PLIST_PATH", plist)
+    # Simulating macOS on any runner: Windows has no os.getuid.
+    monkeypatch.setattr(scheduler.os, "getuid", lambda: 501, raising=False)
     monkeypatch.setattr(scheduler.subprocess, "run",
                         lambda args, **kw: calls.append(args) or type("R", (), {"returncode": 0, "stderr": ""})())
     scheduler.install_schedule()
