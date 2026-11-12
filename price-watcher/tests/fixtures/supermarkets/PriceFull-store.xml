@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Root>
+  <ChainId>7290000000001</ChainId>
+  <StoreId>001</StoreId>
+  <Items Count="28">
+    <Item><ItemCode>101</ItemCode><ItemName>גרון הודו קפוא</ItemName><ItemPrice>15.00</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>102</ItemCode><ItemName>כנפיים הודו טרי</ItemName><ItemPrice>19.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>103</ItemCode><ItemName>גרון הודו טרי</ItemName><ItemPrice>29.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>104</ItemCode><ItemName>שוקיים הודו טרי</ItemName><ItemPrice>29.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>105</ItemCode><ItemName>חזה הודו טרי</ItemName><ItemPrice>39.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>106</ItemCode><ItemName>שישליק הודו טרי</ItemName><ItemPrice>39.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>107</ItemCode><ItemName>הודו אדום טרי</ItemName><ItemPrice>59.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>110</ItemCode><ItemName>כנפיים טרי</ItemName><ItemPrice>16.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>111</ItemCode><ItemName>כרעיים טרי ארוז</ItemName><ItemPrice>19.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>112</ItemCode><ItemName>שוקיים מחפוד טרי</ItemName><ItemPrice>24.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>120</ItemCode><ItemName>שייטל טרי</ItemName><ItemPrice>99.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>121</ItemCode><ItemName>רוסטביף</ItemName><ItemPrice>129.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>122</ItemCode><ItemName>דנבר טרי</ItemName><ItemPrice>199.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>130</ItemCode><ItemName>סטרצ'טלה 200 גרם</ItemName><ItemPrice>24.90</ItemPrice><UnitQty>גרמים</UnitQty><Quantity>200</Quantity><bIsWeighted>0</bIsWeighted></Item>
+    <Item><ItemCode>131</ItemCode><ItemName>לשון בקר קפואה</ItemName><ItemPrice>49.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>132</ItemCode><ItemName>לשון בקר טרייה</ItemName><ItemPrice>159.00</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>140</ItemCode><ItemName>חזה עוף טרי</ItemName><ItemPrice>39.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>141</ItemCode><ItemName>חזה עוף שקית</ItemName><ItemPrice>45.00</ItemPrice><UnitQty>ק"ג</UnitQty><Quantity>1</Quantity><bIsWeighted>0</bIsWeighted></Item>
+    <Item><ItemCode>142</ItemCode><ItemName>חזה עוף פרוס</ItemName><ItemPrice>24.90</ItemPrice><UnitQty>גרמים</UnitQty><Quantity>500</Quantity><bIsWeighted>0</bIsWeighted></Item>
+    <Item><ItemCode>143</ItemCode><ItemName>חזה עוף מועדון</ItemName><ItemPrice>39.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>144</ItemCode><ItemName>חזה עוף קופון</ItemName><ItemPrice>39.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>145</ItemCode><ItemName>חזה עוף מגש 700 גרם</ItemName><ItemPrice>29.90</ItemPrice><UnitQty>יחידה</UnitQty><Quantity>1</Quantity><bIsWeighted>0</bIsWeighted></Item>
+    <Item><ItemCode>150</ItemCode><ItemName>קצוות כנפיים עוף</ItemName><ItemPrice>14.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>160</ItemCode><ItemName>צלעות טלה</ItemName><ItemPrice>149.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>161</ItemCode><ItemName>צלעות בקר</ItemName><ItemPrice>69.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>162</ItemCode><ItemName>גרון עוף</ItemName><ItemPrice>9.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>163</ItemCode><ItemName>צוואר טלה</ItemName><ItemPrice>89.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+    <Item><ItemCode>200</ItemCode><ItemName>פילה סלמון</ItemName><ItemPrice>89.90</ItemPrice><UnitQty>קילוגרם</UnitQty><Quantity>1</Quantity><bIsWeighted>1</bIsWeighted></Item>
+  </Items>
+</Root>
