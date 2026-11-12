@@ -1,0 +1,54 @@
+{
+  "restaurant_name": "Afrit",
+  "date_range": {"start": "2026-11-12", "end": "2026-12-30"},
+  "days_filter": ["weekend"],
+  "weekend_days": ["friday", "saturday"],
+  "party_size": 2,
+  "mode": "notify_only",
+  "timezone": "Asia/Jerusalem",
+  "time_window": {
+    "start": "19:00",
+    "end": "22:30",
+    "query_times": ["19:30", "21:00"]
+  },
+  "time_window_overrides": {
+    "thursday": {"start": "20:00", "end": "22:30", "query_times": ["20:30"]}
+  },
+  "email_notifications": {
+    "frequency": "daily",
+    "suppress_empty": true,
+    "subject_prefix": "[Restaurant Orderer]"
+  },
+  "http": {
+    "min_interval_seconds": 2.5,
+    "jitter_seconds": 1.5,
+    "timeout_seconds": 20,
+    "max_retries": 3,
+    "backoff_seconds": 4,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "accept_language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7"
+  },
+  "platforms": {
+    "ontopo": {
+      "enabled": true,
+      "_unverified": "Endpoints and venue_slug were NOT verified against the live site (no network access during development). Confirm them in browser DevTools (see docs/research.md) and edit here; no code change is needed.",
+      "venue_slug": "",
+      "locale": "he",
+      "base_url": "https://ontopo.com",
+      "auth_endpoint": "/api/loginAnonymously",
+      "availability_endpoint": "/api/availability/searchAvailability",
+      "deep_link_template": "https://ontopo.com/he/il/page/{venue_slug}?date={date_compact}&time={time_compact}&size={party_size}"
+    },
+    "tabit": {
+      "enabled": true,
+      "_unverified": "Endpoints and organization_id were NOT verified against the live site (no network access during development). Confirm them in browser DevTools (see docs/research.md) and edit here; no code change is needed.",
+      "organization_id": "",
+      "base_url": "https://tgm-api.tabit.cloud",
+      "availability_endpoint": "/rsv/booking/temp-reservations",
+      "release_endpoint": "/rsv/booking/temp-reservations/{reservation_id}",
+      "preference": "",
+      "deep_link_template": "https://tabitisrael.co.il/online-reservations/create-reservation?step=search&orgId={organization_id}&date={date}&time={time}&seats={party_size}"
+    }
+  },
+  "state_dir": ".state"
+}
