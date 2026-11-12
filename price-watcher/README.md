@@ -51,6 +51,16 @@ python -m price_watcher status               # when was the last run, is the sch
 
 `--dry-run` runs the full pipeline but does not send email or write state; it prints what *would* have happened per link. Use it to sanity-check extraction against the real sites without noise.
 
+### Supermarket meat deals
+
+The daily email includes meat deals from the supermarkets' public price files (Israeli price-transparency law): Shufersal, the ten chains on url.publishedprices.co.il, and Bareket (ברקת).
+
+- **Area.** Only stores in **Herzliya and Ramat HaSharon** are scanned for now. To scan other cities set `PW_MEAT_REGIONS` in `.env`. It takes city or region names, e.g. `sharon,tel-aviv,rishon` for the previous scope, or `all`.
+- **Categories.** Each category is one cut of one animal (`חזה הודו`, `צלעות טלה`, `כנפיים עוף` …). Frozen items get their own table (`לשון בקר · קפוא`).
+- **Ranking.** Each category shows the `PW_MEAT_TOP_PER_CATEGORY` (default 5) cheapest deals by promo price **per kg**, with chain, store and end date. Items whose pack weight is unknown come after the per-kg rows. The catch-alls (`עוף – אחר`, `בשר – אחר`, `אחר`) mix unrelated cuts, so they are listed at the end without ranking.
+- **Bareket** is read from its Bina Projects portal. If that changes, set `PW_BAREKET_SOURCE` (`bina:<url>`, `publishedprices:<username>` or `off`).
+- `PW_TOP_PER_REGION` is no longer used.
+
 ## Known limits
 
 - Checks only happen while the computer is on and awake. A closed laptop means no checks until it's opened again.
