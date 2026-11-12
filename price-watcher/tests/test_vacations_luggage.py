@@ -249,3 +249,11 @@ def test_flying_deal_url_falls_back_when_fields_missing():
     d = {"selectedPackageUrl": "/product-page?packId=1&laId=2", "departureDate": "2026-11-16"}
     assert V._flying_deal_url("https://www.flying.co.il", d) == \
         "https://www.flying.co.il/product-page?packId=1&laId=2"
+
+
+def test_hulyo_deal_links():
+    base = "https://www.hulyo.co.il"
+    assert vac._hulyo_deal_url(base, "abc123", vac.KIND_PACKAGE) == f"{base}/product?id=abc123&category=packages"
+    assert vac._hulyo_deal_url(base, "abc123", vac.KIND_FLIGHT) == \
+        f"{base}/product?id=abc123&category=flights&subcategory=rt"
+    assert vac._hulyo_deal_url(base, None, vac.KIND_PACKAGE) == f"{base}/"

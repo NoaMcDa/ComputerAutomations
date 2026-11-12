@@ -790,6 +790,21 @@ def _hulyo_luggage(product: dict) -> str:
     return _trip_luggage(states)
 
 
+def _hulyo_deal_url(base: str, product_id: object, kind: str) -> str:
+    """Link to one Hulyo deal, as the site's own cards link it; home page without an id.
+
+    Packages: /product?id=…&category=packages. Round-trip flights:
+    /product?id=…&category=flights&subcategory=rt. Without `category` the
+    page stays empty.
+    """
+    pid = _clean(product_id)
+    if not pid:
+        return f"{base}/"
+    params = {"id": pid, "category": "packages"} if kind == KIND_PACKAGE else \
+        {"id": pid, "category": "flights", "subcategory": "rt"}
+    return f"{base}/product?" + urlencode(params)
+
+
 def _scan_hulyo() -> list[VacationDeal]:
     base = "https://www.hulyo.co.il"
     out: list[VacationDeal] = []
@@ -818,7 +833,8 @@ def _scan_hulyo() -> list[VacationDeal]:
                 out.append(VacationDeal(
                     source="חוליו", kind=kind, destination=destination, price=price,
                     currency=_currency(selling.get("currency") or "USD"),
-                    url=f"{base}/", country=_clean(item.get("countryName")),
+                    url=_hulyo_deal_url(base, item.get("productId"), kind),
+                    country=_clean(item.get("countryName")),
                     date_from=_date(product.get("fromDate") or item.get("fromDate")),
                     date_to=_date(product.get("toDate")),
                     nights=product.get("nights") or base_product.get("nights") or None,

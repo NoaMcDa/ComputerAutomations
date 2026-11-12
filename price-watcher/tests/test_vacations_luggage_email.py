@@ -69,3 +69,14 @@ def test_email_shows_luggage_and_no_value_note():
                               price=Decimal(90), url="https://example.invalid/f",
                               luggage=V.LUGGAGE_CARRY_ON)]
     assert "כבודה: טרולי כלול" in "".join(E._vacation_rows_html(flights, is_packages=False))
+
+
+def test_every_row_has_a_deal_button():
+    deals = [_pkg(150, 5, dest="רומא"), _pkg(160, 4, dest="אתונה")]
+    rows = E._vacation_rows_html(deals, is_packages=True)
+    for row in rows:
+        assert 'class="go" href="https://example.invalid/deal"' in row
+        assert E._DEAL_LINK_LABEL in row
+    assert f"background:{E._DEAL_BUTTON};color:#ffffff" in E._VAC_CSS
+    # Rows are no longer tinted by their marks; only zebra striping is left.
+    assert not any('class="r' in r for r in rows)

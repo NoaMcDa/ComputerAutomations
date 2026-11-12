@@ -1638,18 +1638,37 @@ def _unmapped_note(vac) -> str:
         f"{n} דילים ליעדים שלא זוהתה היבשת שלהם לא מוצגים")
 
 
-# Category marks on the deal tables: (label, badge colour, row tint, meaning).
-_BADGE_CHEAPEST = ("הכי זול לאדם", "#059669", "#ecfdf5", "המחיר הנמוך ביותר לאדם")
-_BADGE_VALUE = ("הכי משתלם", "#2563eb", "#eff6ff",
+# Category marks on the deal tables: (label, chip text colour, chip background, meaning).
+# Soft chips (dark text on a pale tint of the same hue); rows themselves are
+# not tinted, so a table with several marks stays calm and readable.
+_BADGE_CHEAPEST = ("הכי זול לאדם", "#065f46", "#d1fae5", "המחיר הנמוך ביותר לאדם")
+_BADGE_VALUE = ("הכי משתלם", "#1e3a8a", "#dbeafe",
                 "המחיר הנמוך ביותר לאדם ללילה מבין החבילות שכוללות כבודה (טרולי או מזוודה)")
-_BADGE_PACKAGE = ("החבילה הכי זולה", "#7c3aed", "#f5f3ff", "מחיר החבילה הכולל הנמוך ביותר")
-_BADGE_LONGEST = ("הכי ארוך", "#d97706", "#fffbeb", "הכי הרבה לילות")
-_BADGE_SHORTEST = ("הכי קצר", "#0891b2", "#ecfeff", "הכי מעט לילות")
+_BADGE_PACKAGE = ("החבילה הכי זולה", "#4c1d95", "#ede9fe", "מחיר החבילה הכולל הנמוך ביותר")
+_BADGE_LONGEST = ("הכי ארוך", "#78350f", "#fef3c7", "הכי הרבה לילות")
+_BADGE_SHORTEST = ("הכי קצר", "#134e4a", "#ccfbf1", "הכי מעט לילות")
 _BADGES = (_BADGE_CHEAPEST, _BADGE_VALUE, _BADGE_PACKAGE, _BADGE_LONGEST, _BADGE_SHORTEST)
 
 
 def _badge_class(badge) -> int:
     return _BADGES.index(badge)
+
+
+_DEAL_BUTTON = "#1d4ed8"
+_DEAL_LINK_LABEL = "לצפייה בדיל ←"
+
+
+def _deal_link_html(d) -> str:
+    """Site name, then a button linking to the deal.
+
+    Styled by `.vt a.go` only (rows carry no inline styles, to keep the daily
+    email under Gmail's clipping size); without the <style> block it is a
+    plain link.
+    """
+    return (
+        f'<small>{escape(d.source)}</small>'
+        f'<a class="go" href="{escape(d.url)}">{_DEAL_LINK_LABEL}</a>'
+    )
 
 
 # Styles of the vacation tables, in one <style> block in the email's <head>
@@ -1676,9 +1695,13 @@ _VAC_CSS = (
     ".vt td.h small{display:inline}"
     f".vt a{{color:{_COLOR_LINK};font-weight:600;text-decoration:none}}"
     f".vt tr.z{{background:{_COLOR_BG_SOFT}}}"
-    ".vk{display:inline-block;color:#fff;font-size:10px;font-weight:700;padding:2px 6px;"
-    "border-radius:4px;margin-top:3px;white-space:nowrap}"
-    + "".join(f".vk.k{i}{{background:{b[1]}}}.vt tr.r{i}{{background:{b[2]}}}"
+    # The deal link: a solid button, readable in light and dark mode.
+    f".vt a.go{{display:inline-block;margin-top:5px;padding:4px 10px;border-radius:6px;"
+    f"background:{_DEAL_BUTTON};color:#ffffff;font-size:11px;font-weight:700;"
+    "white-space:nowrap;text-decoration:none}"
+    ".vk{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;"
+    "border-radius:4px;margin-top:3px;white-space:nowrap;border:1px solid}"
+    + "".join(f".vk.k{i}{{color:{b[1]};background:{b[2]};border-color:{b[1]}}}"
               for i, b in enumerate(_BADGES))
 )
 
@@ -1942,8 +1965,7 @@ def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
     badges = _deal_badges(deals, is_packages)
     for i, d in enumerate(deals):
         row_badges = badges.get(i, [])
-        row_class = (f' class="r{_badge_class(row_badges[0])}"' if row_badges
-                     else (' class="z"' if i % 2 else ''))
+        row_class = ' class="z"' if i % 2 else ''
         nights = d.nights_or_computed
         details = _deal_details(d)
         marks = "".join(
@@ -1951,12 +1973,12 @@ def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
             for b in row_badges
         )
         per_night = _per_night(d) if is_packages else None
-        source_link = f'<a href="{escape(d.url)}">{escape(d.source)}</a>'
+        deal_link = _deal_link_html(d)
         cells = [
             f'<td class="n">{i + 1}</td>',
-            # Destination. Packages: site link underneath. Flights: details underneath.
+            # Destination. Packages: site + deal button underneath. Flights: details underneath.
             f'<td><b>{escape(_deal_where(d))}</b>'
-            + (f'<small>{source_link}</small>' if is_packages
+            + (f'<div>{deal_link}</div>' if is_packages
                else (f'<small>{escape(details[:90])}</small>' if details else ''))
             + marks + '</td>',
             # Dates
@@ -1970,7 +1992,7 @@ def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
                 + "<br>".join([f'• {escape(x[:80])}' for x in d.includes] + [luggage]) + '</td>'
             )
         else:
-            cells.append(f'<td class="s">{source_link}<small>{escape(_luggage_line(d))}</small></td>')
+            cells.append(f'<td class="s">{deal_link}<small>{escape(_luggage_line(d))}</small></td>')
         # Price per person
         cells.append(
             f'<td class="p">{_ltr(_deal_price(d))}'
