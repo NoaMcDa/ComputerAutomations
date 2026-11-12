@@ -140,10 +140,15 @@ Packages and flights are each split by continent, in this order: Europe, Asia, N
 
 | Continent | Departures | Deals shown |
 |---|---|---|
-| Europe | today to today + `PW_DEALS_EUROPE_DAYS` (50) | up to `PW_DEALS_TOP` (15) |
-| Every other continent | today to today + `PW_DEALS_OTHER_DAYS` (365) | `PW_DEALS_OTHER_TOP` (4) each |
+| Europe | today + 2 days to today + `PW_DEALS_EUROPE_DAYS` (50) | up to `PW_DEALS_TOP` (15) |
+| Every other continent | today + 2 days to today + `PW_DEALS_OTHER_DAYS` (365) | `PW_DEALS_OTHER_TOP` (4) each |
 
-Secret Flights deals use their own window, on any continent: today to today + `PW_DEALS_SECRET_FLIGHTS_DAYS` (90). The site publishes deals two to four months ahead, so the 50-day Europe window would drop all of them.
+Secret Flights deals use their own window, on any continent: today + 2 days to today + `PW_DEALS_SECRET_FLIGHTS_DAYS` (90). The site publishes deals two to four months ahead, so the 50-day Europe window would drop all of them.
+
+Two trip rules apply to packages and flights alike:
+
+- **Trip length:** only trips of `PW_DEALS_MIN_NIGHTS` (3) to `PW_DEALS_MAX_NIGHTS` (5) nights, inclusive. The length is the nights the site states, or else the days between departure and return. Deals whose length isn't known (e.g. a one-way flight) are left out. The per-site counts already exclude them.
+- **Lead time:** only departures at least 48 hours away: the first allowed departure is today + `PW_DEALS_LEAD_DAYS` (2) days. The far end of each window above stays as it is.
 
 - Asia's deals always include the cheapest Japan deal and the cheapest Thailand deal when one is on offer in the window. If there is none, the email says so in one line.
 - Georgia, Armenia, Azerbaijan, Cyprus and Turkey count as Europe. The UAE and Uzbekistan count as Asia. Egypt (Sinai included) counts as Africa.
