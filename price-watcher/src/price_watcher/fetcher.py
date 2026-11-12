@@ -36,14 +36,11 @@ from price_watcher import logging_setup
 from price_watcher import paths
 from price_watcher import sites
 from price_watcher.contracts import FetchResult, FetchStatus
+from price_watcher.http_headers import USER_AGENT
 
 log = logging_setup.get(__name__)
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+_USER_AGENT = USER_AGENT
 
 _DEFAULT_HEADERS = {
     "User-Agent": _USER_AGENT,
@@ -142,12 +139,12 @@ def _fetch(
             error_message=error_msg,
         )
 
-    if http_status == 404:
+    if http_status in (404, 410):
         return FetchResult(
             status=FetchStatus.NOT_FOUND,
             final_url=final_url,
             http_status=http_status,
-            error_message="404 Not Found",
+            error_message=f"HTTP {http_status}: page moved or removed",
         )
 
     html = response.text
@@ -181,7 +178,7 @@ def _fetch(
     raw_path = _save_raw(url, html)
 
     # --- Extraction ladder ---
-    result = _extract(html, url, final_url, selector, http_status, raw_path, response)
+    result = _extract(html, url, final_url, selector, http_status, raw_path)
 
     # --- Playwright fallback ---
     if use_browser_fallback and result.status == FetchStatus.PRICE_NOT_FOUND:
@@ -330,18 +327,26 @@ def _extract(
     selector: Optional[str],
     http_status: Optional[int],
     raw_path: Optional[str],
-    response: Optional[httpx.Response],
+    *,
+    include_shopify: bool = True,
 ) -> FetchResult:
-    """Run the extraction ladder and return a FetchResult."""
+    """Run the extraction ladder and return a FetchResult.
+
+    ``include_shopify=False`` skips step 1 (the Playwright fallback only
+    re-reads rendered HTML). A step may return a non-OK result (NOT_FOUND
+    for a pinned variant that is gone); that ends the ladder, so a later
+    step never substitutes another variant's price.
+    """
     soup = BeautifulSoup(html, "html.parser")
     title = _extract_title(soup)
 
     # 1. Shopify product JSON
-    result = _try_shopify(url, final_url, title, http_status, raw_path)
-    if result is not None:
-        if result.currency is None:
-            result = dataclasses.replace(result, currency=_currency_from_html(soup))
-        return result
+    if include_shopify:
+        result = _try_shopify(url, final_url, title, http_status, raw_path)
+        if result is not None:
+            if result.currency is None:
+                result = dataclasses.replace(result, currency=_currency_from_html(soup))
+            return result
 
     # 2. JSON-LD
     result = _try_jsonld(html, url, final_url, title, http_status, raw_path)
@@ -381,33 +386,9 @@ def _extract_from_html(
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> FetchResult:
-    """Like _extract but without Shopify step (used in Playwright fallback)."""
-    soup = BeautifulSoup(html, "html.parser")
-    title = _extract_title(soup)
-
-    result = _try_jsonld(html, url, final_url, title, http_status, raw_path)
-    if result is not None:
-        return result
-
-    result = _try_meta(soup, final_url, title, http_status, raw_path)
-    if result is not None:
-        return result
-
-    result = _try_microdata(html, url, final_url, title, http_status, raw_path)
-    if result is not None:
-        return result
-
-    if selector:
-        result = _try_selector(soup, selector, final_url, title, http_status, raw_path)
-        if result is not None:
-            return result
-
-    return FetchResult(
-        status=FetchStatus.PRICE_NOT_FOUND,
-        final_url=final_url,
-        title=title,
-        http_status=http_status,
-        raw_html_path=raw_path,
+    """The ladder without the Shopify step (used in the Playwright fallback)."""
+    return _extract(
+        html, url, final_url, selector, http_status, raw_path, include_shopify=False
     )
 
 
@@ -549,6 +530,17 @@ def _try_shopify(
     except InvalidOperation:
         return None
 
+    # The struck-through "compare at" price, when above the price charged.
+    regular_price: Optional[Decimal] = None
+    compare_at = variant.get("compare_at_price")
+    if compare_at is not None and not isinstance(compare_at, bool):
+        try:
+            compare = Decimal(str(compare_at)) / Decimal("100")
+        except InvalidOperation:
+            compare = None
+        if compare is not None and compare > price:
+            regular_price = compare
+
     currency = data.get("currency") or variant.get("currency")
     prod_title = data.get("title") or title
     available = variant.get("available")
@@ -560,6 +552,7 @@ def _try_shopify(
         title=prod_title,
         price=price,
         currency=currency,
+        regular_price=regular_price,
         in_stock=in_stock,
         http_status=http_status,
         raw_html_path=raw_path,
@@ -610,7 +603,7 @@ def _try_jsonld(
         )
     pool = matching or candidates
     best = min(pool, key=lambda c: c[0])  # min() keeps the first of equal prices
-    price, currency, availability, product, group = best
+    price, currency, availability, product, group, _offer = best
 
     in_stock: Optional[bool] = None
     if "OutOfStock" in availability or "SoldOut" in availability:
@@ -646,8 +639,9 @@ def _as_list(value: object) -> list:
     return value if isinstance(value, list) else [value]
 
 
-# (price, currency, availability, product node, product-group node or None)
-_JsonLdCandidate = tuple[Decimal, Optional[str], str, dict, Optional[dict]]
+# (price, currency, availability, product node, product-group node or None,
+#  the offer node the price came from)
+_JsonLdCandidate = tuple[Decimal, Optional[str], str, dict, Optional[dict], dict]
 
 
 def _jsonld_candidates(items: list) -> list[_JsonLdCandidate]:
@@ -701,6 +695,7 @@ def _jsonld_candidates(items: list) -> list[_JsonLdCandidate]:
                         availability if isinstance(availability, str) else "",
                         product,
                         group,
+                        offer,
                     ))
             # AggregateOffer may carry the individual offers as well
             if "offers" in offer:
@@ -748,8 +743,10 @@ def _jsonld_exposes_variant_ids(candidates: list[_JsonLdCandidate]) -> bool:
 
 
 def _jsonld_matches(candidate: _JsonLdCandidate, wanted: set[str]) -> bool:
-    _, _, _, product, _ = candidate
-    for node in (product, *[o for o in _as_list(product.get("offers")) if isinstance(o, dict)]):
+    # Only the candidate's own offer counts, not its sibling offers: one
+    # Product may list one offer per variant, each with its own ``url``.
+    _, _, _, product, _, offer = candidate
+    for node in (product, offer):
         for key in ("sku", "productID", "@id"):
             value = node.get(key)
             if isinstance(value, (str, int)) and str(value) in wanted:
@@ -796,6 +793,7 @@ def _try_meta(
         return None
 
     currency = _meta("product:price:currency") or _meta("og:price:currency") or detected_currency
+    in_stock = _availability_from_text(_meta("product:availability") or _meta("og:availability"))
 
     return FetchResult(
         status=FetchStatus.OK,
@@ -803,9 +801,27 @@ def _try_meta(
         title=title,
         price=price,
         currency=currency,
+        in_stock=in_stock,
         http_status=http_status,
         raw_html_path=raw_path,
     )
+
+
+def _availability_from_text(value: object) -> Optional[bool]:
+    """In-stock flag from a meta / microdata availability value.
+
+    Accepts schema.org URLs ("https://schema.org/InStock") and the free-text
+    forms shops put in ``product:availability`` ("in stock", "out of stock",
+    "oos", "preorder"). None when it says neither.
+    """
+    text = str(value or "").lower().replace(" ", "").replace("_", "").replace("-", "")
+    if not text:
+        return None
+    if any(k in text for k in ("outofstock", "soldout", "discontinued", "oos")):
+        return False
+    if any(k in text for k in ("instock", "limitedavailability", "onlineonly", "instoreonly", "preorder")):
+        return True
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -828,41 +844,71 @@ def _try_microdata(
 
     items = data.get("microdata", [])
 
-    def _walk(node: object) -> Optional[str]:
+    # Prices inside <del>/<s>/<strike> (or a line-through style) are the old,
+    # regular price, not the price charged.
+    struck_values: set[str] = set()
+    for el in BeautifulSoup(html, "html.parser").find_all(attrs={"itemprop": "price"}):
+        if _inside_struck_markup(el):
+            raw = el.get("content") or el.get_text(" ", strip=True)
+            if raw:
+                struck_values.add(str(raw).strip())
+
+    def _walk(node: object) -> Optional[dict]:
+        """Properties of the first node that carries a ``price``."""
+        if isinstance(node, list):
+            for child in node:
+                found = _walk(child)
+                if found:
+                    return found
+            return None
         if isinstance(node, dict):
             props = node.get("properties", {})
-            # Direct price property
-            price_val = props.get("price")
-            if price_val:
-                if isinstance(price_val, list) and price_val:
-                    return str(price_val[0])
-                if isinstance(price_val, str):
-                    return price_val
-            # Recurse
+            if not isinstance(props, dict):
+                return None
+            if props.get("price"):
+                return props
+            # Recurse (an Offer nested in a Product may be a dict or a list)
             for v in props.values():
-                if isinstance(v, list):
-                    for child in v:
-                        found = _walk(child)
-                        if found:
-                            return found
+                found = _walk(v)
+                if found:
+                    return found
         return None
 
     for item in items:
-        raw_price = _walk(item)
-        if raw_price:
+        props = _walk(item)
+        if not props:
+            continue
+        raw_prices = [str(v).strip() for v in _as_list(props.get("price")) if isinstance(v, (str, int, float))]
+        current = [v for v in raw_prices if v not in struck_values]
+        for raw_price in (current or raw_prices)[:1]:
             try:
                 price, currency = _parse_price(raw_price)
-                return FetchResult(
-                    status=FetchStatus.OK,
-                    final_url=final_url,
-                    title=title,
-                    price=price,
-                    currency=currency,
-                    http_status=http_status,
-                    raw_html_path=raw_path,
-                )
             except Exception:
                 continue
+            regular: Optional[Decimal] = None
+            for raw_struck in raw_prices:
+                if raw_struck not in struck_values:
+                    continue
+                try:
+                    old, _ = _parse_price(raw_struck)
+                except Exception:
+                    continue
+                if old > price and (regular is None or old > regular):
+                    regular = old
+            item_currency = props.get("priceCurrency")
+            if isinstance(item_currency, str) and item_currency.strip():
+                currency = item_currency.strip().upper()
+            return FetchResult(
+                status=FetchStatus.OK,
+                final_url=final_url,
+                title=title,
+                price=price,
+                currency=currency,
+                regular_price=regular,
+                in_stock=_availability_from_text(props.get("availability")),
+                http_status=http_status,
+                raw_html_path=raw_path,
+            )
 
     return None
 
@@ -879,7 +925,11 @@ def _try_selector(
     http_status: Optional[int],
     raw_path: Optional[str],
 ) -> Optional[FetchResult]:
-    el = soup.select_one(selector)
+    try:
+        el = soup.select_one(selector)
+    except Exception as exc:  # invalid selector syntax
+        log.warning("Invalid CSS selector %r: %s", selector, exc)
+        return None
     if el is None:
         return None
     text = _price_text_from_element(el)
@@ -887,20 +937,68 @@ def _try_selector(
         return None
     try:
         price, currency = _parse_price(text)
-        return FetchResult(
-            status=FetchStatus.OK,
-            final_url=final_url,
-            title=title,
-            price=price,
-            currency=currency,
-            http_status=http_status,
-            raw_html_path=raw_path,
-        )
     except Exception:
         return None
+    # The struck-through part of a sale element is the regular price.
+    regular: Optional[Decimal] = None
+    for old_text in _struck_texts(el):
+        try:
+            old, _ = _parse_price(old_text)
+        except Exception:
+            continue
+        if old > price and (regular is None or old > regular):
+            regular = old
+    return FetchResult(
+        status=FetchStatus.OK,
+        final_url=final_url,
+        title=title,
+        price=price,
+        currency=currency,
+        regular_price=regular,
+        http_status=http_status,
+        raw_html_path=raw_path,
+    )
 
 
 _STRUCK_TAGS = ("del", "s", "strike")
+
+
+def _is_struck_tag(tag) -> bool:
+    """A <del>/<s>/<strike> tag, or one styled ``text-decoration: line-through``."""
+    if getattr(tag, "name", None) in _STRUCK_TAGS:
+        return True
+    style = tag.get("style") if hasattr(tag, "get") else None
+    return bool(style) and "line-through" in str(style).replace(" ", "").lower()
+
+
+def _inside_struck_markup(el) -> bool:
+    """True if *el* or one of its ancestors is struck through."""
+    node = el
+    while node is not None and getattr(node, "name", None) not in (None, "[document]"):
+        if _is_struck_tag(node):
+            return True
+        node = node.parent
+    return False
+
+
+def _struck_texts(el) -> list[str]:
+    """Texts of the outermost struck-through parts inside *el* (old prices)."""
+    if _is_struck_tag(el):
+        return []
+    out: list[str] = []
+    for tag in el.find_all(_is_struck_tag):
+        parent, nested = tag.parent, False
+        while parent is not None and parent is not el:
+            if _is_struck_tag(parent):
+                nested = True  # inside another struck part already counted
+                break
+            parent = parent.parent
+        if nested:
+            continue
+        text = tag.get_text(strip=True)
+        if text:
+            out.append(text)
+    return out
 
 
 def _price_text_from_element(el) -> str:
@@ -909,19 +1007,20 @@ def _price_text_from_element(el) -> str:
     A sale element often holds the old price too
     (``<del>₪129.90</del> <ins>₪99.90</ins>``): the text inside ``<ins>`` is
     used when present, otherwise the text outside ``<del>`` / ``<s>`` /
-    ``<strike>``; the whole text only if that leaves nothing. Whatever is
+    ``<strike>`` (or a ``line-through`` style); the whole text only if that
+    leaves nothing. Whatever is
     left still goes through _parse_price's several-prices rules.
     """
     def _struck(node) -> bool:  # inside a struck-through tag below *el*?
         for parent in node.parents:
             if parent is el:
                 return False
-            if parent.name in _STRUCK_TAGS:
+            if _is_struck_tag(parent):
                 return True
         return False
 
     whole = el.get_text(strip=True)
-    if el.name in _STRUCK_TAGS:
+    if _is_struck_tag(el):
         return whole
     ins = [t for t in el.find_all("ins") if not _struck(t)]
     ins_text = "".join(t.get_text(strip=True) for t in ins)
@@ -968,7 +1067,6 @@ def _playwright_fallback(
                 final_url = page.url
             except PlaywrightError as exc:
                 log.warning("Playwright navigation failed for %s: %s", url, exc)
-                browser.close()
                 return prior_result
             finally:
                 browser.close()
@@ -976,8 +1074,8 @@ def _playwright_fallback(
         # Save rendered HTML too
         raw_path = _save_raw(url + "#playwright", html)
 
-        result = _extract_from_html(
-            html, url, final_url, selector, http_status, raw_path
+        result = _extract(
+            html, url, final_url, selector, http_status, raw_path, include_shopify=False
         )
 
         # Carry over in-stock info from prior if still missing
@@ -1093,8 +1191,17 @@ def _parse_price(text: str, *, machine_readable: bool = False) -> tuple[Decimal,
 
     if len(numbers) > 1:
         for a, b in zip(numbers, numbers[1:]):
-            gap = re.sub(r"[\s" + _CURRENCY_MARK + r"]", "", text[a.end():b.start()]).lower()
-            if gap in _RANGE_GAPS:
+            raw_gap = text[a.end():b.start()]
+            gap = re.sub(r"[\s" + _CURRENCY_MARK + r"]", "", raw_gap).lower()
+            # "Pack of 2 – ₪49.90": a bare count, then a dash, then a price
+            # with its own currency is not a range ("₪100 - ₪200" / "100 -
+            # 200 ₪" / "100 ₪ - 200 ₪" still are).
+            count_then_price = (
+                raw_gap.rstrip().endswith(_CURRENCY_MARK)
+                and not text[:a.start()].rstrip().endswith(_CURRENCY_MARK)
+                and not raw_gap.lstrip().startswith(_CURRENCY_MARK)
+            )
+            if gap in _RANGE_GAPS and not count_then_price:
                 raise ValueError(f"Price range, not one price: {text!r}")
 
         def _next_to_currency(m: re.Match) -> bool:

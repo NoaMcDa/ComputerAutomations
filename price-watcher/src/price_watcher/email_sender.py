@@ -5,6 +5,7 @@ Public API
 send_change_notification(events)  -> bool
 send_test_email()                 -> None   (raises on failure)
 build_payload(events)             -> EmailPayload | None
+describe_failure(fetch)           -> dict   (status / detail / hint, Hebrew)
 """
 
 from __future__ import annotations
@@ -16,19 +17,20 @@ from html import escape
 from urllib.parse import urlparse
 
 from price_watcher import config as _config_module
-from price_watcher.contracts import ChangeEvent, ChangeType, EmailPayload, PromoInfo
+from price_watcher.contracts import (
+    NOTIFIABLE_TYPES,
+    ChangeEvent,
+    ChangeType,
+    EmailPayload,
+    FetchStatus,
+    PromoInfo,
+)
 from price_watcher.logging_setup import get as _get_logger
 
 log = _get_logger(__name__)
 
 # Change types that warrant an email.
-_NOTIFIABLE = {
-    ChangeType.PRICE_CHANGED,
-    ChangeType.STOCK_CHANGED,
-    ChangeType.PROMO_CHANGED,
-    ChangeType.THRESHOLD_FAILURE,
-    ChangeType.RECOVERED,
-}
+_NOTIFIABLE = NOTIFIABLE_TYPES
 
 # Well-known currency symbols.
 _CURRENCY_SYMBOLS: dict[str, str] = {
@@ -98,6 +100,7 @@ _STATUS_HE = {
     "blocked": "האתר חסם את הבקשה",
     "fetch_failed": "האחזור נכשל",
     "no_powder": "לא נמצאה אבקת קריאטין",
+    "parse_failed": "פענוח העמוד נכשל",
     "unavailable": "לא זמין",
     "not_found": "הדף לא נמצא",
     "price_not_found": "לא נמצא מחיר בדף",
@@ -140,6 +143,63 @@ def failure_detail_he(fetch: "FetchResult") -> str:
     return f"{base} ({msg})" if msg else base
 
 
+def _failure_hint_he(fetch: "FetchResult") -> str | None:
+    """What the user can do about a failing watch (None if nothing specific)."""
+    msg = (fetch.error_message or "").lower()
+    if fetch.status == FetchStatus.NOT_FOUND and "variant" in msg:
+        return (
+            "המידה / הצבע שבקישור כבר לא קיימים במוצר. יש להסיר את המעקב "
+            "ולהוסיף אותו מחדש עם קישור לווריאנט קיים "
+            "(price-watcher remove ואז price-watcher add)."
+        )
+    if fetch.status == FetchStatus.NOT_FOUND:
+        return (
+            "ייתכן שהמוצר הוסר מהאתר או שהקישור השתנה. בדקו את הקישור בדפדפן; "
+            "אם המוצר עבר לכתובת חדשה, הסירו את המעקב והוסיפו את הכתובת החדשה."
+        )
+    if fetch.status == FetchStatus.BLOCKED:
+        return (
+            "האתר חוסם בקשות אוטומטיות (הגנה מבוטים). לרוב זה חולף מעצמו; "
+            "אם זה נמשך ימים, נסו להוסיף את המעקב מחדש עם \u200e--selector\u200e."
+        )
+    if fetch.status == FetchStatus.PRICE_NOT_FOUND or (
+        fetch.status == FetchStatus.OK and fetch.price is not None and fetch.price == 0
+    ):
+        return (
+            "הדף נטען אבל המחיר לא זוהה (או שזוהה מחיר 0). אם עיצוב הדף השתנה, "
+            "הוסיפו את המעקב מחדש עם \u200e--selector\u200e שמצביע על המחיר."
+        )
+    if fetch.status == FetchStatus.UNREACHABLE:
+        return "האתר לא ענה. בדקו את החיבור לאינטרנט ושהאתר עולה בדפדפן."
+    return None
+
+
+def describe_failure(fetch: "FetchResult") -> dict:
+    """Explain why a fetch failed, in Hebrew, with what the user can do.
+
+    Returns {"status", "status_he", "http_status", "error_message",
+    "detail", "hint"}; ``detail`` is failure_detail_he() (None when the
+    fetch did not fail).
+    """
+    status = fetch.status.value
+    detail = failure_detail_he(fetch)
+    return {
+        "status": status,
+        "status_he": _status_he(status),
+        "http_status": fetch.http_status,
+        "error_message": fetch.error_message,
+        "detail": detail or None,
+        "hint": _failure_hint_he(fetch) if detail else None,
+    }
+
+
+def _failure_subject_he(fetch: "FetchResult") -> str:
+    """Short reason for a failure-alert subject line."""
+    if fetch.status == FetchStatus.OK and fetch.price is not None and fetch.price == 0:
+        return "המחיר הוצג כ-0"
+    return _status_he(fetch.status.value)
+
+
 def _stock_he(in_stock: bool | None) -> str:
     return "חזר למלאי" if in_stock else "אזל מהמלאי"
 
@@ -159,6 +219,67 @@ def _promo_details(promo: PromoInfo) -> str:
     if promo.code:
         return f"קוד: {promo.code}  ({promo.discount_pct}% הנחה)"
     return f"הנחה: {promo.discount_pct}%"
+
+
+def _promo_computable(promo: PromoInfo | None) -> bool:
+    """A promo with a usable percentage (not tiered "up to", not unreadable)."""
+    return promo is not None and promo.discount_pct > 0
+
+
+def _promo_desc(promo: PromoInfo) -> str:
+    pct = f"{promo.discount_pct}%"
+    if promo.code:
+        return f"הקוד {promo.code} ({pct})"
+    return f"הנחה אוטומטית ({pct})"
+
+
+def _promo_heading(event: ChangeEvent) -> str:
+    """Heading of a PROMO_CHANGED email: ended / new / changed."""
+    if event.fetch.promo is None:
+        return "המבצע הסתיים"
+    if event.old_promo is None:
+        return "מבצע חדש"
+    return "המבצע השתנה"
+
+
+def _promo_notes(event: ChangeEvent, sym: str) -> list[tuple[str, str]]:
+    """(label, text) rows saying what the promotion means for this event.
+
+    - item excluded from promotions: only the displayed price is shown;
+    - a tiered / unreadable banner: no estimate, displayed price only;
+    - a promotion change: the displayed price did not change;
+    - a price change with a readable promotion: whether the promotion
+      changed too, and the estimated final price (always marked as such).
+    """
+    fetch = event.fetch
+    promo = fetch.promo
+    if event.type not in (ChangeType.PRICE_CHANGED, ChangeType.STOCK_CHANGED,
+                          ChangeType.PROMO_CHANGED, ChangeType.RECOVERED):
+        return []
+    if event.watch.excluded_from_promo:
+        return [("מבצעים", "הפריט מסומן כמוחרג ממבצעי האתר — מוצג המחיר המוצג בלבד")]
+    if promo is not None and not _promo_computable(promo):
+        return [(
+            "מבצע",
+            "באנר המבצע לא נקרא במלואו או שהמבצע מדורג ('עד X%') — "
+            "לא ניתן להעריך מחיר סופי; מוצג המחיר המוצג בלבד",
+        )]
+    if event.type == ChangeType.PROMO_CHANGED:
+        return [("מה השתנה", "המבצע (המחיר המוצג לא השתנה)")]
+    if event.type != ChangeType.PRICE_CHANGED or not _promo_computable(promo):
+        return []
+    rows = [(
+        "מה השתנה",
+        "המחיר המוצג וגם המבצע" if event.promo_changed else "המחיר המוצג (המבצע לא השתנה)",
+    )]
+    est = fetch.estimated_final_price
+    if est is not None:
+        old = event.old_estimated_price
+        if old is not None and old != est:
+            rows.append(("מחיר סופי משוער", f"{_fmt_price(old, sym)} → {_fmt_price(est, sym)} (הערכה)"))
+        else:
+            rows.append(("מחיר סופי משוער", f"{_fmt_price(est, sym)} (הערכה)"))
+    return rows
 
 
 def _old_symbol(event: ChangeEvent, sym: str) -> str:
@@ -207,10 +328,18 @@ def _subject_single(event: ChangeEvent) -> str:
         return f"עדכון מלאי: {label} – {_stock_he(event.fetch.in_stock)}{extras}"
 
     if event.type == ChangeType.PROMO_CHANGED:
-        return f"{_promo_word(event)}: {label}"
+        promo = event.fetch.promo
+        est = event.fetch.estimated_final_price
+        if _promo_computable(promo) and est is not None and not event.watch.excluded_from_promo:
+            (amount,) = _subject_amounts(est)
+            return (
+                f"{_promo_heading(event)}: {label} – בערך {_with_sym(amount, sym)} "
+                f"עם {_promo_desc(promo)}"
+            )
+        return f"{_promo_heading(event)}: {label}"
 
     if event.type == ChangeType.THRESHOLD_FAILURE:
-        return f"המעקב הפסיק לעבוד: {label}"
+        return f"המעקב הפסיק לעבוד: {label} – {_failure_subject_he(event.fetch)}"
 
     if event.type == ChangeType.RECOVERED:
         if event.old_price is not None or event.new_price is not None:
@@ -275,10 +404,13 @@ def _text_event(event: ChangeEvent) -> str:
             out += promo_lines()
         return out
 
+    notes = [f"  {key}: {val}" for key, val in _promo_notes(event, sym)]
+
     if event.type == ChangeType.PRICE_CHANGED:
         lines += [f"המחיר {_direction_he(event.pct_change)}: {label}"]
         lines += price_lines()
         lines += extra_lines()
+        lines += notes
         lines += [
             f"  קישור: {url}",
             f"  נבדק: {ts}",
@@ -292,16 +424,18 @@ def _text_event(event: ChangeEvent) -> str:
             f"  מחיר נוכחי: {price_str}",
         ]
         lines += extra_lines()
+        lines += notes
         lines += [f"  קישור: {url}"]
 
     elif event.type == ChangeType.PROMO_CHANGED:
         displayed = _fmt_price(event.fetch.price, sym)
-        lines += [f"{_promo_word(event)}: {label}"]
+        lines += [f"{_promo_heading(event)}: {label}"]
         lines += promo_lines()
         lines.append(f"  מחיר מוצג: {displayed}")
         if event.fetch.estimated_final_price is not None:
             estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-            lines.append(f"  מחיר סופי משוער: {estimated}")
+            lines.append(f"  מחיר סופי משוער: {estimated} (הערכה)")
+        lines += notes
         lines += [f"  קישור: {url}"]
 
     elif event.type == ChangeType.THRESHOLD_FAILURE:
@@ -310,6 +444,7 @@ def _text_event(event: ChangeEvent) -> str:
             f"המעקב הפסיק לעבוד: {label}",
             f"  סיבה: {reason}",
             *([f"  פירוט: {detail}"] if (detail := failure_detail_he(event.fetch)) else []),
+            *([f"  מה לעשות: {hint}"] if (hint := _failure_hint_he(event.fetch)) else []),
             "  ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש.",
             f"  קישור: {url}",
         ]
@@ -322,6 +457,7 @@ def _text_event(event: ChangeEvent) -> str:
         else:
             lines += [f"  מחיר נוכחי: {_fmt_price(event.fetch.price, sym)}"]
         lines += extra_lines()
+        lines += notes
         lines += [f"  קישור: {url}"]
 
     return "\n".join(lines)
@@ -398,12 +534,15 @@ def _html_event(event: ChangeEvent) -> str:
             out += promo_rows()
         return out
 
+    notes = [row(key, escape(val)) for key, val in _promo_notes(event, sym)]
+
     if event.type == ChangeType.PRICE_CHANGED:
         heading = (
             f'המחיר <span style="color:{price_color}">{_DIRECTION_HE[direction]}</span>: {label}'
         )
         rows += price_rows()
         rows += extra_rows()
+        rows += notes
         rows += [
             row("נבדק", _ltr(ts)),
             row("קישור", link),
@@ -415,11 +554,12 @@ def _html_event(event: ChangeEvent) -> str:
         heading = f'<span style="color:{color}">{_stock_he(event.fetch.in_stock)}</span>: {label}'
         rows += [row("מחיר נוכחי", _ltr(price_str))]
         rows += extra_rows()
+        rows += notes
         rows += [row("קישור", link)]
 
     elif event.type == ChangeType.PROMO_CHANGED:
         displayed = _fmt_price(event.fetch.price, sym)
-        heading = f"{_promo_word(event)}: {label}"
+        heading = f"{_promo_heading(event)}: {label}"
         rows += promo_rows()
         rows.append(row("מחיר מוצג", _ltr(displayed)))
         if event.fetch.estimated_final_price is not None:
@@ -427,6 +567,7 @@ def _html_event(event: ChangeEvent) -> str:
             rows.append(row(
                 "מחיר סופי משוער", f'<strong>{_ltr(estimated)}</strong> <em>(הערכה)</em>'
             ))
+        rows += notes
         rows += [row("קישור", link)]
 
     elif event.type == ChangeType.THRESHOLD_FAILURE:
@@ -435,6 +576,7 @@ def _html_event(event: ChangeEvent) -> str:
         rows += [
             row("סיבה", reason),
             *([row("פירוט", escape(detail))] if (detail := failure_detail_he(event.fetch)) else []),
+            *([row("מה לעשות", escape(hint))] if (hint := _failure_hint_he(event.fetch)) else []),
             row("הערה", "ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש."),
             row("קישור", link),
         ]
@@ -446,6 +588,7 @@ def _html_event(event: ChangeEvent) -> str:
         else:
             rows += [row("מחיר נוכחי", _ltr(_fmt_price(event.fetch.price, sym)))]
         rows += extra_rows()
+        rows += notes
         rows += [row("קישור", link)]
     else:
         heading = f"עדכון: {label}"
@@ -541,7 +684,11 @@ def send_change_notification(events: list[ChangeEvent]) -> bool:
         log.debug("send_change_notification: no notifiable events, skipping email")
         return True
 
-    cfg = _config_module.load().email
+    try:
+        cfg = _config_module.load().email
+    except Exception as exc:  # missing / invalid SMTP settings in .env
+        log.error("Cannot send notification email: %s", exc)
+        return False
     try:
         log.info("Sending notification email: %s", payload.subject)
         _send_via_smtp(payload, cfg)
@@ -978,8 +1125,10 @@ def _supermarkets_section_text(sm) -> list[str]:
             )
             lines.append(f"    {i}. {now} · {p.chain} · {p.item_name[:50]}")
             if getattr(p, "is_promo", True):
+                until = getattr(p, "end_date_display", "")
                 lines.append(
                     f"       מחיר רגיל {was} · הנחה {pct}" + (f" · {extra}" if extra else "")
+                    + (f" · בתוקף עד {until}" if until else "")
                 )
             else:
                 lines.append("       מחיר רגיל (לא במבצע)" + (f" · {extra}" if extra else ""))
@@ -1086,6 +1235,12 @@ def _supermarkets_section_html(sm) -> str:
             chips = " ".join(_region_chip_html(r) for r in _promo_regions(p)) if show_regions else ""
             below = "<br>".join(x for x in (chips, escape(where)) if x)
             desc = (p.promotion_description or "").strip()
+            # Item note: the promotion text and, short, the day the deal ends.
+            until = getattr(p, "end_date_display", "")[:5]
+            note = " · ".join(x for x in (
+                escape(desc[:60]) if desc and desc != p.item_name else "",
+                f"עד {until}" if until else "",
+            ) if x)
             rows_html.append(
                 # The cheapest row is highlighted (class f).
                 ('<tr class="f">' if i == 0 else '<tr>')
@@ -1097,7 +1252,7 @@ def _supermarkets_section_html(sm) -> str:
                 + '</td>'
                 # Item
                 f'<td>{escape(p.item_name[:60])}'
-                + (f'<br><small>{escape(desc[:60])}</small>' if desc and desc != p.item_name else '')
+                + (f'<br><small>{note}</small>' if note else '')
                 + '</td>'
                 # Price per kg (now / was), discount, deal
                 f'<td align="left" nowrap>{_price_compact_html(p)}</td>'
@@ -1807,6 +1962,9 @@ def build_daily_payload(report) -> EmailPayload | None:
         headline.append(vacation_blurb)
     if vac is not None and vac.status != "ok":
         failed.append("חופשות")
+    mp_report = getattr(report, "marketplace", None)  # None = feature off
+    if mp_report is not None and mp_report.status == "failed":
+        failed.append("Marketplace")
     if failed:
         headline.append("סריקה נכשלה: " + ", ".join(failed))
     subject = "דוח יומי: " + (" · ".join(headline) if headline else "אין חדש היום")
@@ -1844,6 +2002,8 @@ def build_daily_payload(report) -> EmailPayload | None:
     text_lines.append("")
     text_lines.extend(_vacations_section_text(vac))
     text_lines.append("")
+    from price_watcher import marketplace as _marketplace
+    text_lines.extend(_marketplace.section_text(mp_report))
     text_lines.append(f"— {_SIGNATURE}")
     text_body = "\n".join(text_lines)
 
@@ -1853,6 +2013,7 @@ def build_daily_payload(report) -> EmailPayload | None:
         '<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
         _meat_style_tag(),
+        _marketplace.style_tag() if mp_report is not None else "",
         '</head>',
         f'<body dir="rtl" style="margin:0;padding:0;background:#f3f4f6;font-family:{_F};color:{_COLOR_TEXT}">',
         f'<table role="presentation" dir="rtl" style="width:100%;background:#f3f4f6;border-collapse:collapse">',
@@ -1923,6 +2084,10 @@ def build_daily_payload(report) -> EmailPayload | None:
     html_parts.append(_section_heading_html(_VACATION_TITLE))
     html_parts.append(_vacations_section_html(vac))
 
+    if mp_report is not None:
+        html_parts.append(_section_heading_html(_marketplace.SECTION_TITLE))
+        html_parts.append(_marketplace.section_html(mp_report, heading=False))
+
     html_parts.append(
         f'</td></tr>'
         f'<tr><td style="padding:16px 24px 24px;border-top:1px solid {_COLOR_BORDER};'
@@ -1948,24 +2113,4 @@ def send_daily_email(report) -> bool:
         return True
     except (smtplib.SMTPException, OSError) as exc:
         log.error("Daily email send failed: %s", type(exc).__name__)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Legacy digest-only payload (kept for backward compatibility, unused now)
-# ---------------------------------------------------------------------------
-
-def send_digest_email(digests) -> bool:
-    """Send the daily digest email. Returns True on success, False on failure."""
-    payload = build_digest_payload(digests)
-    if payload is None:
-        log.info("No digest to send (no sites)")
-        return True
-    cfg = _config_module.load().email
-    try:
-        _send_via_smtp(payload, cfg)
-        log.info("Digest email sent to %s", cfg.email_to)
-        return True
-    except (smtplib.SMTPException, OSError) as exc:
-        log.error("Digest email send failed: %s", type(exc).__name__)
         return False

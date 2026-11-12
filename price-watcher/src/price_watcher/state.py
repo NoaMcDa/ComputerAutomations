@@ -8,27 +8,34 @@ evaluate(watch, fetch, cfg) -> ChangeEvent
 apply(event)         -> None
 apply_many(events, notification_sent=True) -> None
 mark_notified(events) -> None
+effective_fetch(watch, fetch) -> FetchResult
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional
+from urllib.parse import urlparse
 
 from price_watcher.contracts import (
     ChangeEvent,
     ChangeType,
     FetchResult,
     FetchStatus,
+    NOTIFIABLE_TYPES,
     PromoInfo,
     Watch,
 )
 from price_watcher.config import CheckConfig
+from price_watcher.logging_setup import get as _get_logger
 from price_watcher.paths import state_file
+
+log = _get_logger(__name__)
 
 _SCHEMA_VERSION = 1
 _HISTORY_CAP = 500
@@ -81,27 +88,47 @@ def _promo_from_dict(d: Optional[dict]) -> Optional[PromoInfo]:
 # File I/O
 # ---------------------------------------------------------------------------
 
+def _empty_state() -> dict:
+    return {"schema_version": _SCHEMA_VERSION, "watches": {}}
+
+
 def load_state() -> dict:
-    """Load the raw state dict from disk. Returns a default if the file is missing."""
+    """Load the raw state dict from disk. Returns a default if the file is missing.
+
+    A corrupt file is copied aside to ``state.json.corrupt-<time>`` (so the
+    price history is not silently lost on the next save) and an empty state
+    is returned.
+    """
     path = state_file()
     if not path.exists():
-        return {"schema_version": _SCHEMA_VERSION, "watches": {}}
-    with path.open("r", encoding="utf-8") as fh:
-        try:
+        return _empty_state()
+    try:
+        with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        except (json.JSONDecodeError, OSError):
-            return {"schema_version": _SCHEMA_VERSION, "watches": {}}
-    if "watches" not in data:
-        data["watches"] = {}
+        if not isinstance(data, dict) or not isinstance(data.get("watches", {}), dict):
+            raise ValueError("unexpected structure")
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError) as exc:
+        backup = path.with_name(
+            f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        try:
+            shutil.copy2(path, backup)
+            log.error("State file %s is unreadable (%s); backed up to %s", path, exc, backup)
+        except OSError:
+            log.error("State file %s is unreadable (%s)", path, exc)
+        return _empty_state()
+    data.setdefault("watches", {})
     return data
 
 
 def _save_state(data: dict) -> None:
-    """Atomically write the state dict to disk."""
+    """Atomically write the state dict to disk (temp file + fsync + rename)."""
     path = state_file()
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -126,6 +153,59 @@ def _baseline_price(ws: dict) -> Optional[Decimal]:
     return _decimal_or_none(raw)
 
 
+def _redirected_to_home(watch_url: str, final_url: Optional[str]) -> bool:
+    """True when a product link now lands on the shop's home page."""
+    if not final_url:
+        return False
+    try:
+        w, f = urlparse(watch_url), urlparse(final_url)
+    except ValueError:
+        return False
+    return w.path.strip("/") != "" and f.path.strip("/") == ""
+
+
+def _promo_computable(promo: Optional[PromoInfo]) -> bool:
+    """A promo with a usable percentage (not tiered "up to", not unreadable)."""
+    return promo is not None and promo.discount_pct > 0
+
+
+def effective_fetch(watch: Watch, fetch: FetchResult) -> FetchResult:
+    """Apply per-watch options and sanity rules to a raw fetch result.
+
+    - a product page that now redirects to the home page: "not found";
+    - promotion tracking switched off / item excluded from promotions:
+      drop the banner promo and the estimated final price;
+    - a successful fetch with no price that is not "out of stock":
+      "price not found" (an unusable reading is never a change).
+    A price of 0 is left alone: evaluate() counts it as a failure.
+    """
+    if (
+        fetch.status in (FetchStatus.OK, FetchStatus.PRICE_NOT_FOUND)
+        and _redirected_to_home(watch.url, fetch.final_url)
+    ):
+        return replace(
+            fetch,
+            status=FetchStatus.NOT_FOUND,
+            error_message=(
+                f"the product page now redirects to the home page ({fetch.final_url}); "
+                "the product was probably removed"
+            ),
+        )
+    if fetch.status != FetchStatus.OK:
+        return fetch
+    if (not watch.track_promo or watch.excluded_from_promo) and (
+        fetch.promo is not None or fetch.estimated_final_price is not None
+    ):
+        fetch = replace(fetch, promo=None, estimated_final_price=None)
+    if fetch.price is None and fetch.in_stock is not False:
+        return replace(
+            fetch,
+            status=FetchStatus.PRICE_NOT_FOUND,
+            error_message=fetch.error_message or "the page was read but no price was found",
+        )
+    return fetch
+
+
 def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
     """Decide the ChangeType for this fetch result against stored state.
 
@@ -139,22 +219,14 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
     ws: dict = data["watches"].get(watch.id, {})
     now = datetime.now().astimezone()
     threshold = cfg.failure_threshold
+    fetch = effective_fetch(watch, fetch)
 
     # ------------------------------------------------------------------ #
     # Fetch failed                                                         #
     # ------------------------------------------------------------------ #
     if fetch.status != FetchStatus.OK:
+        # Counted even for a link that never worked, so it still alerts.
         consecutive = ws.get("consecutive_failures", 0) + 1
-        has_prior_success = ws.get("last_success_time") is not None
-
-        if not has_prior_success:
-            return ChangeEvent(
-                type=ChangeType.FAILED,
-                watch=watch,
-                fetch=fetch,
-                reason=f"fetch failed with status {fetch.status}; no prior success",
-                timestamp=now,
-            )
 
         failure_notified = ws.get("failure_notified", False)
 
@@ -186,6 +258,23 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
     recovering = consecutive > 0 and failure_notified
 
     stored_price = _baseline_price(ws)
+
+    # A fetch that could not read the currency (e.g. a blocked Shopify page
+    # rescued through its product JSON) keeps the watch's stored currency, so
+    # emails still show the symbol.
+    if fetch.currency is None and ws.get("currency"):
+        fetch = replace(fetch, currency=ws["currency"])
+
+    # A link that alerted before it ever worked: its first reading is the
+    # "working again" email.
+    if stored_price is None and recovering:
+        return ChangeEvent(
+            type=ChangeType.RECOVERED,
+            watch=watch,
+            fetch=fetch,
+            reason=f"recovered after {consecutive} consecutive failures",
+            timestamp=now,
+        )
 
     # First seen
     if stored_price is None:
@@ -274,9 +363,16 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
         and fetch.in_stock != stored_in_stock
     )
 
-    # Promo comparison
+    # Promo comparison. A tiered / unreadable banner (no usable percentage)
+    # is never a change by itself: it must not look like "promotion ended".
     stored_promo = _promo_from_dict(ws.get("promo"))
-    promo_changed = _promos_differ(stored_promo, fetch.promo)
+    if fetch.promo is not None and not _promo_computable(fetch.promo):
+        promo_changed = False
+    else:
+        promo_changed = _promos_differ(
+            stored_promo if _promo_computable(stored_promo) else None,
+            fetch.promo,
+        )
 
     price_changed = new_price is not None and (
         new_price != stored_price or currency_switched
@@ -307,6 +403,7 @@ def evaluate(watch: Watch, fetch: FetchResult, cfg: CheckConfig) -> ChangeEvent:
         stock_changed=stock_changed,
         promo_changed=promo_changed,
         old_promo=stored_promo if promo_changed else None,
+        old_estimated_price=_decimal_or_none(ws.get("estimated_final_price")),
         old_currency=stored_currency if currency_switched else None,
     )
 
@@ -345,13 +442,22 @@ def _apply_filters(event: ChangeEvent, watch: Watch) -> ChangeEvent:
         return event
 
     pct = event.pct_change  # signed float
+    diff = event.diff
     reason: Optional[str] = None
 
     # Drop-only filter
     if watch.notify_only_on_drop and pct is not None and pct > 0:
         reason = "price rose; notify_only_on_drop is set"
 
-    # Minimum change filter
+    # Target price: only notify once the price is at or below the target.
+    elif (
+        watch.target_price is not None
+        and event.new_price is not None
+        and event.new_price > watch.target_price
+    ):
+        reason = f"price {event.new_price} is above the target price {watch.target_price}"
+
+    # Minimum change filters
     elif (
         watch.min_change_pct is not None
         and pct is not None
@@ -361,6 +467,12 @@ def _apply_filters(event: ChangeEvent, watch: Watch) -> ChangeEvent:
             f"change {abs(pct):.2f}% < min_change_pct "
             f"{watch.min_change_pct}%"
         )
+    elif (
+        watch.min_change_abs is not None
+        and diff is not None
+        and abs(diff) < watch.min_change_abs
+    ):
+        reason = f"change {abs(diff)} < min_change_abs {watch.min_change_abs}"
 
     if reason is None:
         return event
@@ -386,14 +498,8 @@ def _apply_filters(event: ChangeEvent, watch: Watch) -> ChangeEvent:
 # State mutation helpers
 # ---------------------------------------------------------------------------
 
-# Change types that warrant an email (mirrors email_sender._NOTIFIABLE).
-_NOTIFIABLE_TYPES = {
-    ChangeType.PRICE_CHANGED,
-    ChangeType.STOCK_CHANGED,
-    ChangeType.PROMO_CHANGED,
-    ChangeType.THRESHOLD_FAILURE,
-    ChangeType.RECOVERED,
-}
+# Change types that warrant an email.
+_NOTIFIABLE_TYPES = NOTIFIABLE_TYPES
 
 # Changes whose state update is held back when their email could not be sent,
 # so the same change is detected (and emailed) again on the next run.
@@ -419,6 +525,11 @@ def _apply_event_to_ws(ws: dict, event: ChangeEvent) -> dict:
 
     if ct == ChangeType.FAILED or ct == ChangeType.THRESHOLD_FAILURE:
         ws["consecutive_failures"] = ws.get("consecutive_failures", 0) + 1
+        ws["last_error"] = {
+            "status": fetch.status.value,
+            "http_status": fetch.http_status,
+            "message": fetch.error_message,
+        }
         return ws
 
     if ct == ChangeType.SANITY_DEFERRED:
@@ -441,6 +552,7 @@ def _apply_event_to_ws(ws: dict, event: ChangeEvent) -> dict:
     ws["last_success_time"] = now_iso
     ws["sanity_deferred_count"] = 0
     ws["currency_hold_count"] = 0
+    ws.pop("last_error", None)
 
     previous_price = _decimal_or_none(ws.get("last_price"))
     if "baseline_price" not in ws and ws.get("last_price") is not None:
@@ -476,6 +588,12 @@ def _update_price_fields(ws: dict, fetch: FetchResult) -> None:
     ws["regular_price"] = _str_or_none(fetch.regular_price)
     if fetch.in_stock is not None:
         ws["in_stock"] = fetch.in_stock
+    # A tiered / unreadable banner keeps the last readable promotion, so a
+    # flapping banner does not produce "ended" / "started" emails.
+    if fetch.promo is not None and not _promo_computable(fetch.promo):
+        if _promo_from_dict(ws.get("promo")) is None:
+            ws["promo"] = _promo_to_dict(fetch.promo)
+        return
     ws["promo"] = _promo_to_dict(fetch.promo)
     ws["estimated_final_price"] = _str_or_none(fetch.estimated_final_price)
 
@@ -486,7 +604,7 @@ def _append_history(ws: dict, price: Optional[Decimal], iso_time: str) -> None:
     history: list = ws.setdefault("history", [])
     history.append({"t": iso_time, "price": str(price)})
     if len(history) > _HISTORY_CAP:
-        del history[0]
+        del history[: len(history) - _HISTORY_CAP]
 
 
 # ---------------------------------------------------------------------------
@@ -501,15 +619,23 @@ def apply(event: ChangeEvent) -> None:
     _save_state(data)
 
 
-def apply_many(events: list[ChangeEvent], *, notification_sent: bool = True) -> None:
+def apply_many(
+    events: list[ChangeEvent],
+    *,
+    notification_sent: bool = True,
+    email_failed: bool = False,
+) -> None:
     """Apply multiple events atomically (one load, mutate all, one save).
 
-    Pass ``notification_sent=False`` when the change email failed: notifiable
-    changes are then not written (only ``last_check_time`` is bumped), so they
-    are detected and emailed again on the next run.
+    Pass ``notification_sent=False`` (or ``email_failed=True``) when the
+    change email failed: notifiable changes are then not written (only
+    ``last_check_time`` is bumped), so they are detected and emailed again on
+    the next run.
     """
     if not events:
         return
+    if email_failed:
+        notification_sent = False
     data = load_state()
     for event in events:
         ws = data["watches"].get(event.watch.id, {})

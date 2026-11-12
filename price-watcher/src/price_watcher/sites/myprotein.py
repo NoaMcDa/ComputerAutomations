@@ -16,10 +16,18 @@ Which offer becomes the PromoInfo when a banner lists several, e.g.
      Extra coded offers on top (app-only / first-order) are not applied.
   2. Otherwise the first offer with a code, paired from the same segment.
   3. Otherwise an "up to N%" banner gives discount 0 (not computable).
+  4. Otherwise a code advertised without a readable percentage ("Use code
+     SPRING at checkout") also gives discount 0: a promotion exists, but the
+     estimate stays at the displayed price.
+
+Stated conditions (minimum spend, selected items, end date) found in banner
+segments that hold no offer of their own ("45% ... code SAVE45X | over
+₪200 | until 30.11") are added to the chosen offer's condition.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urlparse
@@ -28,10 +36,56 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 from price_watcher.contracts import FetchResult, PromoInfo
-from price_watcher.digest import element_text, has_up_to_discount, parse_offers
+from price_watcher.digest import (
+    _codes,
+    _discount_pcts,
+    _segments,
+    element_text,
+    has_up_to_discount,
+    parse_offers,
+)
 from price_watcher.logging_setup import get
 
 log = get(__name__)
+
+# Stated conditions of a promotion: minimum spend, selected items, end date.
+_RE_CONDITIONS = [
+    re.compile(p, re.IGNORECASE | re.UNICODE)
+    for p in (
+        r"(?:on\s+)?(?:orders?|spend(?:ing)?)\s+(?:over|of|above)\s+[₪$€£]?\s*\d+(?:[.,]\d+)*\s*[₪$€£]?",
+        r"min(?:imum|\.)?\s+(?:spend|order)\s+(?:of\s+)?[₪$€£]?\s*\d+(?:[.,]\d+)*\s*[₪$€£]?",
+        r"(?:on\s+)?select(?:ed)?\s+(?:items|products|lines|ranges)",
+        r"(?:ends?|until|expires?)\s+(?:on\s+)?(?:\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?|midnight|tonight|today|sunday|monday|tuesday|wednesday|thursday|friday|saturday)",
+        r"(?:בקנייה|בהזמנה|בקניה)\s+(?:של\s+)?מעל\s+[₪]?\s*\d+(?:[.,]\d+)*\s*(?:₪|ש\"ח|שח)?",
+        r"(?:על\s+)?(?:מוצרים|פריטים)\s+נבחרים",
+        r"(?:בתוקף\s+)?עד\s+(?:ה-?|לתאריך\s+)?\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?",
+    )
+]
+
+
+def _extract_condition(text: str) -> Optional[str]:
+    """Return the stated conditions (minimum spend, selected items, end date)."""
+    found: list[str] = []
+    for pat in _RE_CONDITIONS:
+        for m in pat.finditer(text):
+            cond = re.sub(r"\s+", " ", m.group(0)).strip(" .,;")
+            if cond and cond not in found:
+                found.append(cond)
+    return "; ".join(found)[:200] if found else None
+
+
+def _with_banner_conditions(promo: PromoInfo, raw_text: str) -> PromoInfo:
+    """Add conditions stated in the banner's offer-less segments to *promo*."""
+    extra = _extract_condition(
+        " | ".join(seg for seg in _segments(raw_text) if not _discount_pcts(seg))
+    )
+    if not extra:
+        return promo
+    parts = [c for c in extra.split("; ") if c not in (promo.condition or "")]
+    if not parts:
+        return promo
+    condition = "; ".join([promo.condition, *parts] if promo.condition else parts)
+    return replace(promo, condition=condition[:250])
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,17 +166,33 @@ class MyProteinExtractor:
         sitewide: Optional[PromoInfo] = None
         coded: Optional[PromoInfo] = None
         up_to_source: Optional[str] = None
+        code_only: Optional[PromoInfo] = None
         for raw_text in candidates:
             # Truncate source_text to 200 chars as spec requires
             source_text = raw_text[:200]
             for offer in parse_offers(raw_text):
-                offer = replace(offer, source_text=source_text)
+                offer = _with_banner_conditions(
+                    replace(offer, source_text=source_text), raw_text
+                )
                 if offer.code is None and sitewide is None:
                     sitewide = offer
                 elif offer.code is not None and coded is None:
                     coded = offer
             if up_to_source is None and has_up_to_discount(raw_text):
                 up_to_source = source_text
+            # A banner with a percentage that is not a discount ("80% protein
+            # | code: WHEY80") is not an "unreadable" promotion.
+            if code_only is None and "%" not in raw_text:
+                for seg in _segments(raw_text):
+                    seg_codes = _codes(seg)
+                    if seg_codes:
+                        code_only = PromoInfo(
+                            code=seg_codes[0][0],
+                            discount_pct=Decimal("0"),
+                            condition=seg[:250],
+                            source_text=source_text,
+                        )
+                        break
             if sitewide is not None:
                 break
 
@@ -144,6 +214,19 @@ class MyProteinExtractor:
             return replace(
                 base_result,
                 promo=promo,
+                estimated_final_price=base_result.price,
+            )
+        if promo is None and code_only is not None:
+            # A code is advertised but no percentage can be read: a promotion
+            # exists, the estimate stays at the displayed price.
+            log.info(
+                "MyProtein: code %s advertised but no percentage readable. url=%s",
+                code_only.code,
+                url,
+            )
+            return replace(
+                base_result,
+                promo=code_only,
                 estimated_final_price=base_result.price,
             )
         if promo is None:

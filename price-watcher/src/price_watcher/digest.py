@@ -27,10 +27,10 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from rich.console import Console
-from rich.table import Table
 
 from price_watcher import logging_setup
 from price_watcher.contracts import PromoInfo
+from price_watcher.http_headers import USER_AGENT
 
 
 log = logging_setup.get(__name__)
@@ -45,14 +45,16 @@ _DISPLAY_OVERRIDES = {
 
 
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "he,en;q=0.8,en-US;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",
 }
+
+
+# Shown (terminal, email text and HTML) for a site that was read fine but has
+# no site-wide offer today.
+NO_PROMO_HE = "לא זוהה מבצע כלל-אתרי"
 
 
 @dataclass
@@ -63,6 +65,11 @@ class SiteDigest:
     status: str = "ok"  # "ok" (fetched; empty promos = no promo) / "unreachable" / "blocked"
     promos: list[PromoInfo] = field(default_factory=list)
     error: Optional[str] = None
+
+    @property
+    def failed(self) -> bool:
+        """True only when the homepage could not be read (no promo is not a failure)."""
+        return self.status != "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -437,11 +444,11 @@ def collect_digest() -> list[SiteDigest]:
 def _print_digests(digests: list[SiteDigest]) -> None:
     for d in digests:
         console.print(f"\n[bold cyan]━━━ {d.display_name}[/bold cyan] [dim]({d.host})[/dim]")
-        if d.status != "ok":
+        if d.failed:
             console.print(f"  [red]{d.status}[/red] {d.error or ''}")
             continue
         if not d.promos:
-            console.print("  [dim]no site-wide promo detected[/dim]")
+            console.print(f"  [dim]{NO_PROMO_HE}[/dim]")
             continue
         for i, p in enumerate(d.promos, 1):
             code_cell = f"[bold green]{p.code}[/bold green]" if p.code else "[dim]no code[/dim]"
@@ -459,6 +466,7 @@ class DailyReport:
     sims4: Optional["object"] = None        # Sims4Report
     supermarkets: Optional["object"] = None # SupermarketReport
     vacations: Optional["object"] = None    # VacationReport
+    marketplace: Optional["object"] = None  # MarketplaceReport; None = feature off
 
 
 def collect_daily_report() -> DailyReport:
@@ -484,6 +492,12 @@ def collect_daily_report() -> DailyReport:
     except Exception as exc:
         log.error("Supermarket stage failed: %s: %s", type(exc).__name__, exc)
     report.vacations = collect_vacations()
+    # Facebook Marketplace (off unless PW_FB_QUERIES is set); logic in marketplace.py.
+    try:
+        from price_watcher import marketplace as _marketplace
+        report.marketplace = _marketplace.scan_and_report()
+    except Exception as exc:
+        log.error("Marketplace stage failed: %s: %s", type(exc).__name__, exc)
     return report
 
 
@@ -516,6 +530,10 @@ def _print_daily_report(report: DailyReport) -> None:
         console.print("\n[bold underline]Vacation deals[/bold underline]")
         from price_watcher import vacations as _vac
         _vac.print_report(report.vacations)
+    if getattr(report, "marketplace", None) is not None:
+        console.print("\n[bold underline]Facebook Marketplace[/bold underline]")
+        from price_watcher import marketplace as _marketplace
+        _marketplace.print_report(report.marketplace)
 
 
 def _deals_only_recipients(require_email: bool = True) -> tuple[str, ...]:
@@ -566,6 +584,9 @@ def run_digest(dry_run: bool = False, test: bool = False) -> int:
         if report.supermarkets is not None:
             from price_watcher import supermarkets as _sm
             _sm.persist(report.supermarkets)
+        if getattr(report, "marketplace", None) is not None:
+            from price_watcher import marketplace as _marketplace
+            _marketplace.persist(report.marketplace)
     return 0 if sent else 1
 
 

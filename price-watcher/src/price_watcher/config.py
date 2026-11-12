@@ -73,6 +73,22 @@ class AppConfig:
     log_level: str
 
 
+def load_check() -> CheckConfig:
+    """Load only the check settings (no SMTP values needed).
+
+    Used by `check --dry-run` and by the check loop itself, so a missing or
+    broken email setup never stops prices from being checked.
+    """
+    delay_min = max(0.0, _get_float("PW_DELAY_MIN_SEC", 2.0))
+    delay_max = max(delay_min, _get_float("PW_DELAY_MAX_SEC", 8.0))
+    return CheckConfig(
+        failure_threshold=max(1, _get_int("PW_FAILURE_THRESHOLD", 6)),
+        sanity_jump_pct=_get_float("PW_SANITY_JUMP_PCT", 90.0),
+        delay_min_sec=delay_min,
+        delay_max_sec=delay_max,
+    )
+
+
 def load(require_email: bool = True) -> AppConfig:
     """Load config from env + .env file. Raises ConfigError if invalid.
 
@@ -96,11 +112,6 @@ def load(require_email: bool = True) -> AppConfig:
                 if addr.strip()
             ),
         ),
-        check=CheckConfig(
-            failure_threshold=_get_int("PW_FAILURE_THRESHOLD", 6),
-            sanity_jump_pct=_get_float("PW_SANITY_JUMP_PCT", 90.0),
-            delay_min_sec=_get_float("PW_DELAY_MIN_SEC", 2.0),
-            delay_max_sec=_get_float("PW_DELAY_MAX_SEC", 8.0),
-        ),
+        check=load_check(),
         log_level=os.environ.get("PW_LOG_LEVEL", "INFO"),
     )

@@ -33,6 +33,7 @@ from rich.console import Console
 from rich.table import Table
 
 from price_watcher import logging_setup
+from price_watcher.http_headers import USER_AGENT
 from price_watcher.paths import data_dir
 
 log = logging_setup.get(__name__)
@@ -60,10 +61,7 @@ class CreatineProduct:
 # ---------------------------------------------------------------------------
 
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "he,en;q=0.8,en-US;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",
@@ -91,6 +89,8 @@ _SALE_MARK_RE = re.compile(r"\d+\s*%|הנחה|\boff\b", re.IGNORECASE)
 
 
 def _to_decimal(num: str) -> Optional[Decimal]:
+    if re.fullmatch(r"\d+,\d{1,2}", num):
+        num = num.replace(",", ".")  # decimal comma (EU stores): "19,99"
     try:
         return Decimal(num.replace(",", ""))
     except InvalidOperation:
@@ -148,8 +148,12 @@ def _parse_price(text: str) -> Optional[tuple[Decimal, str, Optional[Decimal], s
                 unit = "100g"
             elif raw_unit in ("count", "ct", "ליחידה", "יחידה"):
                 per_unit_price, unit = val, "count"
+            elif raw_unit in ("ml", 'מ"ל'):
+                # per-100ml (not comparable with per-100g, but keeps the quantity)
+                per_unit_price = (val * 100 / qty).quantize(Decimal("0.01"))
+                unit = "100ml"
             else:
-                per_unit_price, unit = val, raw_unit  # oz / ml: kept, not comparable
+                per_unit_price, unit = val, raw_unit  # oz: kept, not comparable
 
     # Prices before the per-unit group: either one price or (original, current).
     # Anything after a '25% off' marker is the original price, not the price paid.
@@ -163,10 +167,7 @@ def _parse_price(text: str) -> Optional[tuple[Decimal, str, Optional[Decimal], s
     return price, currency, per_unit_price, unit, on_sale
 
 
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+_BROWSER_UA = USER_AGENT
 
 
 # Why the last fetch attempt(s) failed, so the report can say "blocked by
@@ -241,13 +242,30 @@ def _fetch_html_browser() -> Optional[str]:
 # a per-100g price but should not compete for "cheapest creatine powder".
 _NON_POWDER_RE = re.compile(
     r"gumm|capsule|caps\b|tablet|chewable|chews?\b|softgel|liquid|drink|bar\b|"
-    r"כמוס|גומי|טבליות|לעיס|נוזל|חטיף",
+    r"כמוס|גומי|טבליות|לעיס|נוזל|חטיף|"
+    # blends, other creatine salts and mixes are not plain monohydrate powder
+    r"\bblend|complex|matrix|stack|pre[- ]?workout|electrolyte|beta[- ]?alanine|"
+    r"bcaa|glutamine|protein|\bhcl\b|hydrochloride|nitrate|ethyl ester|"
+    r"kre[- ]?alkalyn|buffered|chelate|malate|citrate|\bmix\b|\+|"
+    r"סוכרי|קפסול|טבלי|תערובת|חלבון|מסטיק",
+    re.IGNORECASE,
+)
+# Flavoured mixes are left out unless the name says unflavoured.
+_FLAVOUR_RE = re.compile(r"flavou?r|בטעם|טעם", re.IGNORECASE)
+_UNFLAVOURED_RE = re.compile(
+    r"un-?flavou?red|no flavou?r|flavou?rless|without flavou?r|ללא טעם|נטול טעם|בלי טעם",
     re.IGNORECASE,
 )
 
 
 def _is_powder(p: CreatineProduct) -> bool:
-    return p.price_per_100g is not None and not _NON_POWDER_RE.search(p.name)
+    if p.price_per_100g is None or _NON_POWDER_RE.search(p.name):
+        return False
+    return not (_FLAVOUR_RE.search(p.name) and not _UNFLAVOURED_RE.search(p.name))
+
+
+# Public name (the product filter: plain, unflavoured creatine powder).
+is_monohydrate_powder = _is_powder
 
 
 def _parse_cells(html: str) -> tuple[list[CreatineProduct], int]:
@@ -398,6 +416,45 @@ def _product_from_dict(d: dict) -> CreatineProduct:
     )
 
 
+_PRODUCT_ID_RE = re.compile(r"/pr/[^?#]*?/(\d+)(?:[/?#]|$)")
+
+
+def _same_product(a: CreatineProduct, b: CreatineProduct) -> bool:
+    """Same product? By iHerb product id when both links have one, else by name.
+
+    The id survives the page coming back in another language; the name does not.
+    """
+    ma, mb = _PRODUCT_ID_RE.search(a.url or ""), _PRODUCT_ID_RE.search(b.url or "")
+    if ma and mb:
+        return ma.group(1) == mb.group(1)
+    return a.name == b.name
+
+
+def compare(
+    previous: Optional[CreatineProduct], cheapest: CreatineProduct
+) -> tuple[bool, Optional[str]]:
+    """(changed, direction) between the stored and the new cheapest product.
+
+    direction is "dropped" / "rose" / "changed" (same price per 100g but a
+    different product, or not comparable across currencies) / None (first
+    observation or unchanged).
+    """
+    if previous is None:
+        return True, None  # first observation counts as "to be announced"
+    if (previous.price_per_100g == cheapest.price_per_100g
+            and previous.currency == cheapest.currency
+            and _same_product(previous, cheapest)):
+        return False, None
+    if (previous.price_per_100g and cheapest.price_per_100g
+            and previous.currency == cheapest.currency):
+        if cheapest.price_per_100g < previous.price_per_100g:
+            return True, "dropped"
+        if cheapest.price_per_100g > previous.price_per_100g:
+            return True, "rose"
+        return True, "changed"  # same price, a different product is now cheapest
+    return True, "changed"
+
+
 def _print_table(products: list[CreatineProduct], cheapest: Optional[CreatineProduct]) -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("#", width=3)
@@ -503,24 +560,7 @@ def scan_and_report() -> CreatineReport:
 
     state = _load_state()
     previous = _product_from_dict(state["cheapest"]) if state.get("cheapest") else None
-
-    changed = False
-    direction = None
-    if previous is None:
-        changed = True  # first observation counts as "to be announced"
-    elif (previous.price_per_100g != cheapest.price_per_100g or previous.name != cheapest.name
-          or previous.currency != cheapest.currency):
-        changed = True
-        if (previous.price_per_100g and cheapest.price_per_100g
-                and previous.currency == cheapest.currency):
-            if cheapest.price_per_100g < previous.price_per_100g:
-                direction = "dropped"
-            elif cheapest.price_per_100g > previous.price_per_100g:
-                direction = "rose"
-            else:
-                direction = "changed"  # same price, a different product is now cheapest
-        else:
-            direction = "changed"
+    changed, direction = compare(previous, cheapest)
 
     powders = sorted(powders_all, key=lambda p: p.price_per_100g)[:10]
 

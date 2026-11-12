@@ -38,15 +38,13 @@ from rich.console import Console
 from rich.table import Table
 
 from price_watcher import logging_setup
+from price_watcher.http_headers import USER_AGENT
 
 log = logging_setup.get(__name__)
 console = Console()
 
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
     "Accept-Language": "he,en;q=0.8,en-US;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",

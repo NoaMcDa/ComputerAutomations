@@ -2,10 +2,12 @@
 
 Public API
 ----------
-run_check(dry_run=False) -> int
+run_check(dry_run=False) -> int    exit code, see EXIT_* below
 install_schedule()       -> None
 uninstall_schedule()     -> None
 status()                 -> None
+install_digest_schedule() / uninstall_digest_schedule()
+launchd_plist() / schtasks_xml() / cron_line()   schedule definitions (pure)
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import plistlib
 import random
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
@@ -23,10 +26,11 @@ from typing import Optional
 
 import filelock
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from price_watcher import config as _config_mod
-from price_watcher.contracts import ChangeEvent, ChangeType, FetchStatus
+from price_watcher.contracts import NOTIFIABLE_TYPES, ChangeEvent, ChangeType, FetchStatus
 from price_watcher.paths import data_dir, lock_file, log_dir
 
 _console = Console()
@@ -57,11 +61,48 @@ def _venv_python() -> str:
     return sys.executable
 
 
+def last_run_path() -> Path:
+    return data_dir() / "last-run.json"
+
+
+def _read_last_run() -> Optional[dict]:
+    path = last_run_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_last_run(summary: dict) -> None:
+    """Write last-run.json atomically.
+
+    A dry run keeps the previous real run under ``previous_real_run`` so
+    ``status`` can still say when the scheduled check last ran.
+    """
+    path = last_run_path()
+    if summary.get("dry_run"):
+        prev = _read_last_run()
+        if prev is not None:
+            real = prev if not prev.get("dry_run") else prev.get("previous_real_run")
+            if real:
+                summary["previous_real_run"] = real
+    tmp = path.with_suffix(".json.tmp")
+    # ASCII-only JSON: readable whatever encoding a reader assumes.
+    tmp.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------------------
 # run_check
 # ---------------------------------------------------------------------------
 
-EXIT_EMAIL_FAILED = 3
+# Exit codes of `check` (also what the OS scheduler records for the run).
+EXIT_OK = 0
+EXIT_LINK_FAILED = 1      # at least one link could not be fetched / read
+EXIT_EMAIL_FAILED = 3     # a change email could not be sent (changes held back)
 
 
 def run_check(dry_run: bool = False) -> int:  # noqa: C901  (complexity OK here)
@@ -70,9 +111,14 @@ def run_check(dry_run: bool = False) -> int:  # noqa: C901  (complexity OK here)
     Returns 0 if every fetch succeeded, 1 if at least one failed, and 3 if
     there was a change email to send and sending it failed (takes precedence,
     so a broken SMTP setup is visible to the OS scheduler).
+
+    The check itself needs no SMTP settings: a missing / broken email setup
+    makes the change email fail (exit 3, changes held back) instead of
+    stopping prices from being checked. The `check` CLI command still
+    refuses a real run without SMTP settings (one-line config error).
     """
     # 1. Load config
-    cfg = _config_mod.load(require_email=not dry_run)
+    cfg = _config_mod.load(require_email=False)
 
     # 2. Acquire process lock
     try:
@@ -99,19 +145,29 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
 
     _log = _get_logger(__name__)
 
+    started = datetime.now(tz=timezone.utc)
+
     # 3. Load & filter watches
     watches = [w for w in _watchlist.load_all() if not w.paused]
 
     if not watches:
         _console.print("[dim]No active watches.[/dim]")
-        return 0
+        _write_last_run({
+            "timestamp": started.isoformat(),
+            "dry_run": dry_run,
+            "no_watches": True,
+            "checked": 0, "changed": 0, "failed": 0,
+            "email_sent": None, "email_failed": False,
+            "exit_code": EXIT_OK,
+            "events": [],
+        })
+        return EXIT_OK
 
     # 4. Fetch + evaluate
     events: list[ChangeEvent] = []
     for idx, watch in enumerate(watches):
         if idx > 0:
             delay = random.uniform(cfg.check.delay_min_sec, cfg.check.delay_max_sec)
-            import time
             time.sleep(delay)
 
         # One misbehaving watch must not abort the whole run: an exception is
@@ -157,6 +213,11 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
         ok = fetch.status == FetchStatus.OK
         failed = not ok or event.type == ChangeType.FAILED
         send_word = "would send" if dry_run else "sending"
+        # A dry run says what it would email (the subject) or that it would not.
+        subject = (
+            f": {_email_sender._subject_single(event)}"
+            if dry_run and event.type in NOTIFIABLE_TYPES else ""
+        )
 
         def _price_cell() -> str:
             if fetch.price is not None:
@@ -182,13 +243,13 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
             any_failed = True
             status_cell = "[red]FAIL[/red]"
             info_cell = event.reason or fetch.error_message or fetch.status.value
-            action_cell = f"{send_word} failure alert"
+            action_cell = f"{send_word} failure alert{subject}"
         elif event.type == ChangeType.RECOVERED:
             if event.old_price is not None or event.stock_changed or event.promo_changed:
                 changed_count += 1
             status_cell = "[green]OK[/green]"
             info_cell = _change_cell()
-            action_cell = f"recovered ({send_word})"
+            action_cell = f"recovered ({send_word}){subject}"
         elif failed:
             any_failed = True
             reason = fetch.error_message or fetch.status.value
@@ -211,39 +272,53 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
             changed_count += 1
             status_cell = "[green]OK[/green]"
             info_cell = _change_cell()
-            action_cell = send_word
+            action_cell = f"{send_word}{subject}"
 
-        table.add_row(status_cell, watch_name, info_cell, action_cell)
+        if dry_run and event.type not in NOTIFIABLE_TYPES:
+            action_cell = f"would not notify ({action_cell})"
+
+        # Names, URLs and error texts may contain [brackets]: not markup.
+        table.add_row(
+            status_cell,
+            _rich_escape(watch_name),
+            _rich_escape(info_cell),
+            _rich_escape(action_cell),
+        )
 
     _console.print(table)
 
     # 6. Build email payload
     payload = _email_sender.build_payload(events)
 
+    sent = True
+    email_sent: Optional[bool] = None
     if dry_run:
         if payload is not None:
             _console.print(
-                f"[bold]WOULD SEND EMAIL[/bold] — Subject: {payload.subject}"
+                f"[bold]WOULD SEND EMAIL[/bold] — Subject: {_rich_escape(payload.subject)}"
             )
-        return 1 if any_failed else 0
-
-    # Real run: send + persist
-    sent = True
-    email_failed = False
-    if payload is not None:
-        sent = _email_sender.send_change_notification(events)
-        email_failed = not sent
-        if sent:
-            _state.mark_notified(events)
+            for line in payload.text_body.splitlines()[:8]:
+                _console.print(f"  [dim]{_rich_escape(line)}[/dim]")
         else:
-            _console.print(
-                "[yellow]Email failed — changes not recorded; they will be "
-                "retried on the next run.[/yellow]"
-            )
+            _console.print("[dim]Would not send any email.[/dim]")
+        _console.print("[dim]Dry run: nothing was sent and the state file was not changed.[/dim]")
+    else:
+        # Real run: send + persist
+        if payload is not None:
+            sent = _email_sender.send_change_notification(events)
+            email_sent = sent
+            if sent:
+                _state.mark_notified(events)
+            else:
+                _console.print(
+                    "[yellow]Email failed — changes not recorded; they will be "
+                    "retried on the next run.[/yellow]"
+                )
 
-    # If the email failed, notifiable changes are not written to state so the
-    # next run detects and sends them again.
-    _state.apply_many(events, notification_sent=sent)
+        # If the email failed, notifiable changes are not written to state so the
+        # next run detects and sends them again.
+        _state.apply_many(events, notification_sent=sent)
+    email_failed = email_sent is False
 
     # Summary line
     checked = len(events)
@@ -252,41 +327,56 @@ def _run_check_locked(cfg, dry_run: bool) -> int:
         if e.fetch.status != FetchStatus.OK
         or e.type in (ChangeType.FAILED, ChangeType.THRESHOLD_FAILURE)
     )
+    if email_failed:
+        rc = EXIT_EMAIL_FAILED
+    elif any_failed:
+        rc = EXIT_LINK_FAILED
+    else:
+        rc = EXIT_OK
+    summary_line = f"{checked} checked, {changed_count} changed, {failed_count} failed"
+    if email_failed:
+        summary_line += ", EMAIL NOT SENT"
     _console.print(
-        f"\n[bold]{checked} checked, {changed_count} changed, {failed_count} failed[/bold]"
+        f"\n[bold]{summary_line}[/bold]" + (" [dim](dry run)[/dim]" if dry_run else "")
     )
+    _log.info("Check finished%s: %s (exit %d)", " (dry run)" if dry_run else "", summary_line, rc)
 
-    # Write last-run.json
+    # Write last-run.json (a dry run keeps the last real run inside it)
     brief_events = []
     for e in events:
+        info = _email_sender.describe_failure(e.fetch)
         brief_events.append({
             "watch_id": e.watch.id,
             "name": e.watch.name,
+            "url": e.watch.url,
             "type": e.type.value,
             "old_price": str(e.old_price) if e.old_price is not None else None,
             "new_price": str(e.new_price) if e.new_price is not None else None,
             "reason": e.reason,
+            "status": e.fetch.status.value,
             "fetch_status": e.fetch.status.value,
             "http_status": e.fetch.http_status,
             "error_message": e.fetch.error_message,
-            "detail": _email_sender.failure_detail_he(e.fetch) or None,
+            "detail": info["detail"],
+            "hint": info["hint"],
         })
 
-    last_run = {
+    _write_last_run({
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "dry_run": dry_run,
+        "no_watches": False,
         "checked": checked,
         "changed": changed_count,
         "failed": failed_count,
+        "email_sent": email_sent,
         "email_failed": email_failed,
+        "exit_code": rc,
         "events": brief_events,
-    }
-    last_run_path = data_dir() / "last-run.json"
-    last_run_path.write_text(json.dumps(last_run, indent=2))
+    })
 
     if email_failed:
         _log.error("change email could not be sent; changes will be retried next run")
-        return EXIT_EMAIL_FAILED
-    return 1 if any_failed else 0
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -303,22 +393,53 @@ def install_schedule() -> None:
         _console.print(
             "[yellow]Unsupported platform for automatic scheduling. "
             "Add a cron entry manually:[/yellow]\n"
-            f"  0 {_CHECK_HOUR} * * * {_venv_python()} -m price_watcher check"
+            f"  {cron_line('check', _CHECK_HOUR)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Schedule definitions (pure; tested offline)
+# ---------------------------------------------------------------------------
+
+def launchd_plist(label: str, command: str, hour: int, log_name: str) -> dict:
+    """The launchd agent definition for `python -m price_watcher <command>`.
+
+    launchd runs a StartCalendarInterval job that was missed while the Mac
+    slept as soon as it wakes, so no extra catch-up setting is needed.
+    """
+    return {
+        "Label": label,
+        "ProgramArguments": [_venv_python(), "-m", "price_watcher", command],
+        "WorkingDirectory": str(_repo_dir()),
+        "StartCalendarInterval": {"Hour": hour, "Minute": 0},
+        "RunAtLoad": False,
+        "StandardOutPath": str(log_dir() / f"launchd.{log_name}out.log"),
+        "StandardErrorPath": str(log_dir() / f"launchd.{log_name}err.log"),
+    }
+
+
+def _windows_python() -> str:
+    """pythonw.exe next to the venv's python.exe, so no console window pops up."""
+    python_path = _venv_python()
+    pythonw = Path(python_path).parent / "pythonw.exe"
+    if pythonw.exists():
+        return str(pythonw)
+    return python_path
+
+
+def schtasks_xml(description: str, command: str, hour: int, time_limit: str) -> str:
+    """Task Scheduler XML for a daily `python -m price_watcher <command>`."""
+    return _task_xml(description, hour, time_limit, _windows_python(), command)
+
+
+def cron_line(command: str, hour: int) -> str:
+    return f"0 {hour} * * * {_venv_python()} -m price_watcher {command}"
 
 
 def _install_launchd() -> None:
     log_dir().mkdir(parents=True, exist_ok=True)
 
-    plist_data = {
-        "Label": _PLIST_LABEL,
-        "ProgramArguments": [_venv_python(), "-m", "price_watcher", "check"],
-        "WorkingDirectory": str(_repo_dir()),
-        "StartCalendarInterval": {"Hour": _CHECK_HOUR, "Minute": 0},
-        "RunAtLoad": False,
-        "StandardOutPath": str(log_dir() / "launchd.out.log"),
-        "StandardErrorPath": str(log_dir() / "launchd.err.log"),
-    }
+    plist_data = launchd_plist(_PLIST_LABEL, "check", _CHECK_HOUR, "")
 
     # Idempotent: unload first if plist already exists
     if _PLIST_PATH.exists():
@@ -357,7 +478,11 @@ def _install_launchd() -> None:
 
 def _task_xml(description: str, hour: int, limit: str, python_path: str, subcommand: str) -> str:
     """Task Scheduler XML. Values are XML-escaped; battery settings allow
-    running on battery (laptops) and not being killed when unplugged."""
+    running on battery (laptops) and not being killed when unplugged.
+
+    StartWhenAvailable = run as soon as possible after a missed start
+    (computer asleep or off at the scheduled time); a second start while one
+    is still running is ignored."""
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -376,13 +501,14 @@ def _task_xml(description: str, hour: int, limit: str, python_path: str, subcomm
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
   <Actions>
     <Exec>
       <Command>{_xml_escape(python_path)}</Command>
-      <Arguments>-m price_watcher {subcommand}</Arguments>
+      <Arguments>-m price_watcher {_xml_escape(subcommand)}</Arguments>
       <WorkingDirectory>{_xml_escape(str(_repo_dir()))}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -516,38 +642,63 @@ def status() -> None:
         _console.print("[bold]Digest schedule:[/bold] [dim]unknown (unsupported platform)[/dim]")
 
     # --- last run ---
-    last_run_path = data_dir() / "last-run.json"
-    if not last_run_path.exists():
+    path = last_run_path()
+    if not path.exists():
         _console.print("[bold]Last run:[/bold] No runs yet")
         return
+    data = _read_last_run()
+    if data is None:
+        _console.print(f"[red]Could not parse {path}[/red]")
+        return
 
-    try:
-        data = json.loads(last_run_path.read_text())
-        ts_raw = data.get("timestamp", "")
-        checked = data.get("checked", "?")
-        changed = data.get("changed", "?")
-        failed = data.get("failed", "?")
-        email_failed = bool(data.get("email_failed", False))
-
-        # Pretty-print the timestamp
-        try:
-            dt = datetime.fromisoformat(ts_raw)
-            ts_display = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        except (ValueError, TypeError):
-            ts_display = ts_raw
-
+    if data.get("dry_run"):
         _console.print(
-            f"[bold]Last run:[/bold] {ts_display} — "
-            f"{checked} checked, {changed} changed, {failed} failed"
+            f"[bold]Last run:[/bold] {_run_line(data)} "
+            "[yellow](dry run — nothing sent or saved)[/yellow]"
         )
-        if email_failed:
-            _console.print(
-                "[bold red]Email failed:[/bold red] the last run could not send "
-                "its change email; changes are held and will be retried. "
-                "Check the SMTP settings (run `test-email`)."
-            )
-    except (json.JSONDecodeError, KeyError) as exc:
-        _console.print(f"[red]Could not parse last-run.json:[/red] {exc}")
+        real = data.get("previous_real_run")
+        if real:
+            _console.print(f"[bold]Last real run:[/bold] {_run_line(real)}")
+        data = real
+    else:
+        _console.print(f"[bold]Last run:[/bold] {_run_line(data)}")
+
+    if not data:
+        return
+    if data.get("email_failed"):
+        _console.print(
+            "[bold red]Email failed:[/bold red] the last run's change email could "
+            "NOT be sent; changes are held and will be retried. "
+            "Check the SMTP settings (run `test-email`)."
+        )
+    elif data.get("email_sent"):
+        _console.print("[bold]Email:[/bold] [green]sent[/green]")
+    for ev in data.get("events", []):
+        if ev.get("detail") and ev.get("type") in ("failed", "threshold_failure"):
+            name = ev.get("name") or ev.get("url") or ev.get("watch_id")
+            _console.print(f"  [red]FAIL[/red] {_rich_escape(str(name))}: {_rich_escape(ev['detail'])}")
+            if ev.get("hint"):
+                _console.print(f"       [dim]{_rich_escape(ev['hint'])}[/dim]")
+
+
+def _format_ts(ts_raw: str) -> str:
+    try:
+        return datetime.fromisoformat(ts_raw).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (ValueError, TypeError):
+        return str(ts_raw)
+
+
+def _run_line(data: dict) -> str:
+    if data.get("no_watches"):
+        what = "no active watches"
+    else:
+        what = (
+            f"{data.get('checked', '?')} checked, {data.get('changed', '?')} changed, "
+            f"{data.get('failed', '?')} failed"
+        )
+    if "exit_code" in data:
+        what += f", exit code {data['exit_code']}"
+    return f"{_format_ts(data.get('timestamp', ''))} — {what}"
 
 
 def _launchd_installed(label: str = _PLIST_LABEL) -> bool:
@@ -587,7 +738,7 @@ def install_digest_schedule() -> None:
         _console.print(
             "[yellow]Unsupported platform for automatic scheduling. "
             "Add a cron entry manually:[/yellow]\n"
-            f"  0 9 * * * {_venv_python()} -m price_watcher digest"
+            f"  {cron_line('digest', 9)}"
         )
 
 
@@ -604,15 +755,7 @@ def uninstall_digest_schedule() -> None:
 def _install_digest_launchd() -> None:
     log_dir().mkdir(parents=True, exist_ok=True)
 
-    plist_data = {
-        "Label": _DIGEST_PLIST_LABEL,
-        "ProgramArguments": [_venv_python(), "-m", "price_watcher", "digest"],
-        "WorkingDirectory": str(_repo_dir()),
-        "StartCalendarInterval": {"Hour": 9, "Minute": 0},
-        "RunAtLoad": False,
-        "StandardOutPath": str(log_dir() / "launchd.digest.out.log"),
-        "StandardErrorPath": str(log_dir() / "launchd.digest.err.log"),
-    }
+    plist_data = launchd_plist(_DIGEST_PLIST_LABEL, "digest", 9, "digest.")
 
     if _DIGEST_PLIST_PATH.exists():
         _bootout_digest_launchd()

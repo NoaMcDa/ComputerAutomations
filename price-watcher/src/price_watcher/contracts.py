@@ -24,10 +24,19 @@ class Watch:
     name: Optional[str] = None
     selector: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
+    # Only notify when the price went down.
     notify_only_on_drop: bool = False
+    # Ignore price changes smaller than this percentage / absolute amount.
     min_change_pct: Optional[float] = None
+    min_change_abs: Optional[Decimal] = None
+    # Only notify about a price change once the price is at or below this.
     target_price: Optional[Decimal] = None
+    # Read site promotion banners (MyProtein) for this link. False = off.
+    track_promo: bool = True
+    # The item is excluded from site promotions: the banner's discount does
+    # not apply to it, so no estimated final price is computed.
     excluded_from_promo: bool = False
+    # Skipped by `check` while True.
     paused: bool = False
 
 
@@ -84,6 +93,16 @@ class ChangeType(str, Enum):
     SANITY_DEFERRED = "sanity_deferred"
 
 
+# Change types that warrant an email.
+NOTIFIABLE_TYPES = frozenset({
+    ChangeType.PRICE_CHANGED,
+    ChangeType.STOCK_CHANGED,
+    ChangeType.PROMO_CHANGED,
+    ChangeType.THRESHOLD_FAILURE,
+    ChangeType.RECOVERED,
+})
+
+
 @dataclass
 class ChangeEvent:
     """The outcome of comparing a new FetchResult against stored state."""
@@ -101,6 +120,9 @@ class ChangeEvent:
     stock_changed: bool = False
     promo_changed: bool = False
     old_promo: Optional[PromoInfo] = None
+    # The estimated final price stored before this run, so the email can say
+    # what changed (e.g. "promotion ended").
+    old_estimated_price: Optional[Decimal] = None
     # Set when the price is compared across a currency switch.
     old_currency: Optional[str] = None
 

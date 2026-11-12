@@ -38,16 +38,19 @@ price; compensation credits and payment-method discounts are skipped.
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import os
 import re
 import xml.etree.ElementTree as ET
+import zipfile
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from collections import Counter
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from rich.console import Console
@@ -91,6 +94,14 @@ _BINA_CHAINS: tuple[tuple[str, str], ...] = (
     ("superbareket", "סופר ברקת"),
 )
 
+# Super Bareket's source can be switched without editing code, with
+# PW_BAREKET_SOURCE in .env:
+#   bina:<portal URL or sub-domain>   (default: its Bina Projects portal)
+#   publishedprices:<username>        (if the chain moves to the Cerberus host)
+#   off                               (skip the chain)
+_BAREKET_NAME = "סופר ברקת"
+_BAREKET_DEFAULT_SOURCE = "bina:superbareket"
+
 
 # ---- Scan area: regions and cities ----
 #
@@ -100,19 +111,22 @@ _BINA_CHAINS: tuple[tuple[str, str], ...] = (
 # city on or off, change ON/OFF here — or, without editing code, set
 # PW_MEAT_CITIES in .env to a comma-separated list of city (or region) names,
 # e.g. "PW_MEAT_CITIES=הרצליה,רמת השרון,תל אביב", or "הכל" for every city
-# below. PW_MEAT_CITIES, when set, replaces the ON/OFF column.
+# below. PW_MEAT_CITIES, when set, replaces the ON/OFF column. The ASCII names
+# in `_SLUGS` work too ("herzliya,ramat-hasharon", "sharon", "all"), and
+# PW_MEAT_REGIONS is read as an older name of the same setting.
 #
 # The code is matched against the Stores file's <City>; the spellings are used
 # for chains that publish City=0 and only name the city inside the store name
-# or address (see `_region_for_store`). A code of None = name match only. OFF
+# or address (see `_region_for_store`); they include neighbourhoods that only
+# exist in that city ("נוף ים", "מורשה"). A code of None = name match only. OFF
 # cities still matter: a store recognised as being in an OFF city is left out
 # even when its address mentions an ON city ("רחוב הרצליה" in Netanya).
 ON, OFF = True, False
 
 _REGIONS: tuple[tuple[str, tuple[tuple[Optional[str], tuple[str, ...], bool], ...]], ...] = (
     ("השרון", (
-        ("6400", ("הרצליה", "הרצלייה"), ON),
-        ("2650", ("רמת השרון", "רמת-השרון", 'רמה"ש'), ON),
+        ("6400", ("הרצליה", "הרצלייה", "נוף ים", "נווה עמל", "יד התשעה", "נווה ישראל"), ON),
+        ("2650", ("רמת השרון", "רמת-השרון", 'רמה"ש', "מורשה", "נווה מגן", "נווה גן"), ON),
         ("7400", ("נתניה",), OFF),
         ("8700", ("רעננה",), OFF),
         ("6900", ("כפר סבא", "כפר-סבא", 'כפ"ס'), OFF),
@@ -129,10 +143,11 @@ _REGIONS: tuple[tuple[str, tuple[tuple[Optional[str], tuple[str, ...], bool], ..
         (None, ("כוכב יאיר",), OFF),
     )),
     ("תל אביב", (
-        ("5000", ("תל אביב", "תל-אביב", 'ת"א', "יד אליהו", "רמת אביב", "נווה צדק", "פלורנטין"), OFF),
+        ("5000", ("תל אביב", "תל-אביב", 'ת"א', "תל אביב יפו", "יד אליהו", "רמת אביב", "נווה צדק",
+                  "פלורנטין", "רמת החייל", "צהלה", "בבלי"), OFF),
     )),
     ("ראשון לציון והסביבה", (
-        ("8300", ("ראשון לציון", "ראשון-לציון", 'ראשל"צ', "ראשלצ"), OFF),
+        ("8300", ("ראשון לציון", "ראשון-לציון", 'ראשל"צ', "ראשלצ", "רמת אליהו", "נחלת יהודה"), OFF),
         ("7200", ("נס ציונה", "נס-ציונה"), OFF),
         ("2530", ("באר יעקב",), OFF),
         ("466", ("בית דגן",), OFF),
@@ -142,6 +157,18 @@ _REGIONS: tuple[tuple[str, tuple[tuple[Optional[str], tuple[str, ...], bool], ..
 )
 
 _REGION_ORDER: tuple[str, ...] = tuple(name for name, _ in _REGIONS)
+
+# ASCII names accepted in PW_MEAT_CITIES / PW_MEAT_REGIONS -> region or city.
+_SLUGS: dict[str, str] = {
+    "sharon": "השרון", "tel-aviv": "תל אביב", "rishon": "ראשון לציון והסביבה",
+    "herzliya": "הרצליה", "ramat-hasharon": "רמת השרון", "netanya": "נתניה",
+    "raanana": "רעננה", "kfar-saba": "כפר סבא", "hod-hasharon": "הוד השרון",
+    "kfar-yona": "כפר יונה", "even-yehuda": "אבן יהודה", "tel-mond": "תל מונד",
+    "kadima-zoran": "קדימה", "pardesiya": "פרדסיה", "tira": "טירה", "taibe": "טייבה",
+    "glil-yam": "גליל ים", "kalansawe": "קלנסווה", "kochav-yair": "כוכב יאיר",
+    "rishon-lezion": "ראשון לציון", "ness-ziona": "נס ציונה", "beer-yaakov": "באר יעקב",
+    "beit-dagan": "בית דגן", "holon": "חולון", "bat-yam": "בת ים",
+}
 
 # Every known city in table order: (region, city display name, enabled flag).
 _ALL_CITIES: tuple[tuple[str, str, bool], ...] = tuple(
@@ -165,11 +192,12 @@ def _norm(text: str) -> str:
 
 # (compiled pattern, region, city display name, spelling length), longest
 # spelling first. A spelling must stand as whole words ("הרצל" street never
-# matches "הרצליה", "רמת השרוני" is not "רמת השרון").
+# matches "הרצליה", "רמת השרוני" is not "רמת השרון"); a one-letter prefix
+# (ב / ו / ה / ל) is allowed: "ברמת השרון", "וחולון".
 _NAME_TO_REGION: list[tuple[re.Pattern, str, str, int]] = sorted(
     (
         (
-            re.compile(r"(?<![א-ת])" + re.escape(_norm(spelling)) + r"(?![א-ת\"])"),
+            re.compile(r"(?<![א-ת])[בוהל]?" + re.escape(_norm(spelling)) + r"(?![א-ת\"])"),
             region,
             names[0],
             len(spelling),
@@ -204,8 +232,12 @@ def _stores_per_region() -> int:
 
 
 def _top_per_category() -> int:
-    """How many deals to keep per meat category in the report."""
-    return _env_int("PW_TOP_PER_CATEGORY", 5) or 5
+    """How many deals to keep per meat category in the report.
+
+    PW_MEAT_TOP_PER_CATEGORY is read as an older name of the same setting.
+    """
+    name = "PW_TOP_PER_CATEGORY" if os.environ.get("PW_TOP_PER_CATEGORY") else "PW_MEAT_TOP_PER_CATEGORY"
+    return _env_int(name, 5) or 5
 
 
 _ALL_CITIES_WORDS = {"הכל", "הכול", "all", "*"}
@@ -215,10 +247,11 @@ def _enabled_cities() -> tuple[str, ...]:
     """City display names to scan, in table order.
 
     PW_MEAT_CITIES (comma-separated city or region names, any spelling from
-    `_REGIONS`, or "הכל") overrides the ON/OFF column. Unknown names are
-    logged and ignored; if nothing valid is left the ON/OFF column is used.
+    `_REGIONS` or an ASCII name from `_SLUGS`, or "הכל") overrides the ON/OFF
+    column; PW_MEAT_REGIONS is used when PW_MEAT_CITIES is empty. Unknown names
+    are logged and ignored; if nothing valid is left the ON/OFF column is used.
     """
-    raw = (os.environ.get("PW_MEAT_CITIES") or "").strip()
+    raw = (os.environ.get("PW_MEAT_CITIES") or os.environ.get("PW_MEAT_REGIONS") or "").strip()
     default = tuple(city for _r, city, on in _ALL_CITIES if on)
     if not raw:
         return default
@@ -229,6 +262,7 @@ def _enabled_cities() -> tuple[str, ...]:
             continue
         if part.lower() in _ALL_CITIES_WORDS:
             return _CITY_ORDER
+        part = _SLUGS.get(part.lower(), part)
         hits = {city for region, city, _on in _ALL_CITIES if _norm(region) == part}
         for region, cities in _REGIONS:
             for _code, names, _on in cities:
@@ -322,26 +356,42 @@ def _region_for_store(store: dict[str, str]) -> Optional[tuple[str, str]]:
     return name_hit or _match_city(store.get("address", ""), address=True)
 
 
-def _maybe_gunzip(raw: bytes) -> bytes:
-    try:
-        return gzip.decompress(raw)
-    except (OSError, EOFError):
-        return raw
+def _maybe_decompress(raw: bytes) -> bytes:
+    """Feeds come as gzip, zip (one member) or plain XML."""
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            return gzip.decompress(raw)
+        except (OSError, EOFError):
+            return raw
+    if raw[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                names = [n for n in zf.namelist() if not n.endswith("/")]
+                if names:
+                    return zf.read(names[0])
+        except (zipfile.BadZipFile, OSError):
+            return raw
+    return raw
+
+
+def _local(tag: object) -> str:
+    """Lower-case tag name without any XML namespace."""
+    return str(tag).rsplit("}", 1)[-1].lower()
 
 
 def _parse_stores(raw: bytes, cities: Optional[tuple[str, ...]] = None) -> list[StoreInfo]:
     """Parse a Stores XML file and keep only stores in the enabled cities."""
     try:
-        root = ET.fromstring(_maybe_gunzip(raw))
+        root = ET.fromstring(_maybe_decompress(raw))
     except ET.ParseError as exc:
         log.warning("Stores XML parse failed: %s", exc)
         return []
     enabled = set(_enabled_cities() if cities is None else cities)
     out: list[StoreInfo] = []
     for el in root.iter():
-        if el.tag.lower() != "store":
+        if _local(el.tag) != "store":
             continue
-        fields = {c.tag.lower(): (c.text or "").strip() for c in el}
+        fields = {_local(c.tag): (c.text or "").strip() for c in el}
         sid = fields.get("storeid", "")
         if not sid.isdigit():
             continue
@@ -495,6 +545,8 @@ _GROUND = ("טחון", "טחונה")
 _CATEGORY_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     # label, species, keywords
     # --- Chicken ---
+    # Wing tips / trimmings are not wings (much cheaper): catch-all.
+    ("עוף – אחר",                 "chicken", ("קצוות",)),
     ("טחון עוף",                  "chicken", _GROUND),
     ("פרגיות",                    "chicken", ("פרגית", "פרגיות")),
     ("חזה / פילה עוף",            "chicken", ("חזה", "פילה", "להקפצה")),
@@ -528,6 +580,7 @@ _CATEGORY_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("כבד אווז",                  "goose",   ("כבד",)),
     ("אווז – אחר",                "goose",   _GOOSE_WORDS),
     ("חזה ברווז",                 "duck",    ("חזה", "מגרה")),
+    ("שוק ברווז",                 "duck",    _DRUMSTICKS),
     ("ברווז – אחר",               "duck",    _DUCK_WORDS),
     # --- Lamb ---
     ("טחון כבש",                  "lamb",    _GROUND),
@@ -995,6 +1048,16 @@ class MeatPromo:
         return None
 
     @property
+    def end_date_display(self) -> str:
+        """End date of the deal as DD/MM/YYYY, '' when unknown."""
+        if not self.end_date:
+            return ""
+        try:
+            return datetime.strptime(self.end_date[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+        except ValueError:
+            return self.end_date
+
+    @property
     def savings_amount(self) -> Optional[Decimal]:
         """Saving per unit (per kg for weighed items)."""
         if self.regular_price and self.discounted_price is not None:
@@ -1081,27 +1144,29 @@ def _dec(text: Optional[str]) -> Optional[Decimal]:
 
 
 def _build_item_index(pricefull_root: ET.Element) -> dict[str, _FeedItem]:
-    """Map ItemCode → _FeedItem from a PriceFull XML tree."""
+    """Map ItemCode → _FeedItem from a PriceFull XML tree.
+
+    Every <Item> (or <Product>) anywhere in the tree counts, whatever the tag
+    case or namespace: an empty <Items/> before the real list (or a nested
+    one) must not hide the items.
+    """
     index: dict[str, _FeedItem] = {}
-    items = pricefull_root.find("Items")
-    if items is None:
-        items = pricefull_root.find(".//Items")
-    if items is None:
-        return index
-    for item in items.findall("Item"):
-        fields = {c.tag: (c.text or "").strip() for c in item}
-        code = fields.get("ItemCode", "")
-        name = fields.get("ItemName", "")
+    for item in pricefull_root.iter():
+        if _local(item.tag) not in ("item", "product"):
+            continue
+        fields = {_local(c.tag): (c.text or "").strip() for c in item}
+        code = fields.get("itemcode", "")
+        name = fields.get("itemname", "")
         if code and name:
             index[code] = _FeedItem(
                 name=name,
-                price=_dec(fields.get("ItemPrice")),
-                manufacturer=fields.get("ManufactureName", ""),
-                weighted=fields.get("bIsWeighted", "") == "1",
-                unit_of_measure=fields.get("UnitOfMeasure", ""),
-                unit_price=_dec(fields.get("UnitOfMeasurePrice")),
-                unit_qty=fields.get("UnitQty", ""),
-                quantity=_dec(fields.get("Quantity")),
+                price=_dec(fields.get("itemprice")),
+                manufacturer=fields.get("manufacturename", ""),
+                weighted=fields.get("bisweighted", "") == "1",
+                unit_of_measure=fields.get("unitofmeasure", ""),
+                unit_price=_dec(fields.get("unitofmeasureprice")),
+                unit_qty=fields.get("unitqty", ""),
+                quantity=_dec(fields.get("quantity")),
             )
     return index
 
@@ -1124,11 +1189,11 @@ def _build_item_index(pricefull_root: ET.Element) -> dict[str, _FeedItem]:
 # sources that contradict each other — the deal has no price per kg and is
 # left out of the ranking (counted in `unpriced_by_category`).
 
-_GRAM_UNITS = ("גרם", "גר", "גר'", "ג", "ג'")
+_GRAM_UNITS = ("גרם", "גרמים", "גר", "גר'", "ג", "ג'")
 _KG_UNITS = ("קילוגרם", "קילו", "ק\"ג", "קג", "ק\"", "ק'ג")
 _UNIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)?\s*([א-ת\"'.]+)\s*$")
 _NAME_WEIGHT_RE = re.compile(
-    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(קילוגרם|קילו|ק\"ג|קג|ק\"|גרם|גר'|גר|ג'|ג)(?![א-ת])"
+    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(קילוגרם|קילו|ק\"ג|קג|ק\"|גרמים|גרם|גר'|גר|ג'|ג)(?![א-ת])"
 )
 _PACK_TOLERANCE = Decimal("0.05")
 _MIN_PACK_G, _MAX_PACK_G = Decimal("50"), Decimal("10000")
@@ -1214,8 +1279,8 @@ def _scan_store(
     if not price_raw or not promo_raw:
         raise _StoreFeedError("download failed")
     try:
-        price_root = ET.fromstring(_maybe_gunzip(price_raw))
-        promo_root = ET.fromstring(_maybe_gunzip(promo_raw))
+        price_root = ET.fromstring(_maybe_decompress(price_raw))
+        promo_root = ET.fromstring(_maybe_decompress(promo_raw))
     except ET.ParseError as exc:
         raise _StoreFeedError(f"parse failed: {exc}") from exc
     item_index = _build_item_index(price_root)
@@ -1496,28 +1561,54 @@ def _bina_list(client: httpx.Client, base: str, file_type: str, store: int = 0) 
     return [str(row.get("FileNm", "")).strip() for row in rows if isinstance(row, dict)]
 
 
+def _looks_like_feed(body: bytes) -> bool:
+    if body[:2] == b"\x1f\x8b" or body[:4] == b"PK\x03\x04":
+        return True
+    head = body[:200].lstrip(b"\xef\xbb\xbf \r\n\t").lower()
+    return head.startswith(b"<?xml") or (
+        head.startswith(b"<") and not head.startswith((b"<!doctype", b"<html"))
+    )
+
+
 def _bina_download(client: httpx.Client, base: str, filename: str) -> Optional[bytes]:
     r = client.post(base + "Download.aspx", params={"FileNm": filename})
     if r.status_code != 200:
         return None
+    if _looks_like_feed(r.content):
+        return r.content  # the file itself instead of a link to it
     try:
         path = (r.json() or [{}])[0].get("SPath", "")
     except (ValueError, AttributeError, IndexError):
         return None
     if not path:
         return None
+    if not path.startswith("http"):
+        path = base + path.lstrip("/")
     r = client.get(path, timeout=120)
     return r.content if r.status_code == 200 else None
 
 
-def scan_bina_chain(subdomain: str, chain_name: str) -> tuple[list[MeatPromo], list[StoreInfo]]:
+def scan_bina_chain(
+    subdomain: str,
+    chain_name: str,
+    *,
+    client: Optional[httpx.Client] = None,
+) -> tuple[list[MeatPromo], list[StoreInfo]]:
     """Scan one chain hosted by Bina Projects (enabled cities only).
 
+    `subdomain` is the portal's sub-domain ("superbareket") or its full URL.
     Raises ChainScanError when the chain could not be scanned.
     """
-    base = _BINA_URL.format(sub=subdomain)
+    if "://" in subdomain:
+        base = subdomain.rstrip("/") + "/"
+    else:
+        base = _BINA_URL.format(sub=subdomain)
     log.info("%s: fetching store list from %s", chain_name, base)
-    with httpx.Client(follow_redirects=True, timeout=60, headers=_HEADERS) as client:
+    owned = (
+        httpx.Client(follow_redirects=True, timeout=60, headers=_HEADERS)
+        if client is None else nullcontext(client)
+    )
+    with owned as client:
         try:
             stores_files = sorted(
                 n for n in _bina_list(client, base, _BINA_STORES) if n.startswith("Stores")
@@ -1621,6 +1712,11 @@ def _desc_unit_price(desc: str) -> Optional[Decimal]:
     return total / qty
 
 
+# Deal fields that the standard layout carries on <Promotion> and the other
+# layout on each <PromotionItem> (an item's own value wins).
+_PROMO_LEVEL_FIELDS = ("DiscountRate", "DiscountedPrice", "MinQty", "DiscountedPricePerMida")
+
+
 def _extract_meat_promos(
     chain_name: str,
     store_id: str,
@@ -1636,30 +1732,36 @@ def _extract_meat_promos(
         return []
     seen: set[tuple[str, str]] = set()
     for promo in promos_container.findall("Promotion"):
-        desc_el = promo.find("PromotionDescription")
-        desc = (desc_el.text or "").strip() if desc_el is not None else ""
-        end_el = promo.find("PromotionEndDateTime")
-        end = (end_el.text or "").strip() if end_el is not None else ""
+        # Two layouts exist: prices on each <PromotionItem> (with
+        # PromotionEndDateTime and a ClubID text), or the standard one with
+        # the prices on the <Promotion> itself, <Item> children, separate
+        # PromotionEndDate / PromotionEndHour and <Clubs><ClubId>.
+        promo_fields = {c.tag: (c.text or "").strip() for c in promo if len(c) == 0}
+        desc = promo_fields.get("PromotionDescription", "")
+        end = promo_fields.get("PromotionEndDateTime") or promo_fields.get("PromotionEndDate") or ""
 
-        is_coupon_el = promo.find("AdditionalIsCoupon")
-        if is_coupon_el is not None and (is_coupon_el.text or "").strip() == "1":
+        if promo_fields.get("AdditionalIsCoupon") == "1":
             continue
         if _NOT_A_PROMO_PAT.search(_norm(desc)):
             continue
-        club_el = promo.find("ClubID")
-        if club_el is not None and club_el.text:
-            club_text = club_el.text.strip()
-            if club_text and not (club_text.startswith("0") or "כלל" in club_text):
-                continue
+        clubs = [(c.text or "").strip() for c in promo.iter() if _local(c.tag) == "clubid"]
+        clubs = [c for c in clubs if c]
+        if clubs and not any(c.startswith("0") or "כלל" in c for c in clubs):
+            continue
 
         items_container = promo.find(".//PromotionItems")
         if items_container is None:
             continue
-        for pi in items_container.findall("PromotionItem"):
-            fields = {c.tag: (c.text or "").strip() for c in pi}
+        for pi in items_container.findall("PromotionItem") + items_container.findall("Item"):
+            fields = {
+                **{k: promo_fields[k] for k in _PROMO_LEVEL_FIELDS if promo_fields.get(k)},
+                **{c.tag: (c.text or "").strip() for c in pi if (c.text or "").strip()},
+            }
             code = fields.get("ItemCode", "")
             if not code or code == "0" * len(code):
                 continue
+            if fields.get("IsGiftItem") == "1":
+                continue  # the free item of a "buy X get Y" deal
             item = item_index.get(code)
             if item is None:
                 continue
@@ -1710,6 +1812,39 @@ def _extract_meat_promos(
 
 # ---- Orchestrator ----
 
+def _bareket_source() -> Optional[tuple[str, str]]:
+    """(kind, argument) from PW_BAREKET_SOURCE, or None when switched off."""
+    raw = os.environ.get("PW_BAREKET_SOURCE", "").strip() or _BAREKET_DEFAULT_SOURCE
+    if raw.lower() in ("off", "none", "0", "false", "no"):
+        return None
+    kind, _sep, arg = raw.partition(":")
+    kind, arg = kind.strip().lower(), arg.strip()
+    if kind in ("bina", "publishedprices") and arg:
+        return kind, arg
+    log.warning("PW_BAREKET_SOURCE=%r not understood; %s skipped", raw, _BAREKET_NAME)
+    return None
+
+
+def _chain_tasks() -> list[tuple[str, Callable[[], tuple[list[MeatPromo], list[StoreInfo]]]]]:
+    """(chain name, scan function) for every chain to scan."""
+    tasks: list[tuple[str, Callable]] = [(_SHUFERSAL_NAME, lambda: scan_shufersal())]
+    for user, name in _PUBLISHEDPRICES_CHAINS:
+        tasks.append((name, lambda u=user, n=name: scan_publishedprices_chain(u, n)))
+    for sub, name in _BINA_CHAINS:
+        if name != _BAREKET_NAME:
+            tasks.append((name, lambda s=sub, n=name: scan_bina_chain(s, n)))
+            continue
+        source = _bareket_source()
+        if source is None:
+            continue
+        kind, arg = source
+        if kind == "bina":
+            tasks.append((name, lambda a=arg, n=name: scan_bina_chain(a, n)))
+        else:
+            tasks.append((name, lambda a=arg, n=name: scan_publishedprices_chain(a, n)))
+    return tasks
+
+
 def scan_and_report() -> SupermarketReport:
     """Scan every configured chain in parallel and return a combined report."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1719,11 +1854,7 @@ def scan_and_report() -> SupermarketReport:
         status="ok", cities=list(cities), regions=list(_active_regions(cities)),
     )
 
-    tasks: dict[str, object] = {_SHUFERSAL_NAME: scan_shufersal}
-    for user, name in _PUBLISHEDPRICES_CHAINS:
-        tasks[name] = (lambda u=user, n=name: scan_publishedprices_chain(u, n))
-    for sub, name in _BINA_CHAINS:
-        tasks[name] = (lambda s=sub, n=name: scan_bina_chain(s, n))
+    tasks = dict(_chain_tasks())
     log.info(
         "Running supermarket meat scan across %d chains (cities: %s)",
         len(tasks), ", ".join(cities),
@@ -1747,6 +1878,10 @@ def scan_and_report() -> SupermarketReport:
                 log.warning("%s: no meat items returned", name)
                 report.chains_empty[name] = "לא נמצאו מוצרי בשר"
                 continue
+            if not any(p.is_promo for p in promos):
+                # Scanned fine; its regular prices still compete in the tables.
+                log.info("%s: scanned, no meat deals today", name)
+                report.chains_empty[name] = "אין היום מבצעי בשר"
             report.promos.extend(promos)
             report.chains_scanned.append(name)
             for store in used:
@@ -1806,6 +1941,8 @@ def _finalize_report(report: SupermarketReport) -> None:
                 if branch not in kept.stores:
                     kept.stores.append(branch)
         seen_stores[key].add(p.store_id)
+        if p.end_date and (not kept.end_date or p.end_date < kept.end_date):
+            kept.end_date = p.end_date  # the deal ends first in that store
         for region in p.regions:
             if region not in kept.regions:
                 kept.regions.append(region)
@@ -1876,16 +2013,22 @@ def _promo_to_dict(p: MeatPromo) -> dict:
 
 
 def persist(report: SupermarketReport) -> None:
+    """Write the latest report atomically (temp file + os.replace)."""
     if report.status != "ok":
         return
-    _state_file().write_text(
+    path = _state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
         json.dumps({
             "schema_version": 1,
             "last_scanned_at": datetime.now().astimezone().isoformat(),
+            "cities": report.cities,
             "promos": [_promo_to_dict(p) for p in report.promos],
         }, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    os.replace(tmp, path)
 
 
 # ---- Terminal output ----
@@ -1924,6 +2067,7 @@ def print_report(report: SupermarketReport) -> None:
     table.add_column("Was/kg")
     table.add_column("Off")
     table.add_column("Deal")
+    table.add_column("Until")
     previous = None
     for p in report.promos:
         category = p.category or _categorize(p)
@@ -1936,6 +2080,7 @@ def print_report(report: SupermarketReport) -> None:
         table.add_row(
             category if category != previous else "", p.chain, ", ".join(p.stores or p.cities),
             p.item_name[:50], now, was, off, deal or p.promotion_description[:40],
+            p.end_date_display,
         )
         previous = category
     console.print(table)

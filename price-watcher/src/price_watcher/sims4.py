@@ -31,6 +31,7 @@ from rich.console import Console
 from rich.table import Table
 
 from price_watcher import logging_setup
+from price_watcher.http_headers import USER_AGENT
 from price_watcher.paths import data_dir
 
 log = logging_setup.get(__name__)
@@ -40,10 +41,7 @@ console = Console()
 _EA_STORE_URL = "https://www.ea.com/games/the-sims/the-sims-4/store/categories/all-packs"
 
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept-Language": "en",
     "Accept-Encoding": "gzip, deflate, br",
 }
@@ -194,18 +192,46 @@ def parse_packs(html: str) -> list[Sims4Pack]:
     return packs
 
 
-def scan_ea() -> list[Sims4Pack]:
-    """Fetch the EA Sims 4 all-packs page and extract pack info."""
+def _fetch(url: str) -> Optional[str]:
     try:
         with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
-            resp = client.get(_EA_STORE_URL)
-    except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError) as exc:
+            resp = client.get(url)
+    # HTTPError also covers TooManyRedirects / DecodingError, not only transport errors.
+    except httpx.HTTPError as exc:
         log.error("EA fetch failed: %s", exc)
-        return []
+        return None
     if resp.status_code != 200:
         log.warning("EA returned HTTP %s", resp.status_code)
-        return []
-    return parse_packs(resp.text)
+        return None
+    return resp.text
+
+
+@dataclass
+class Sims4Scan:
+    """Outcome of reading the store page: the packs, and whether it loaded at all."""
+    packs: list[Sims4Pack] = field(default_factory=list)
+    pages: int = 0
+    fetched: bool = False
+
+
+# Whether the last scan_ea() call loaded the store page (lets scan_and_report
+# tell "EA unreachable" from "page loaded but no packs could be read").
+_last_fetch_ok = False
+
+
+def scan_ea_detailed(fetch=None) -> Sims4Scan:
+    """Fetch the all-packs page (first 50 packs only, see the module docstring)."""
+    global _last_fetch_ok
+    html = (fetch or _fetch)(_EA_STORE_URL)
+    _last_fetch_ok = html is not None
+    if html is None:
+        return Sims4Scan()
+    return Sims4Scan(packs=parse_packs(html), pages=1, fetched=True)
+
+
+def scan_ea() -> list[Sims4Pack]:
+    """Fetch the EA Sims 4 all-packs page and extract pack info."""
+    return scan_ea_detailed().packs
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +274,20 @@ def _pack_to_dict(p: Sims4Pack) -> dict:
 # Core logic
 # ---------------------------------------------------------------------------
 
-def scan_and_report() -> Sims4Report:
+def scan_and_report(scan: Optional[Sims4Scan] = None) -> Sims4Report:
     """Scan EA, compare against stored state, return a report (no email, no save)."""
+    global _last_fetch_ok
     log.info("Scanning EA Sims 4 packs")
-    packs = scan_ea()
+    if scan is None:
+        _last_fetch_ok = False
+        found = scan_ea()
+        loaded = bool(found) or _last_fetch_ok
+        scan = Sims4Scan(packs=found, pages=1 if loaded else 0, fetched=loaded)
+    packs = scan.packs
+    if not scan.fetched:
+        return Sims4Report(status="fetch_failed", error="לא ניתן היה לטעון את החנות של EA")
     if not packs:
-        return Sims4Report(status="fetch_failed", error="לא זוהו חבילות בעמוד של EA")
+        return Sims4Report(status="parse_failed", error="לא זוהו חבילות בעמוד של EA")
 
     state = _load_state()
     stored = state.get("packs", {})
@@ -282,10 +316,11 @@ def persist(report: Sims4Report) -> None:
     state = _load_state()
     # Merge, don't replace: a pack that drops off the first store page keeps its
     # last known state, so it is not re-announced when it comes back.
+    now = datetime.now().astimezone().isoformat()
     merged = dict(state.get("packs", {}))
-    merged.update({p.slug: _pack_to_dict(p) for p in report.packs})
+    merged.update({p.slug: {**_pack_to_dict(p), "last_seen_at": now} for p in report.packs})
     state["packs"] = merged
-    state["last_scanned_at"] = datetime.now().astimezone().isoformat()
+    state["last_scanned_at"] = now
     _save_state(state)
 
 
