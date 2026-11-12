@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import typer
 from rich.console import Console
 
@@ -28,15 +30,127 @@ def version() -> None:
     console.print(f"price-watcher {__version__}")
 
 
+def parse_min_change(value: Optional[str]) -> dict:
+    """"5%" -> {"min_change_pct": 5.0}; "10" -> {"min_change_abs": "10"}."""
+    if value is None:
+        return {}
+    text = value.strip()
+    try:
+        if text.endswith("%"):
+            pct = float(text[:-1].strip())
+            if pct < 0:
+                raise ValueError
+            return {"min_change_pct": pct}
+        amount = float(text)
+        if amount < 0:
+            raise ValueError
+        return {"min_change_abs": text}
+    except ValueError:
+        raise typer.BadParameter(
+            f"{value!r}: use a percentage like 5% or an amount like 10",
+            param_hint="--min-change",
+        )
+
+
+_MIN_CHANGE_HELP = "Ignore smaller price changes: a percentage (5%) or an amount (10)"
+_TARGET_HELP = "Only notify about a price change once the price is at or below this"
+_DROPS_HELP = "Only notify when the price goes down"
+_PROMO_HELP = "Read the site's promotion banner (MyProtein) and estimate the final price"
+_EXCLUDED_HELP = "The item is excluded from site promotions: no estimated final price"
+
+
 @app.command()
 def add(
     url: str = typer.Argument(..., help="Product URL to watch"),
     name: str = typer.Option(None, "--name", help="Friendly label"),
     selector: str = typer.Option(None, "--selector", help="CSS selector for the price, used if auto-detection fails"),
+    only_drops: bool = typer.Option(False, "--only-drops", help=_DROPS_HELP),
+    min_change: Optional[str] = typer.Option(None, "--min-change", help=_MIN_CHANGE_HELP),
+    target: Optional[str] = typer.Option(None, "--target", help=_TARGET_HELP),
+    promo: bool = typer.Option(True, "--promo/--no-promo", help=_PROMO_HELP),
+    excluded_from_promo: bool = typer.Option(False, "--excluded-from-promo", help=_EXCLUDED_HELP),
 ) -> None:
     """Add a URL to the watch list."""
     from price_watcher.watchlist import add as _add
-    _add(url=url, name=name, selector=selector)
+
+    options: dict = {}
+    if only_drops:
+        options["notify_only_on_drop"] = True
+    options.update(parse_min_change(min_change))
+    if target is not None:
+        options["target_price"] = target
+    if not promo:
+        options["track_promo"] = False
+    if excluded_from_promo:
+        options["excluded_from_promo"] = True
+    _add(url=url, name=name, selector=selector, **options)
+
+
+@app.command(name="set")
+def set_cmd(
+    target: str = typer.Argument(..., help="URL or id of the watch to change"),
+    name: Optional[str] = typer.Option(None, "--name", help="Friendly label"),
+    selector: Optional[str] = typer.Option(None, "--selector", help="CSS selector for the price"),
+    only_drops: Optional[bool] = typer.Option(None, "--only-drops/--all-changes", help=_DROPS_HELP),
+    min_change: Optional[str] = typer.Option(
+        None, "--min-change", help=_MIN_CHANGE_HELP + "; 'none' removes it",
+    ),
+    target_price: Optional[str] = typer.Option(
+        None, "--target", help=_TARGET_HELP + "; 'none' removes it",
+    ),
+    promo: Optional[bool] = typer.Option(None, "--promo/--no-promo", help=_PROMO_HELP),
+    excluded_from_promo: Optional[bool] = typer.Option(
+        None, "--excluded-from-promo/--not-excluded-from-promo", help=_EXCLUDED_HELP,
+    ),
+    paused: Optional[bool] = typer.Option(None, "--pause/--resume", help="Skip this link in `check`"),
+) -> None:
+    """Change the settings of a watched URL (notification filters, promo, pause)."""
+    from price_watcher.watchlist import set_options
+
+    options: dict = {
+        "name": name,
+        "selector": selector,
+        "notify_only_on_drop": only_drops,
+        "track_promo": promo,
+        "excluded_from_promo": excluded_from_promo,
+        "paused": paused,
+    }
+    clear: list[str] = []
+    if min_change is not None:
+        clear += ["min_change_pct", "min_change_abs"]
+        if min_change.strip().lower() != "none":
+            parsed = parse_min_change(min_change)
+            clear = [k for k in clear if k not in parsed]
+            options.update(parsed)
+    if target_price is not None:
+        if target_price.strip().lower() == "none":
+            clear.append("target_price")
+        else:
+            options["target_price"] = target_price
+    if all(v is None for v in options.values()) and not clear:
+        raise typer.BadParameter("nothing to change; pass at least one option")
+    watch = set_options(target, clear=clear, **options)
+    console.print(f"[green]Updated:[/green] {watch.name or watch.url}")
+    console.print(_describe_settings(watch))
+
+
+def _describe_settings(w) -> str:
+    parts = []
+    if w.paused:
+        parts.append("paused")
+    if w.notify_only_on_drop:
+        parts.append("drops only")
+    if w.min_change_pct is not None:
+        parts.append(f"min change {w.min_change_pct:g}%")
+    if w.min_change_abs is not None:
+        parts.append(f"min change {w.min_change_abs}")
+    if w.target_price is not None:
+        parts.append(f"target ≤ {w.target_price}")
+    if not w.track_promo:
+        parts.append("promotion banner off")
+    if w.excluded_from_promo:
+        parts.append("excluded from promotions")
+    return "  settings: " + (", ".join(parts) if parts else "defaults (notify on every change)")
 
 
 @app.command(name="list")
@@ -57,16 +171,26 @@ def remove(target: str = typer.Argument(..., help="URL or id to remove")) -> Non
 def check(
     dry_run: bool = typer.Option(False, "--dry-run", help="Run the full pipeline but do not send email or write state"),
 ) -> None:
-    """Fetch, compare, notify and save state for every watched URL."""
+    """Fetch, compare, notify and save state for every watched URL.
+
+    Exit code: 0 = all links read (and any change email sent), 1 = at least
+    one link could not be fetched or read, 3 = a change email could not be
+    sent (the changes are retried on the next run).
+    """
     from price_watcher.scheduler import run_check
-    run_check(dry_run=dry_run)
+    raise typer.Exit(run_check(dry_run=dry_run))
 
 
 @app.command(name="test-email")
 def test_email() -> None:
     """Send a sample email to verify the SMTP setup."""
     from price_watcher.email_sender import send_test_email
-    send_test_email()
+    try:
+        send_test_email()
+    except Exception as exc:
+        console.print(f"[red]Test email failed:[/red] {type(exc).__name__}: {exc}")
+        raise typer.Exit(1)
+    console.print("[green]Test email sent.[/green] Check your inbox (and spam folder).")
 
 
 @app.command(name="install-schedule")
@@ -94,9 +218,12 @@ def status() -> None:
 def digest(
     dry_run: bool = typer.Option(False, "--dry-run", help="Collect + print, but do not email"),
 ) -> None:
-    """Send the daily sales digest: for each watched site, current promo banner (if any)."""
+    """Send the daily report: site promos, creatine, Sims 4, supermarket meat.
+
+    Exit code: 0 = sent (or dry run), 1 = the email could not be sent.
+    """
     from price_watcher.digest import run_digest
-    run_digest(dry_run=dry_run)
+    raise typer.Exit(run_digest(dry_run=dry_run))
 
 
 @app.command(name="install-digest-schedule")

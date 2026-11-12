@@ -1,10 +1,13 @@
-"""Email notifications for price / stock / promo changes.
+"""Email notifications for price / stock / promo changes and the daily report.
 
 Public API
 ----------
 send_change_notification(events)  -> bool
 send_test_email()                 -> None   (raises on failure)
 build_payload(events)             -> EmailPayload | None
+describe_failure(fetch)           -> dict   (status / detail / hint, Hebrew)
+build_daily_payload(report)       -> EmailPayload | None
+send_daily_email(report)          -> bool
 """
 
 from __future__ import annotations
@@ -16,19 +19,21 @@ from html import escape
 from urllib.parse import urlparse
 
 from price_watcher import config as _config_module
-from price_watcher.contracts import ChangeEvent, ChangeType, EmailPayload
+from price_watcher.contracts import (
+    NOTIFIABLE_TYPES,
+    ChangeEvent,
+    ChangeType,
+    EmailPayload,
+    FetchResult,
+    FetchStatus,
+    PromoInfo,
+)
 from price_watcher.logging_setup import get as _get_logger
 
 log = _get_logger(__name__)
 
-# Change types that warrant an email.
-_NOTIFIABLE = {
-    ChangeType.PRICE_CHANGED,
-    ChangeType.STOCK_CHANGED,
-    ChangeType.PROMO_CHANGED,
-    ChangeType.THRESHOLD_FAILURE,
-    ChangeType.RECOVERED,
-}
+# Change types that warrant an email (kept under the old private name).
+_NOTIFIABLE = NOTIFIABLE_TYPES
 
 # Well-known currency symbols.
 _CURRENCY_SYMBOLS: dict[str, str] = {
@@ -62,14 +67,30 @@ def _truncate(s: str, max_len: int = 35) -> str:
     return s[: max_len - 1] + "…"
 
 
+def _num(price: Decimal | None) -> str:
+    """Format a price: thousands separators, agorot only when non-zero.
+
+    499 -> "499", 1299.9 -> "1,299.90", 19.90 -> "19.90".
+    """
+    if price is None:
+        return "?"
+    text = f"{price:,.2f}"
+    return text[:-3] if text.endswith(".00") else text
+
+
 def _fmt_price(price: Decimal | None, symbol: str) -> str:
     if price is None:
         return "?"
-    return f"{price:,.2f} {symbol}".rstrip("0").rstrip(".")
+    return f"{_num(price)} {symbol}"
 
 
-def _direction_word(pct: float | None) -> str:
+def _direction_word(pct: float | None, diff: Decimal | None = None) -> str:
     """Internal (English) direction key — see _DIRECTION_HE for display."""
+    if diff is not None:
+        if diff < 0:
+            return "dropped"
+        if diff > 0:
+            return "rose"
     if pct is None:
         return "changed"
     return "dropped" if pct < 0 else "rose"
@@ -78,9 +99,13 @@ def _direction_word(pct: float | None) -> str:
 _DIRECTION_HE = {"dropped": "ירד", "rose": "עלה", "changed": "השתנה"}
 
 _STATUS_HE = {
+    "ok": "תקין",
     "unreachable": "האתר לא זמין",
     "blocked": "האתר חסם את הבקשה",
+    "not_found": "הדף לא נמצא (ייתכן שהמוצר הוסר)",
+    "price_not_found": "המחיר לא נמצא בדף",
     "fetch_failed": "האחזור נכשל",
+    "no_promo": "לא זוהה מבצע כלל-אתרי",
     "no_powder": "לא נמצאה אבקת קריאטין",
     "unavailable": "לא זמין",
 }
@@ -88,8 +113,8 @@ _STATUS_HE = {
 _SIGNATURE = "מעקב מחירים"
 
 
-def _direction_he(pct: float | None) -> str:
-    return _DIRECTION_HE[_direction_word(pct)]
+def _direction_he(pct: float | None, diff: Decimal | None = None) -> str:
+    return _DIRECTION_HE[_direction_word(pct, diff)]
 
 
 def _status_he(status: str | None) -> str:
@@ -106,6 +131,165 @@ def _ltr(value: object) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Failure description (threshold alert + last-run.json)
+# ---------------------------------------------------------------------------
+
+def describe_failure(fetch: FetchResult) -> dict:
+    """Explain why a fetch failed, in Hebrew, with what the user can do.
+
+    Returns {"status", "status_he", "http_status", "error_message",
+    "detail", "hint"}; ``detail`` is one line combining the status, the
+    HTTP code and the error message.
+    """
+    status = fetch.status.value if isinstance(fetch.status, FetchStatus) else str(fetch.status)
+    msg = (fetch.error_message or "").strip()
+    parts = [_status_he(status)]
+    if fetch.http_status:
+        parts.append(f"HTTP {fetch.http_status}")
+    detail = " · ".join(parts)
+    if msg:
+        detail += f" — {msg}"
+
+    low = msg.lower()
+    if fetch.status == FetchStatus.NOT_FOUND and "variant" in low:
+        hint = (
+            "המידה / הצבע שבקישור כבר לא קיימים במוצר. יש להסיר את המעקב "
+            "ולהוסיף אותו מחדש עם קישור לווריאנט קיים "
+            "(price-watcher remove ואז price-watcher add)."
+        )
+    elif fetch.status == FetchStatus.NOT_FOUND:
+        hint = (
+            "ייתכן שהמוצר הוסר מהאתר או שהקישור השתנה. בדקו את הקישור בדפדפן; "
+            "אם המוצר עבר לכתובת חדשה, הסירו את המעקב והוסיפו את הכתובת החדשה."
+        )
+    elif fetch.status == FetchStatus.BLOCKED:
+        hint = (
+            "האתר חוסם בקשות אוטומטיות (הגנה מבוטים). לרוב זה חולף מעצמו; "
+            "אם זה נמשך ימים, נסו להוסיף את המעקב מחדש עם ‎--selector‎."
+        )
+    elif fetch.status == FetchStatus.PRICE_NOT_FOUND:
+        hint = (
+            "הדף נטען אבל המחיר לא זוהה (או שזוהה מחיר 0). אם עיצוב הדף השתנה, "
+            "הוסיפו את המעקב מחדש עם ‎--selector‎ שמצביע על המחיר."
+        )
+    elif fetch.status == FetchStatus.UNREACHABLE:
+        hint = "האתר לא ענה. בדקו את החיבור לאינטרנט ושהאתר עולה בדפדפן."
+    else:
+        hint = None
+    return {
+        "status": status,
+        "status_he": _status_he(status),
+        "http_status": fetch.http_status,
+        "error_message": fetch.error_message,
+        "detail": detail,
+        "hint": hint,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion (MyProtein banner) wording
+# ---------------------------------------------------------------------------
+
+def _promo_computable(promo: PromoInfo | None) -> bool:
+    return promo is not None and promo.discount_pct > 0
+
+
+def _promo_desc(promo: PromoInfo) -> str:
+    pct = f"{_num(promo.discount_pct)}%"
+    if promo.code:
+        return f"הקוד {promo.code} ({pct})"
+    return f"הנחה אוטומטית ({pct})"
+
+
+def _promo_rows(event: ChangeEvent, sym: str) -> list[tuple[str, str]]:
+    """(label, plain-text value) rows about the promotion / estimated price.
+
+    The estimated final price is always marked as an estimate. A banner
+    that could not be read never turns into a price rise: it is reported as
+    "displayed price only".
+    """
+    fetch = event.fetch
+    promo = fetch.promo
+    rows: list[tuple[str, str]] = []
+    if event.watch.excluded_from_promo:
+        rows.append(("מבצעים", "הפריט מסומן כמוחרג ממבצעי האתר — מוצג המחיר המוצג בלבד"))
+        return rows
+    if not event.watch.track_promo:
+        return rows
+
+    old = event.old_promo if _promo_computable(event.old_promo) else None
+    if promo is None and old is not None:
+        rows.append(("מבצע", f"המבצע הסתיים (היה: {_promo_desc(old)})"))
+        rows.append(("מחיר סופי משוער", f"{_fmt_price(fetch.price, sym)} (ללא מבצע)"))
+        return rows
+    if promo is None:
+        return rows
+    if not _promo_computable(promo):
+        rows.append((
+            "מבצע",
+            "באנר המבצע לא נקרא במלואו או שהמבצע מדורג ('עד X%') — "
+            "לא ניתן להעריך מחיר סופי; מוצג המחיר המוצג בלבד",
+        ))
+        if promo.source_text:
+            rows.append(("טקסט הבאנר", promo.source_text[:200]))
+        return rows
+
+    est = fetch.estimated_final_price
+    rows.append((
+        "מחיר סופי משוער",
+        f"מוצג {_fmt_price(fetch.price, sym)}, בערך {_fmt_price(est, sym)} "
+        f"עם {_promo_desc(promo)} (הערכה)",
+    ))
+    if promo.condition:
+        rows.append(("תנאי המבצע", promo.condition[:200]))
+    if old is not None and (old.code != promo.code or old.discount_pct != promo.discount_pct):
+        rows.append(("מבצע קודם", _promo_desc(old)))
+    if (
+        event.old_estimated_price is not None
+        and est is not None
+        and event.old_estimated_price != est
+    ):
+        rows.append((
+            "מחיר משוער קודם",
+            f"{_fmt_price(event.old_estimated_price, sym)} → {_fmt_price(est, sym)}",
+        ))
+    return rows
+
+
+def _what_changed(event: ChangeEvent) -> str | None:
+    """Say whether the displayed price, the promotion or both changed."""
+    promo_changed = _promo_changed(event)
+    if event.type == ChangeType.PROMO_CHANGED:
+        return "המבצע (המחיר המוצג לא השתנה)"
+    if event.type == ChangeType.PRICE_CHANGED and promo_changed:
+        return "המחיר המוצג וגם המבצע"
+    if event.type == ChangeType.PRICE_CHANGED and _promo_computable(event.fetch.promo):
+        return "המחיר המוצג (המבצע לא השתנה)"
+    return None
+
+
+def _promo_changed(event: ChangeEvent) -> bool:
+    if not event.watch.track_promo or event.watch.excluded_from_promo:
+        return False
+    old = event.old_promo if _promo_computable(event.old_promo) else None
+    new = event.fetch.promo if _promo_computable(event.fetch.promo) else None
+    if old is None and new is None:
+        return False
+    if old is None or new is None:
+        return True
+    return old.code != new.code or old.discount_pct != new.discount_pct
+
+
+def _promo_heading(event: ChangeEvent) -> str:
+    old = event.old_promo if _promo_computable(event.old_promo) else None
+    if event.fetch.promo is None and old is not None:
+        return "המבצע הסתיים"
+    if old is None:
+        return "מבצע חדש"
+    return "המבצע השתנה"
+
+
+# ---------------------------------------------------------------------------
 # Subject builders
 # ---------------------------------------------------------------------------
 
@@ -114,19 +298,29 @@ def _subject_single(event: ChangeEvent) -> str:
     sym = _currency_symbol(event.fetch.currency)
 
     if event.type == ChangeType.PRICE_CHANGED:
-        old = f"{event.old_price:,.0f}" if event.old_price is not None else "?"
-        new = f"{event.new_price:,.0f}" if event.new_price is not None else "?"
+        old = _num(event.old_price)
+        new = _num(event.new_price)
         pct = f" ({event.pct_change:+.1f}%)" if event.pct_change is not None else ""
-        return f"המחיר {_direction_he(event.pct_change)}: {label} – מ-{old} ל-{new} {sym}{pct}"
+        return (
+            f"המחיר {_direction_he(event.pct_change, event.diff)}: {label} – "
+            f"מ-{old} ל-{new} {sym}{pct}"
+        )
 
     if event.type == ChangeType.STOCK_CHANGED:
         return f"עדכון מלאי: {label} – {_stock_he(event.fetch.in_stock)}"
 
     if event.type == ChangeType.PROMO_CHANGED:
-        return f"המבצע השתנה: {label}"
+        promo = event.fetch.promo
+        heading = _promo_heading(event)
+        if _promo_computable(promo) and event.fetch.estimated_final_price is not None:
+            return (
+                f"{heading}: {label} – בערך {_num(event.fetch.estimated_final_price)} {sym} "
+                f"עם {_promo_desc(promo)}"
+            )
+        return f"{heading}: {label}"
 
     if event.type == ChangeType.THRESHOLD_FAILURE:
-        return f"המעקב הפסיק לעבוד: {label}"
+        return f"המעקב הפסיק לעבוד: {label} – {_status_he(event.fetch.status.value)}"
 
     if event.type == ChangeType.RECOVERED:
         return f"המעקב חזר לעבוד: {label}"
@@ -147,72 +341,98 @@ def _subject_multi(events: list[ChangeEvent]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Event content (shared by the text and HTML bodies)
+# ---------------------------------------------------------------------------
+
+def _event_content(event: ChangeEvent) -> tuple[str, str, list[tuple[str, str]]]:
+    """Return (heading, heading colour, [(label, plain value), ...]).
+
+    Prices go in their own rows so the HTML body can keep them LTR.
+    """
+    label = _watch_label(event)
+    sym = _currency_symbol(event.fetch.currency)
+    ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
+    rows: list[tuple[str, str]] = []
+    color = ""
+
+    if event.type == ChangeType.PRICE_CHANGED:
+        direction = _direction_word(event.pct_change, event.diff)
+        color = "#c00" if direction == "rose" else "#080"
+        heading = f"המחיר {_DIRECTION_HE[direction]}: {label}"
+        diff_str = ""
+        if event.diff is not None:
+            diff_str = f"{event.diff:+,.2f} {sym}"
+            if event.pct_change is not None:
+                diff_str += f", {event.pct_change:+.1f}%"
+        rows += [
+            ("מחיר קודם", _fmt_price(event.old_price, sym)),
+            ("מחיר חדש", _fmt_price(event.new_price, sym)),
+        ]
+        if diff_str:
+            rows.append(("שינוי", diff_str))
+        if event.reason and "currency" in event.reason:
+            rows.append(("הערה", f"המטבע השתנה ({event.reason})"))
+        what = _what_changed(event)
+        if what:
+            rows.append(("מה השתנה", what))
+        rows += _promo_rows(event, sym)
+
+    elif event.type == ChangeType.STOCK_CHANGED:
+        color = "#080" if event.fetch.in_stock else "#c00"
+        heading = f"{_stock_he(event.fetch.in_stock)}: {label}"
+        rows.append(("מחיר נוכחי", _fmt_price(event.new_price or event.fetch.price, sym)))
+        rows += _promo_rows(event, sym)
+
+    elif event.type == ChangeType.PROMO_CHANGED:
+        heading = f"{_promo_heading(event)}: {label}"
+        rows.append(("מחיר מוצג", _fmt_price(event.fetch.price, sym)))
+        rows.append(("מה השתנה", _what_changed(event) or "המבצע"))
+        rows += _promo_rows(event, sym)
+
+    elif event.type == ChangeType.THRESHOLD_FAILURE:
+        color = "#c00"
+        heading = f"המעקב הפסיק לעבוד: {label}"
+        info = describe_failure(event.fetch)
+        rows.append(("סיבה", event.reason or "שגיאה לא ידועה"))
+        rows.append(("פירוט", info["detail"]))
+        if info["hint"]:
+            rows.append(("מה לעשות", info["hint"]))
+        rows.append(("הערה", "ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש; לא תישלח התראה נוספת עד אז."))
+
+    elif event.type == ChangeType.RECOVERED:
+        color = "#080"
+        heading = f"המעקב חזר לעבוד: {label}"
+        rows.append(("מחיר נוכחי", _fmt_price(event.new_price or event.fetch.price, sym)))
+        if (
+            event.old_price is not None
+            and event.new_price is not None
+            and event.old_price != event.new_price
+        ):
+            rows.append(("מחיר לפני התקלה", _fmt_price(event.old_price, sym)))
+        rows += _promo_rows(event, sym)
+
+    else:
+        heading = f"עדכון: {label}"
+
+    rows.append(("נבדק", ts))
+    return heading, color, rows
+
+
+_LTR_ROWS = {
+    "מחיר קודם", "מחיר חדש", "שינוי", "מחיר נוכחי", "מחיר מוצג",
+    "מחיר לפני התקלה", "נבדק", "מחיר משוער קודם",
+}
+
+
+# ---------------------------------------------------------------------------
 # Body builders (plain text)
 # ---------------------------------------------------------------------------
 
 def _text_event(event: ChangeEvent) -> str:
-    label = _watch_label(event)
-    sym = _currency_symbol(event.fetch.currency)
-    url = event.watch.url
-    ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
-    lines: list[str] = []
-
-    if event.type == ChangeType.PRICE_CHANGED:
-        old = _fmt_price(event.old_price, sym)
-        new = _fmt_price(event.new_price, sym)
-        diff_str = ""
-        if event.diff is not None and event.pct_change is not None:
-            diff_str = f"  ({event.diff:+,.2f} {sym}, {event.pct_change:+.1f}%)"
-        lines += [
-            f"המחיר {_direction_he(event.pct_change)}: {label}",
-            f"  מחיר קודם: {old}",
-            f"  מחיר חדש: {new}{diff_str}",
-            f"  קישור: {url}",
-            f"  נבדק: {ts}",
-        ]
-
-    elif event.type == ChangeType.STOCK_CHANGED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        lines += [
-            f"עדכון מלאי: {_stock_he(event.fetch.in_stock)}",
-            f"  מוצר: {label}",
-            f"  מחיר נוכחי: {price_str}",
-            f"  קישור: {url}",
-        ]
-
-    elif event.type == ChangeType.PROMO_CHANGED:
-        promo = event.fetch.promo
-        displayed = _fmt_price(event.fetch.price, sym)
-        estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-        lines += [f"המבצע השתנה: {label}"]
-        if promo:
-            if promo.code:
-                lines.append(f"  קוד: {promo.code}  ({promo.discount_pct}% הנחה)")
-            if promo.condition:
-                lines.append(f"  תנאים: {promo.condition}")
-        lines += [
-            f"  מחיר מוצג: {displayed}",
-            f"  מחיר סופי משוער: {estimated}",
-            f"  קישור: {url}",
-        ]
-
-    elif event.type == ChangeType.THRESHOLD_FAILURE:
-        reason = event.reason or "שגיאה לא ידועה"
-        lines += [
-            f"המעקב הפסיק לעבוד: {label}",
-            f"  סיבה: {reason}",
-            "  ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש.",
-            f"  קישור: {url}",
-        ]
-
-    elif event.type == ChangeType.RECOVERED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        lines += [
-            f"המעקב חזר לעבוד: {label}",
-            f"  מחיר נוכחי: {price_str}",
-            f"  קישור: {url}",
-        ]
-
+    heading, _color, rows = _event_content(event)
+    lines = [heading]
+    lines += [f"  {key}: {val}" for key, val in rows]
+    lines.append(f"  קישור: {event.watch.url}")
     return "\n".join(lines)
 
 
@@ -226,96 +446,37 @@ def _build_text_body(events: list[ChangeEvent]) -> str:
 # ---------------------------------------------------------------------------
 
 def _html_event(event: ChangeEvent) -> str:
-    label = escape(_watch_label(event))
-    sym = _currency_symbol(event.fetch.currency)
+    heading_text, color, rows = _event_content(event)
     url = escape(event.watch.url)
-    ts = event.timestamp.strftime("%Y-%m-%d %H:%M")
     link = f'<a href="{url}" dir="ltr">{url}</a>'
 
-    rows: list[str] = []
-
-    def row(key: str, val: str) -> str:
+    def row(key: str, val_html: str) -> str:
         return (
             f'<tr><td style="padding:4px 8px;color:#555;white-space:nowrap;text-align:right">'
             f'<strong>{escape(key)}</strong></td>'
-            f'<td style="padding:4px 8px;text-align:right">{val}</td></tr>'
+            f'<td style="padding:4px 8px;text-align:right">{val_html}</td></tr>'
         )
 
-    if event.type == ChangeType.PRICE_CHANGED:
-        direction = _direction_word(event.pct_change)
-        color = "#c00" if direction == "rose" else "#080"
-        old = _fmt_price(event.old_price, sym)
-        new = _fmt_price(event.new_price, sym)
-        diff_str = ""
-        if event.diff is not None and event.pct_change is not None:
-            diff_str = f"{event.diff:+,.2f} {sym}, {event.pct_change:+.1f}%"
-        heading = (
-            f'המחיר <span style="color:{color}">{_DIRECTION_HE[direction]}</span>: {label}'
-        )
-        rows += [
-            row("מחיר קודם", _ltr(old)),
-            row("מחיר חדש", f'<strong style="color:{color}">{_ltr(new)}</strong>'),
-            row("שינוי", _ltr(diff_str)),
-            row("נבדק", _ltr(ts)),
-            row("קישור", link),
-        ]
+    html_rows: list[str] = []
+    for key, val in rows:
+        val_html = _ltr(val) if key in _LTR_ROWS else escape(val)
+        if key == "מחיר חדש" and color:
+            val_html = f'<strong style="color:{color}">{val_html}</strong>'
+        html_rows.append(row(key, val_html))
+    html_rows.append(row("קישור", link))
 
-    elif event.type == ChangeType.STOCK_CHANGED:
-        color = "#080" if event.fetch.in_stock else "#c00"
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        heading = f'<span style="color:{color}">{_stock_he(event.fetch.in_stock)}</span>: {label}'
-        rows += [
-            row("מחיר נוכחי", _ltr(price_str)),
-            row("קישור", link),
-        ]
+    heading = escape(heading_text)
+    if color:
+        heading = f'<span style="color:{color}">{heading}</span>'
 
-    elif event.type == ChangeType.PROMO_CHANGED:
-        promo = event.fetch.promo
-        displayed = _fmt_price(event.fetch.price, sym)
-        estimated = _fmt_price(event.fetch.estimated_final_price, sym)
-        heading = f"המבצע השתנה: {label}"
-        if promo and promo.code:
-            rows.append(row(
-                "קוד",
-                f'<strong dir="ltr">{escape(promo.code)}</strong> '
-                f'({escape(str(promo.discount_pct))}% הנחה)',
-            ))
-        if promo and promo.condition:
-            rows.append(row("תנאים", escape(promo.condition)))
-        rows += [
-            row("מחיר מוצג", _ltr(displayed)),
-            row("מחיר סופי משוער", f'<strong>{_ltr(estimated)}</strong> <em>(הערכה)</em>'),
-            row("קישור", link),
-        ]
-
-    elif event.type == ChangeType.THRESHOLD_FAILURE:
-        reason = escape(event.reason or "שגיאה לא ידועה")
-        heading = f'המעקב הפסיק לעבוד: {label}'
-        rows += [
-            row("סיבה", reason),
-            row("הערה", "ניסיונות חוזרים יימשכו ברקע עד שהמעקב יתאושש."),
-            row("קישור", link),
-        ]
-
-    elif event.type == ChangeType.RECOVERED:
-        price_str = _fmt_price(event.new_price or event.fetch.price, sym)
-        heading = f'המעקב חזר לעבוד: {label}'
-        rows += [
-            row("מחיר נוכחי", _ltr(price_str)),
-            row("קישור", link),
-        ]
-    else:
-        heading = f"עדכון: {label}"
-
-    table = (
+    return (
         '<table dir="rtl" style="border-collapse:collapse;font-family:sans-serif;font-size:14px;'
         'width:100%;max-width:560px">'
         f'<tr><th colspan="2" style="text-align:right;padding:8px;background:#f4f4f4;'
         f'border-bottom:2px solid #ddd">{heading}</th></tr>'
-        + "".join(rows)
+        + "".join(html_rows)
         + "</table>"
     )
-    return table
 
 
 def _build_html_body(events: list[ChangeEvent]) -> str:
@@ -355,7 +516,7 @@ def build_payload(events: list[ChangeEvent]) -> EmailPayload | None:
     return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
 
 
-def _send_via_smtp(payload: EmailPayload, cfg: "config.EmailConfig") -> None:  # type: ignore[name-defined]
+def _send_via_smtp(payload: EmailPayload, cfg: _config_module.EmailConfig) -> None:
     """Low-level SMTP send. Raises on any failure."""
     msg = EmailMessage()
     msg["Subject"] = payload.subject
@@ -384,7 +545,11 @@ def send_change_notification(events: list[ChangeEvent]) -> bool:
         log.debug("send_change_notification: no notifiable events, skipping email")
         return True
 
-    cfg = _config_module.load().email
+    try:
+        cfg = _config_module.load().email
+    except Exception as exc:  # missing / invalid SMTP settings in .env
+        log.error("Cannot send notification email: %s", exc)
+        return False
     try:
         log.info("Sending notification email: %s", payload.subject)
         _send_via_smtp(payload, cfg)
@@ -427,107 +592,84 @@ def send_test_email() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Daily sales digest
+# Daily report: site-wide promotions section
 # ---------------------------------------------------------------------------
 
-def build_digest_payload(digests) -> EmailPayload | None:
-    """Build the detailed daily digest email. Lists every promo per site with
-    code, percentage, condition, and raw source excerpt."""
-    from price_watcher.digest import SiteDigest  # lazy to avoid circular import
-    digests: list[SiteDigest] = list(digests)
-    if not digests:
-        return None
+def _site_promos_section_text(site_digests) -> list[str]:
+    """Plain-text lines for the "site-wide promotions" part of the daily email."""
+    from price_watcher.digest import NO_PROMO_HE
 
-    all_promos = [(d, p) for d in digests for p in d.promos]
-    if all_promos:
-        best = max(all_promos, key=lambda dp: dp[1].discount_pct)
-        best_site, best_promo = best
-        total = len(all_promos)
-        subject = (
-            f"דוח מבצעים יומי: {total} מבצעים "
-            f"(המוביל: {best_promo.discount_pct}% הנחה ב-{best_site.display_name}"
-            + (f" עם הקוד {best_promo.code}" if best_promo.code else "")
-            + ")"
-        )
-    else:
-        subject = "דוח מבצעים יומי: אין היום מבצעים כלל-אתריים"
-
-    # --- Plain text body ---
-    text_lines = ["דוח מבצעים יומי", "=" * 50, ""]
-    for d in digests:
-        text_lines.append(f"▼ {d.display_name}  ({d.host})")
-        text_lines.append(f"   {d.homepage_url}")
-        if d.status != "ok":
-            text_lines.append(f"   [{_status_he(d.status)}] {d.error or ''}")
-            text_lines.append("")
+    lines = ["מבצעים כלל-אתריים", "-" * 50, ""]
+    if not site_digests:
+        lines.append("  (אין אתרים ברשימת המעקב)")
+        lines.append("")
+    for d in site_digests:
+        lines.append(f"▼ {d.display_name}  ({d.host})")
+        lines.append(f"  {d.homepage_url}")
+        if d.failed:
+            lines.append(f"  [{_status_he(d.status)}] {d.error or ''}".rstrip())
+            lines.append("")
             continue
         if not d.promos:
-            text_lines.append("   (לא זוהה מבצע כלל-אתרי)")
-            text_lines.append("")
+            lines.append(f"  ({NO_PROMO_HE})")
+            lines.append("")
             continue
         for i, p in enumerate(d.promos, 1):
             code_part = f"קוד: {p.code}" if p.code else "ללא קוד"
-            text_lines.append(f"   {i}. {p.discount_pct}% הנחה  —  {code_part}")
+            lines.append(f"  {i}. {p.discount_pct}% הנחה  —  {code_part}")
             if p.condition:
-                text_lines.append(f"      פירוט: {p.condition[:200]}")
-        text_lines.append("")
-    text_lines.append(f"— {_SIGNATURE}")
-    text_body = "\n".join(text_lines)
+                lines.append(f"     {p.condition[:200]}")
+        lines.append("")
+    return lines
 
-    # --- HTML body ---
-    html_parts = [
-        '<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8"></head>',
-        '<body dir="rtl" style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;'
-        'padding:16px;max-width:680px;line-height:1.5;text-align:right">',
-        '<h2 style="margin:0 0 20px">דוח מבצעים יומי</h2>',
-    ]
-    for d in digests:
-        html_parts.append(
-            f'<div style="margin:0 0 24px;padding:14px 16px;border:1px solid #e5e7eb;'
+
+def _site_promos_section_html(site_digests) -> str:
+    """HTML for the "site-wide promotions" part of the daily email."""
+    from price_watcher.digest import NO_PROMO_HE
+
+    parts: list[str] = []
+    if not site_digests:
+        parts.append('<div style="color:#888;font-style:italic">אין אתרים ברשימת המעקב.</div>')
+    for d in site_digests:
+        parts.append(
+            f'<div style="margin:0 0 20px;padding:14px 16px;border:1px solid #e5e7eb;'
             f'border-radius:8px;background:#fafafa">'
-        )
-        html_parts.append(
             f'<div style="font-size:16px;font-weight:600">{escape(d.display_name)}'
-            f' <a href="{escape(d.homepage_url)}" style="font-weight:normal;color:#2563eb;'
+            f' <a href="{escape(d.homepage_url)}" dir="ltr" style="font-weight:normal;color:#2563eb;'
             f'text-decoration:none;font-size:13px">({escape(d.host)})</a></div>'
         )
-        if d.status != "ok":
-            html_parts.append(
+        if d.failed:
+            parts.append(
                 f'<div style="margin-top:8px;color:#c33">'
                 f'<b>{escape(_status_he(d.status))}:</b> {escape(d.error or "—")}</div>'
             )
         elif not d.promos:
-            html_parts.append(
+            parts.append(
                 '<div style="margin-top:8px;color:#888;font-style:italic">'
-                'לא זוהה מבצע כלל-אתרי</div>'
+                f'{NO_PROMO_HE}</div>'
             )
         else:
             for p in d.promos:
                 code_html = (
-                    f'<code style="background:#111;color:#fff;padding:2px 8px;'
-                    f'border-radius:4px;font-size:14px;font-weight:600" dir="ltr">{escape(p.code)}</code>'
+                    f'<code dir="ltr" style="background:#111;color:#fff;padding:2px 8px;'
+                    f'border-radius:4px;font-size:14px;font-weight:600">{escape(p.code)}</code>'
                     if p.code
                     else '<span style="color:#888;font-size:13px">(ללא קוד)</span>'
                 )
-                html_parts.append(
+                parts.append(
                     f'<div style="margin:10px 0 0;padding-top:10px;border-top:1px solid #eee">'
                     f'<div style="font-size:15px">'
-                    f'<b style="color:#dc2626">{p.discount_pct}% הנחה</b>  &nbsp; {code_html}</div>'
+                    f'<b style="color:#dc2626">{escape(str(p.discount_pct))}% הנחה</b>'
+                    f'  &nbsp; {code_html}</div>'
                 )
                 if p.condition:
-                    html_parts.append(
+                    parts.append(
                         f'<div style="margin-top:4px;color:#555;font-size:13px">'
                         f'{escape(p.condition[:300])}</div>'
                     )
-                html_parts.append('</div>')
-        html_parts.append('</div>')
-    html_parts.append(
-        f'<p style="color:#999;font-size:12px;margin-top:24px">— {_SIGNATURE}</p>'
-        '</body></html>'
-    )
-    html_body = "".join(html_parts)
-
-    return EmailPayload(subject=subject, text_body=text_body, html_body=html_body)
+                parts.append('</div>')
+        parts.append('</div>')
+    return "".join(parts)
 
 
 def _group_meat_by_category(sm):
@@ -1043,29 +1185,7 @@ def build_daily_payload(report) -> EmailPayload | None:
 
     # ---- Plain text ----
     text_lines = ["דוח יומי", "=" * 50, ""]
-    text_lines.append("מבצעים כלל-אתריים")
-    text_lines.append("-" * 50)
-    text_lines.append("")
-    if not site_digests:
-        text_lines.append("  (אין אתרים ברשימת המעקב)")
-        text_lines.append("")
-    for d in site_digests:
-        text_lines.append(f"▼ {d.display_name}  ({d.host})")
-        text_lines.append(f"  {d.homepage_url}")
-        if d.status != "ok":
-            text_lines.append(f"  [{_status_he(d.status)}] {d.error or ''}")
-            text_lines.append("")
-            continue
-        if not d.promos:
-            text_lines.append("  (לא זוהה מבצע כלל-אתרי)")
-            text_lines.append("")
-            continue
-        for i, p in enumerate(d.promos, 1):
-            code_part = f"קוד: {p.code}" if p.code else "ללא קוד"
-            text_lines.append(f"  {i}. {p.discount_pct}% הנחה  —  {code_part}")
-            if p.condition:
-                text_lines.append(f"     {p.condition[:200]}")
-        text_lines.append("")
+    text_lines.extend(_site_promos_section_text(site_digests))
     text_lines.extend(_creatine_section_text(report.creatine))
     text_lines.append("")
     text_lines.extend(_sims4_section_text(getattr(report, "sims4", None)))
@@ -1095,48 +1215,7 @@ def build_daily_payload(report) -> EmailPayload | None:
         f'<tr><td style="padding:16px 24px;text-align:right">',
         _section_heading_html("מבצעים כלל-אתריים", first=True),
     ]
-    if not site_digests:
-        html_parts.append(
-            '<div style="color:#888;font-style:italic">אין אתרים ברשימת המעקב.</div>'
-        )
-    for d in site_digests:
-        html_parts.append(
-            f'<div style="margin:0 0 20px;padding:14px 16px;border:1px solid #e5e7eb;'
-            f'border-radius:8px;background:#fafafa">'
-            f'<div style="font-size:16px;font-weight:600">{escape(d.display_name)}'
-            f' <a href="{escape(d.homepage_url)}" dir="ltr" style="font-weight:normal;color:#2563eb;'
-            f'text-decoration:none;font-size:13px">({escape(d.host)})</a></div>'
-        )
-        if d.status != "ok":
-            html_parts.append(
-                f'<div style="margin-top:8px;color:#c33">'
-                f'<b>{escape(_status_he(d.status))}:</b> {escape(d.error or "—")}</div>'
-            )
-        elif not d.promos:
-            html_parts.append(
-                '<div style="margin-top:8px;color:#888;font-style:italic">'
-                'לא זוהה מבצע כלל-אתרי</div>'
-            )
-        else:
-            for p in d.promos:
-                code_html = (
-                    f'<code dir="ltr" style="background:#111;color:#fff;padding:2px 8px;'
-                    f'border-radius:4px;font-size:14px;font-weight:600">{escape(p.code)}</code>'
-                    if p.code
-                    else '<span style="color:#888;font-size:13px">(ללא קוד)</span>'
-                )
-                html_parts.append(
-                    f'<div style="margin:10px 0 0;padding-top:10px;border-top:1px solid #eee">'
-                    f'<div style="font-size:15px">'
-                    f'<b style="color:#dc2626">{p.discount_pct}% הנחה</b>  &nbsp; {code_html}</div>'
-                )
-                if p.condition:
-                    html_parts.append(
-                        f'<div style="margin-top:4px;color:#555;font-size:13px">'
-                        f'{escape(p.condition[:300])}</div>'
-                    )
-                html_parts.append('</div>')
-        html_parts.append('</div>')
+    html_parts.append(_site_promos_section_html(site_digests))
 
     html_parts.append(_section_heading_html("קריאטין"))
     html_parts.append(_creatine_section_html(report.creatine))
@@ -1165,31 +1244,15 @@ def send_daily_email(report) -> bool:
     if payload is None:
         log.info("No daily report to send")
         return True
-    cfg = _config_module.load().email
+    try:
+        cfg = _config_module.load().email
+    except Exception as exc:  # missing / invalid SMTP settings in .env
+        log.error("Cannot send the daily email: %s", exc)
+        return False
     try:
         _send_via_smtp(payload, cfg)
         log.info("Daily email sent to %s", cfg.email_to)
         return True
     except (smtplib.SMTPException, OSError) as exc:
-        log.error("Daily email send failed: %s", type(exc).__name__)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Legacy digest-only payload (kept for backward compatibility, unused now)
-# ---------------------------------------------------------------------------
-
-def send_digest_email(digests) -> bool:
-    """Send the daily digest email. Returns True on success, False on failure."""
-    payload = build_digest_payload(digests)
-    if payload is None:
-        log.info("No digest to send (no sites)")
-        return True
-    cfg = _config_module.load().email
-    try:
-        _send_via_smtp(payload, cfg)
-        log.info("Digest email sent to %s", cfg.email_to)
-        return True
-    except (smtplib.SMTPException, OSError) as exc:
-        log.error("Digest email send failed: %s", type(exc).__name__)
+        log.error("Daily email send failed: %s: %s", type(exc).__name__, exc)
         return False

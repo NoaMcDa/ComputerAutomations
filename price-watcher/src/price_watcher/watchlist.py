@@ -4,9 +4,10 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -14,9 +15,11 @@ from rich.console import Console
 from rich.table import Table
 
 from price_watcher.contracts import Watch
+from price_watcher.logging_setup import get as _get_logger
 from price_watcher.paths import watchlist_file
 
 console = Console()
+log = _get_logger(__name__)
 
 _SCHEMA_VERSION = 1
 _KEEP_PARAMS = {"variant", "size", "sku", "color", "colour", "flavour", "pid", "product_id", "id"}
@@ -49,18 +52,75 @@ class _Encoder(json.JSONEncoder):
         return super().default(obj)
 
 
+_WATCH_FIELDS = {f.name for f in dataclasses.fields(Watch)}
+_DECIMAL_FIELDS = ("target_price", "min_change_abs")
+
+
+def _watch_from_record(rec: Any) -> Watch:
+    """Build a Watch from one stored record. Raises ValueError if unusable."""
+    if not isinstance(rec, dict):
+        raise ValueError(f"record is a {type(rec).__name__}, not an object")
+    if not rec.get("id") or not rec.get("url"):
+        raise ValueError("record has no id or url")
+    unknown = set(rec) - _WATCH_FIELDS
+    if unknown:
+        log.warning(
+            "Watch %s: ignoring unknown field(s) %s in %s",
+            rec.get("id"), ", ".join(sorted(unknown)), watchlist_file(),
+        )
+    rec = {k: v for k, v in rec.items() if k in _WATCH_FIELDS}
+    if rec.get("created_at"):
+        rec["created_at"] = datetime.fromisoformat(str(rec["created_at"]))
+    else:
+        rec.pop("created_at", None)
+    for key in _DECIMAL_FIELDS:
+        if rec.get(key) is not None:
+            try:
+                rec[key] = Decimal(str(rec[key]))
+            except InvalidOperation as exc:
+                raise ValueError(f"{key} {rec[key]!r} is not a number") from exc
+    return Watch(**rec)
+
+
+def _backup_corrupt(path, exc: Exception) -> None:
+    backup = path.with_name(f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    try:
+        shutil.copy2(path, backup)
+        log.error("Watch list %s is unreadable (%s); backed up to %s", path, exc, backup)
+        console.print(
+            f"[red]The watch list file is corrupt ({exc}).[/red] "
+            f"A copy was saved to {backup}."
+        )
+    except OSError:
+        log.error("Watch list %s is unreadable (%s)", path, exc)
+
+
 def load_all() -> list[Watch]:
+    """Load the watch list.
+
+    Never raises on bad data: a corrupt file is backed up and treated as
+    empty; a record with unknown keys keeps its known fields; an unusable
+    record is logged and skipped. One bad entry must not take down `check`,
+    `list` or `digest`.
+    """
     path = watchlist_file()
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        records = data.get("watches", []) if isinstance(data, dict) else None
+        if not isinstance(records, list):
+            raise ValueError("no 'watches' list")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        _backup_corrupt(path, exc)
+        return []
     watches = []
-    for rec in data.get("watches", []):
-        if "created_at" in rec and rec["created_at"]:
-            rec["created_at"] = datetime.fromisoformat(rec["created_at"])
-        if "target_price" in rec and rec["target_price"] is not None:
-            rec["target_price"] = Decimal(rec["target_price"])
-        watches.append(Watch(**rec))
+    for i, rec in enumerate(records):
+        try:
+            watches.append(_watch_from_record(rec))
+        except (TypeError, ValueError) as exc:
+            log.error("Skipping watch #%d in %s: %s", i + 1, path, exc)
+            console.print(f"[yellow]Skipping an unreadable watch entry (#{i + 1}): {exc}[/yellow]")
     return watches
 
 
@@ -84,9 +144,11 @@ def save_all(watches: list[Watch]) -> None:
         raise
 
 
-def add(url: str, name: str | None = None, selector: str | None = None) -> None:
+def add(url: str, name: str | None = None, selector: str | None = None, **options: Any) -> None:
+    """Add a watch. *options* are extra Watch settings (see set_options)."""
     try:
         normalised = _normalise_url(url)
+        opts = _check_options(options)
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise SystemExit(1)
@@ -120,6 +182,7 @@ def add(url: str, name: str | None = None, selector: str | None = None) -> None:
         name=name,
         selector=selector,
         created_at=datetime.now(),
+        **opts,
     )
     watches.append(watch)
     save_all(watches)
@@ -187,3 +250,75 @@ def remove(target: str) -> None:
         pass
 
     console.print(f"[green]Removed:[/green] {target}")
+
+
+# ---------------------------------------------------------------------------
+# Per-watch notification settings
+# ---------------------------------------------------------------------------
+
+# Settings that `add` / `set` may change (everything except identity fields).
+SETTABLE_OPTIONS = (
+    "name", "selector", "notify_only_on_drop", "min_change_pct", "min_change_abs",
+    "target_price", "track_promo", "excluded_from_promo", "paused",
+)
+
+
+def _check_options(options: dict) -> dict:
+    """Validate and normalise per-watch settings; raises ValueError."""
+    unknown = set(options) - set(SETTABLE_OPTIONS)
+    if unknown:
+        raise ValueError(f"unknown watch option(s): {', '.join(sorted(unknown))}")
+    out = dict(options)
+    for key in ("target_price", "min_change_abs"):
+        if out.get(key) is not None:
+            try:
+                value = Decimal(str(out[key]))
+            except InvalidOperation as exc:
+                raise ValueError(f"{key}: {out[key]!r} is not a number") from exc
+            if value < 0:
+                raise ValueError(f"{key} must not be negative")
+            out[key] = value
+    if out.get("min_change_pct") is not None:
+        out["min_change_pct"] = float(out["min_change_pct"])
+        if out["min_change_pct"] < 0:
+            raise ValueError("min_change_pct must not be negative")
+    return out
+
+
+def find(watches: list[Watch], target: str) -> Watch | None:
+    """Find a watch by id or (normalised) URL."""
+    try:
+        normalised = _normalise_url(target)
+        target_id = _make_id(normalised)
+    except ValueError:
+        normalised, target_id = None, target
+    for w in watches:
+        if w.id in (target, target_id) or (normalised and w.url == normalised):
+            return w
+    return None
+
+
+def set_options(target: str, **options: Any) -> Watch:
+    """Change settings of an existing watch (by URL or id). Returns the new Watch.
+
+    Options left as None are not changed; to clear a numeric setting pass
+    the CLI's "none" (handled by the CLI as ``clear=[...]``).
+    """
+    clear = options.pop("clear", None) or []
+    watches = load_all()
+    watch = find(watches, target)
+    if watch is None:
+        console.print(f"[yellow]Not found:[/yellow] {target!r}")
+        raise SystemExit(1)
+    try:
+        changes = _check_options({k: v for k, v in options.items() if v is not None})
+        for key in clear:
+            if key not in SETTABLE_OPTIONS:
+                raise ValueError(f"unknown watch option: {key}")
+            changes[key] = None
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise SystemExit(1)
+    updated = dataclasses.replace(watch, **changes)
+    save_all([updated if w.id == watch.id else w for w in watches])
+    return updated

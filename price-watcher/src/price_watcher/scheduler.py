@@ -2,10 +2,11 @@
 
 Public API
 ----------
-run_check(dry_run=False) -> int
+run_check(dry_run=False) -> int    exit code, see EXIT_* below
 install_schedule()       -> None
 uninstall_schedule()     -> None
 status()                 -> None
+install_digest_schedule() / uninstall_digest_schedule()
 """
 
 from __future__ import annotations
@@ -16,19 +17,36 @@ import plistlib
 import random
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 import filelock
 from rich.console import Console
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from price_watcher import config as _config_mod
-from price_watcher.contracts import ChangeEvent, ChangeType, FetchStatus
+from price_watcher.contracts import (
+    NOTIFIABLE_TYPES,
+    ChangeEvent,
+    ChangeType,
+    FetchResult,
+    FetchStatus,
+    Watch,
+)
+from price_watcher.logging_setup import get as _get_logger
 from price_watcher.paths import data_dir, lock_file, log_dir
 
 _console = Console()
+log = _get_logger(__name__)
+
+# Exit codes of `check` (also what the OS scheduler records for the run).
+EXIT_OK = 0
+EXIT_LINK_FAILED = 1      # at least one link could not be fetched / read
+EXIT_EMAIL_FAILED = 3     # a change email could not be sent (changes held back)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,6 +63,7 @@ _CHECK_HOUR = 9
 _DIGEST_PLIST_LABEL = "com.noada.price-watcher.digest"
 _DIGEST_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_DIGEST_PLIST_LABEL}.plist"
 _DIGEST_WIN_TASK_NAME = "PriceWatcherDailyDigest"
+_DIGEST_HOUR = 9
 
 
 def _repo_dir() -> Path:
@@ -53,248 +72,316 @@ def _repo_dir() -> Path:
 
 
 def _venv_python() -> str:
+    """The interpreter of the project's own virtual environment."""
     return sys.executable
+
+
+def last_run_path() -> Path:
+    return data_dir() / "last-run.json"
+
+
+def _write_last_run(summary: dict) -> None:
+    """Write last-run.json atomically.
+
+    A dry run keeps the previous real run under ``previous_real_run`` so
+    ``status`` can still say when the scheduled check last ran.
+    """
+    path = last_run_path()
+    if summary.get("dry_run"):
+        prev = _read_last_run()
+        if prev is not None:
+            real = prev if not prev.get("dry_run") else prev.get("previous_real_run")
+            if real:
+                summary["previous_real_run"] = real
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_last_run() -> Optional[dict]:
+    path = last_run_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # ---------------------------------------------------------------------------
 # run_check
 # ---------------------------------------------------------------------------
 
-def run_check(dry_run: bool = False) -> int:  # noqa: C901  (complexity OK here)
+def run_check(dry_run: bool = False) -> int:
     """Fetch all active watches, detect changes, optionally send email.
 
-    Returns 0 if every fetch succeeded, 1 if at least one failed.
+    Returns EXIT_OK (0) when every link was read and any change email was
+    sent, EXIT_LINK_FAILED (1) when at least one link failed, and
+    EXIT_EMAIL_FAILED (3) when a change email could not be sent (the changes
+    are then held back and retried on the next run).
     """
-    # 1. Load config
-    cfg = _config_mod.load()
+    # The check itself needs no SMTP settings; the sender loads them.
+    check_cfg = _config_mod.load_check()
 
-    # 2. Acquire process lock
     try:
-        _lock = filelock.FileLock(str(lock_file()), timeout=0)
-        _lock.acquire()
+        lock = filelock.FileLock(str(lock_file()), timeout=0)
+        lock.acquire()
     except filelock.Timeout:
         _console.print("[yellow]another check is running[/yellow]")
-        return 0
+        log.info("Skipped: another check is running")
+        return EXIT_OK
 
     try:
-        return _run_check_locked(cfg, dry_run)
+        return _run_check_locked(check_cfg, dry_run)
     finally:
-        _lock.release()
+        lock.release()
 
 
-def _run_check_locked(cfg, dry_run: bool) -> int:
-    # Lazy imports
-    from price_watcher import watchlist as _watchlist
+def _check_one(watch: Watch, check_cfg) -> ChangeEvent:
+    """Fetch + evaluate one watch. Never raises: one bad link must not stop the others."""
     from price_watcher import fetcher as _fetcher
     from price_watcher import state as _state
-    from price_watcher import email_sender as _email_sender
 
-    # 3. Load & filter watches
+    try:
+        fetch_result = _fetcher.fetch(watch.url, watch.selector)
+        return _state.evaluate(watch, fetch_result, check_cfg)
+    except Exception as exc:  # defensive: fetch() promises not to raise
+        log.exception("Checking %s failed", watch.url)
+        fetch_result = FetchResult(
+            status=FetchStatus.UNREACHABLE,
+            final_url=watch.url,
+            error_message=f"internal error: {type(exc).__name__}: {exc}",
+        )
+        return ChangeEvent(
+            type=ChangeType.FAILED,
+            watch=watch,
+            fetch=fetch_result,
+            reason=fetch_result.error_message,
+        )
+
+
+def _is_failed(event: ChangeEvent) -> bool:
+    return event.fetch.status != FetchStatus.OK or event.type in (
+        ChangeType.FAILED, ChangeType.THRESHOLD_FAILURE,
+    )
+
+
+def _run_check_locked(check_cfg, dry_run: bool) -> int:
+    from price_watcher import email_sender as _email_sender
+    from price_watcher import state as _state
+    from price_watcher import watchlist as _watchlist
+
+    started = datetime.now(tz=timezone.utc)
     watches = [w for w in _watchlist.load_all() if not w.paused]
 
     if not watches:
         _console.print("[dim]No active watches.[/dim]")
-        return 0
+        _write_last_run({
+            "timestamp": started.isoformat(),
+            "dry_run": dry_run,
+            "no_watches": True,
+            "checked": 0, "changed": 0, "failed": 0,
+            "email_sent": None, "email_failed": False,
+            "exit_code": EXIT_OK,
+            "events": [],
+        })
+        return EXIT_OK
 
-    # 4. Fetch + evaluate
+    previous = _state.load_state().get("watches", {})
+
+    # Fetch + evaluate, with a small random delay between links.
     events: list[ChangeEvent] = []
     for idx, watch in enumerate(watches):
         if idx > 0:
-            delay = random.uniform(cfg.check.delay_min_sec, cfg.check.delay_max_sec)
-            import time
-            time.sleep(delay)
+            time.sleep(random.uniform(check_cfg.delay_min_sec, check_cfg.delay_max_sec))
+        events.append(_check_one(watch, check_cfg))
 
-        fetch_result = _fetcher.fetch(watch.url, watch.selector)
-        event = _state.evaluate(watch, fetch_result, cfg.check)
-        events.append(event)
+    payload = _email_sender.build_payload(events)
 
-    # 5. Build results table
+    # Results table
     table = Table(show_header=True, header_style="bold")
-    table.add_column("Status", width=4)
+    table.add_column("Status", width=6)
     table.add_column("Name")
-    table.add_column("Price / Info")
+    table.add_column("Previous")
+    table.add_column("Current")
     table.add_column("Action")
 
-    any_failed = False
     changed_count = 0
-
     for event in events:
-        watch_name = event.watch.name or event.watch.url
         fetch = event.fetch
-        ok = fetch.status == FetchStatus.OK
-        failed = not ok or event.type == ChangeType.FAILED
+        ws = previous.get(event.watch.id, {})
+        prev_cell = _price_text(ws.get("last_price"), ws.get("currency"))
+        cur_cell = _price_text(fetch.price, fetch.currency or ws.get("currency"))
+        if fetch.estimated_final_price is not None and fetch.promo is not None:
+            cur_cell += f" (≈{fetch.estimated_final_price} est.)"
+        notifies = event.type in NOTIFIABLE_TYPES
+        if notifies:
+            subject = _email_sender._subject_single(event)
+            action = (f"would send: {subject}" if dry_run else f"email: {subject}")
+        else:
+            action = "would not notify" if dry_run else "no email"
 
-        def _price_cell() -> str:
-            if fetch.price is not None:
-                cur = fetch.currency or ""
-                return f"{fetch.price}{(' ' + cur) if cur else ''}"
-            return "—"
-
-        if failed:
-            any_failed = True
-            reason = fetch.error_message or fetch.status.value
+        if _is_failed(event):
             status_cell = "[red]FAIL[/red]"
-            info_cell = reason
-            action_cell = "no email"
+            cur_cell = fetch.error_message or fetch.status.value
+            if not notifies:
+                action += f" ({event.reason or 'failed'})"
         elif event.type == ChangeType.FIRST_SEEN:
             status_cell = "[green]OK[/green]"
-            info_cell = _price_cell()
-            action_cell = "first seen (no email)"
-        elif event.type == ChangeType.NO_CHANGE:
-            status_cell = "[green]OK[/green]"
-            info_cell = _price_cell()
-            action_cell = "no change"
+            action += " — first seen"
         elif event.type == ChangeType.SANITY_DEFERRED:
             status_cell = "[yellow]OK[/yellow]"
-            info_cell = f"{_price_cell()} — {event.reason or 'deferred'}"
-            action_cell = "deferred (no email)"
-        else:
-            changed_count += 1
+            action += f" — deferred: {event.reason}"
+        elif event.type == ChangeType.NO_CHANGE:
             status_cell = "[green]OK[/green]"
-            old_str = str(event.old_price) if event.old_price is not None else "—"
-            new_str = str(event.new_price) if event.new_price is not None else "—"
-            info_cell = f"{old_str} → {new_str}"
-            action_cell = "would send" if dry_run else "sending"
-
-        table.add_row(status_cell, watch_name, info_cell, action_cell)
+            if event.reason:
+                action += f" — {event.reason}"
+        else:
+            status_cell = "[green]OK[/green]"
+            if event.type in (ChangeType.PRICE_CHANGED, ChangeType.STOCK_CHANGED,
+                              ChangeType.PROMO_CHANGED):
+                changed_count += 1
+        table.add_row(
+            status_cell,
+            _rich_escape(event.watch.name or event.watch.url),
+            _rich_escape(prev_cell),
+            _rich_escape(cur_cell),
+            _rich_escape(action),
+        )
 
     _console.print(table)
 
-    # 6. Build email payload
-    payload = _email_sender.build_payload(events)
+    checked = len(events)
+    failed_count = sum(1 for e in events if _is_failed(e))
+    any_failed = failed_count > 0
 
+    email_sent: Optional[bool] = None
     if dry_run:
         if payload is not None:
-            _console.print(
-                f"[bold]WOULD SEND EMAIL[/bold] — Subject: {payload.subject}"
-            )
-        return 1 if any_failed else 0
+            _console.print(f"[bold]WOULD SEND EMAIL[/bold] — Subject: {_rich_escape(payload.subject)}")
+            preview = payload.text_body.splitlines()[:8]
+            for line in preview:
+                _console.print(f"  [dim]{_rich_escape(line)}[/dim]")
+        else:
+            _console.print("[dim]Would not send any email.[/dim]")
+        _console.print("[dim]Dry run: nothing was sent and the state file was not changed.[/dim]")
+    else:
+        if payload is not None:
+            email_sent = _email_sender.send_change_notification(events)
+            if email_sent:
+                _state.mark_notified(events)
+            else:
+                _console.print(
+                    "[bold red]The change email could not be sent; the changes are held "
+                    "back and will be retried on the next run.[/bold red]"
+                )
+                log.error(
+                    "Change email not sent; %d notifiable change(s) held back for retry",
+                    sum(1 for e in events if e.type in NOTIFIABLE_TYPES),
+                )
+        _state.apply_many(events, email_failed=(email_sent is False))
 
-    # Real run: send + persist
-    if payload is not None:
-        sent = _email_sender.send_change_notification(events)
-        if sent:
-            _state.mark_notified(events)
+    email_failed = email_sent is False
+    if email_failed:
+        rc = EXIT_EMAIL_FAILED
+    elif any_failed:
+        rc = EXIT_LINK_FAILED
+    else:
+        rc = EXIT_OK
 
-    _state.apply_many(events)
+    summary_line = f"{checked} checked, {changed_count} changed, {failed_count} failed"
+    if email_failed:
+        summary_line += ", EMAIL NOT SENT"
+    _console.print(f"\n[bold]{summary_line}[/bold]" + (" [dim](dry run)[/dim]" if dry_run else ""))
+    log.info("Check finished%s: %s (exit %d)", " (dry run)" if dry_run else "", summary_line, rc)
 
-    # Summary line
-    checked = len(events)
-    failed_count = sum(
-        1 for e in events
-        if e.fetch.status != FetchStatus.OK or e.type == ChangeType.FAILED
-    )
-    _console.print(
-        f"\n[bold]{checked} checked, {changed_count} changed, {failed_count} failed[/bold]"
-    )
-
-    # Write last-run.json
-    brief_events = []
-    for e in events:
-        brief_events.append({
-            "watch_id": e.watch.id,
-            "name": e.watch.name,
-            "type": e.type.value,
-            "old_price": str(e.old_price) if e.old_price is not None else None,
-            "new_price": str(e.new_price) if e.new_price is not None else None,
-            "reason": e.reason,
-        })
-
-    last_run = {
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+    _write_last_run({
+        "timestamp": started.isoformat(),
+        "dry_run": dry_run,
+        "no_watches": False,
         "checked": checked,
         "changed": changed_count,
         "failed": failed_count,
-        "events": brief_events,
+        "email_sent": email_sent,
+        "email_failed": email_failed,
+        "exit_code": rc,
+        "events": [_event_summary(e) for e in events],
+    })
+    return rc
+
+
+def _price_text(price, currency: Optional[str]) -> str:
+    if price is None:
+        return "—"
+    return f"{price} {currency}" if currency else str(price)
+
+
+def _event_summary(e: ChangeEvent) -> dict:
+    out = {
+        "watch_id": e.watch.id,
+        "name": e.watch.name,
+        "url": e.watch.url,
+        "type": e.type.value,
+        "status": e.fetch.status.value,
+        "http_status": e.fetch.http_status,
+        "error_message": e.fetch.error_message,
+        "old_price": str(e.old_price) if e.old_price is not None else None,
+        "new_price": str(e.new_price) if e.new_price is not None else None,
+        "reason": e.reason,
     }
-    last_run_path = data_dir() / "last-run.json"
-    last_run_path.write_text(json.dumps(last_run, indent=2))
-
-    return 1 if any_failed else 0
+    if _is_failed(e):
+        from price_watcher.email_sender import describe_failure
+        info = describe_failure(e.fetch)
+        out["detail"] = info["detail"]
+        out["hint"] = info["hint"]
+    return out
 
 
 # ---------------------------------------------------------------------------
-# install_schedule
+# Schedule definitions (pure; tested offline)
 # ---------------------------------------------------------------------------
 
-def install_schedule() -> None:
-    """Install the daily (09:00) price-check job for the current OS."""
-    if sys.platform == "darwin":
-        _install_launchd()
-    elif sys.platform.startswith("win"):
-        _install_schtasks()
-    else:
-        _console.print(
-            "[yellow]Unsupported platform for automatic scheduling. "
-            "Add a cron entry manually:[/yellow]\n"
-            f"  0 {_CHECK_HOUR} * * * {_venv_python()} -m price_watcher check"
-        )
+def launchd_plist(label: str, command: str, hour: int, log_name: str) -> dict:
+    """The launchd agent definition for `python -m price_watcher <command>`.
 
-
-def _install_launchd() -> None:
-    log_dir().mkdir(parents=True, exist_ok=True)
-
-    plist_data = {
-        "Label": _PLIST_LABEL,
-        "ProgramArguments": [_venv_python(), "-m", "price_watcher", "check"],
+    launchd runs a StartCalendarInterval job that was missed while the Mac
+    slept as soon as it wakes, so no extra catch-up setting is needed.
+    """
+    return {
+        "Label": label,
+        "ProgramArguments": [_venv_python(), "-m", "price_watcher", command],
         "WorkingDirectory": str(_repo_dir()),
-        "StartCalendarInterval": {"Hour": _CHECK_HOUR, "Minute": 0},
+        "StartCalendarInterval": {"Hour": hour, "Minute": 0},
         "RunAtLoad": False,
-        "StandardOutPath": str(log_dir() / "launchd.out.log"),
-        "StandardErrorPath": str(log_dir() / "launchd.err.log"),
+        "StandardOutPath": str(log_dir() / f"launchd.{log_name}out.log"),
+        "StandardErrorPath": str(log_dir() / f"launchd.{log_name}err.log"),
     }
 
-    # Idempotent: unload first if plist already exists
-    if _PLIST_PATH.exists():
-        _bootout_launchd()
 
-    _PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _PLIST_PATH.open("wb") as f:
-        plistlib.dump(plist_data, f)
-
-    _console.print(f"Wrote plist to {_PLIST_PATH}")
-
-    uid = os.getuid()
-    result = subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(_PLIST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        # Fallback for older macOS
-        result2 = subprocess.run(
-            ["launchctl", "load", "-w", str(_PLIST_PATH)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result2.returncode != 0:
-            _console.print(
-                f"[red]launchctl bootstrap failed:[/red] {result.stderr.strip()}\n"
-                f"[red]launchctl load -w also failed:[/red] {result2.stderr.strip()}"
-            )
-            return
-
-    _console.print(f"[green]Schedule installed (launchd, daily at {_CHECK_HOUR:02d}:00).[/green]")
-
-
-def _install_schtasks() -> None:
+def _windows_python() -> str:
+    """pythonw.exe next to the venv's python.exe, so no console window pops up."""
     python_path = _venv_python()
-    # Prefer pythonw.exe to suppress console window
     pythonw = Path(python_path).parent / "pythonw.exe"
     if pythonw.exists():
-        python_path = str(pythonw)
+        return str(pythonw)
+    return python_path
 
-    # Build XML for StartWhenAvailable support
-    xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
+
+def schtasks_xml(description: str, command: str, hour: int, time_limit: str) -> str:
+    """Task Scheduler XML for a daily `python -m price_watcher <command>`.
+
+    StartWhenAvailable = run as soon as possible after a missed start
+    (computer asleep or off at the scheduled time).
+    """
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Price Watcher daily check</Description>
+    <Description>{_xml_escape(description)}</Description>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
-      <StartBoundary>2024-01-01T{_CHECK_HOUR:02d}:00:00</StartBoundary>
+      <StartBoundary>2024-01-01T{hour:02d}:00:00</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
@@ -303,111 +390,181 @@ def _install_schtasks() -> None:
   </Triggers>
   <Settings>
     <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>{time_limit}</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
   <Actions>
     <Exec>
-      <Command>{python_path}</Command>
-      <Arguments>-m price_watcher check</Arguments>
-      <WorkingDirectory>{_repo_dir()}</WorkingDirectory>
+      <Command>{_xml_escape(_windows_python())}</Command>
+      <Arguments>-m price_watcher {_xml_escape(command)}</Arguments>
+      <WorkingDirectory>{_xml_escape(str(_repo_dir()))}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"""
 
-    xml_path = data_dir() / "task-scheduler.xml"
-    xml_path.write_text(xml_content, encoding="utf-16")
 
-    _delete_legacy_schtask()
+def cron_line(command: str, hour: int) -> str:
+    return f"0 {hour} * * * {_venv_python()} -m price_watcher {command}"
 
+
+# ---------------------------------------------------------------------------
+# install / uninstall (generic)
+# ---------------------------------------------------------------------------
+
+def _install_launchd_job(plist_path: Path, plist_data: dict, what: str, hour: int) -> None:
+    log_dir().mkdir(parents=True, exist_ok=True)
+
+    # Idempotent: unload first if plist already exists
+    if plist_path.exists():
+        _bootout(plist_path)
+
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    with plist_path.open("wb") as f:
+        plistlib.dump(plist_data, f)
+    _console.print(f"Wrote plist to {plist_path}")
+
+    uid = os.getuid()
     result = subprocess.run(
-        ["schtasks", "/create", "/xml", str(xml_path),
-         "/tn", _WIN_TASK_NAME, "/f"],
-        capture_output=True,
-        text=True,
-        check=False,
+        ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        # Fallback for older macOS
+        result2 = subprocess.run(
+            ["launchctl", "load", "-w", str(plist_path)],
+            capture_output=True, text=True, check=False,
+        )
+        if result2.returncode != 0:
+            _console.print(
+                f"[red]launchctl bootstrap failed:[/red] {result.stderr.strip()}\n"
+                f"[red]launchctl load -w also failed:[/red] {result2.stderr.strip()}"
+            )
+            return
+    _console.print(f"[green]{what} installed (launchd, daily at {hour:02d}:00).[/green]")
+
+
+def _bootout(plist_path: Path) -> None:
+    """Best-effort unload/bootout of a launchd job."""
+    uid = os.getuid()
+    result = subprocess.run(
+        ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        subprocess.run(
+            ["launchctl", "unload", str(plist_path)],
+            capture_output=True, text=True, check=False,
+        )
+
+
+def _uninstall_launchd_job(plist_path: Path, what: str) -> None:
+    if not plist_path.exists():
+        _console.print(f"[yellow]{what}: plist not found — not installed.[/yellow]")
+        return
+    _bootout(plist_path)
+    plist_path.unlink(missing_ok=True)
+    _console.print(f"[green]{what} removed.[/green]")
+
+
+def _install_schtask(task_name: str, xml_content: str, xml_file: str, what: str, hour: int) -> None:
+    xml_path = data_dir() / xml_file
+    xml_path.write_text(xml_content, encoding="utf-16")
+    result = subprocess.run(
+        ["schtasks", "/create", "/xml", str(xml_path), "/tn", task_name, "/f"],
+        capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         _console.print(f"[red]schtasks /create failed:[/red] {result.stderr.strip()}")
         return
-
-    _console.print(f"[green]Schedule installed (Task Scheduler, daily at {_CHECK_HOUR:02d}:00).[/green]")
-
-
-# ---------------------------------------------------------------------------
-# uninstall_schedule
-# ---------------------------------------------------------------------------
-
-def uninstall_schedule() -> None:
-    """Remove the daily price-check job."""
-    if sys.platform == "darwin":
-        _uninstall_launchd()
-    elif sys.platform.startswith("win"):
-        _uninstall_schtasks()
-    else:
-        _console.print("[yellow]No automatic schedule to remove on this platform.[/yellow]")
+    _console.print(f"[green]{what} installed (Task Scheduler, daily at {hour:02d}:00).[/green]")
 
 
-def _bootout_launchd() -> None:
-    """Best-effort unload/bootout of the launchd job."""
-    uid = os.getuid()
+def _uninstall_schtask(task_name: str, what: str) -> None:
     result = subprocess.run(
-        ["launchctl", "bootout", f"gui/{uid}", str(_PLIST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
+        ["schtasks", "/delete", "/tn", task_name, "/f"],
+        capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        subprocess.run(
-            ["launchctl", "unload", str(_PLIST_PATH)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-
-def _uninstall_launchd() -> None:
-    if not _PLIST_PATH.exists():
-        _console.print("[yellow]Plist not found — schedule may not be installed.[/yellow]")
+        _console.print(f"[red]schtasks /delete failed:[/red] {result.stderr.strip()}")
         return
-
-    _bootout_launchd()
-
-    _PLIST_PATH.unlink(missing_ok=True)
-    _console.print("[green]Schedule removed.[/green]")
+    _console.print(f"[green]{what} removed.[/green]")
 
 
 def _delete_legacy_schtask() -> None:
     """Remove the old hourly task if a previous version installed it."""
     subprocess.run(
         ["schtasks", "/delete", "/tn", _LEGACY_WIN_TASK_NAME, "/f"],
-        capture_output=True,
-        text=True,
-        check=False,
+        capture_output=True, text=True, check=False,
     )
 
 
-def _uninstall_schtasks() -> None:
-    _delete_legacy_schtask()
-    result = subprocess.run(
-        ["schtasks", "/delete", "/tn", _WIN_TASK_NAME, "/f"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        _console.print(f"[red]schtasks /delete failed:[/red] {result.stderr.strip()}")
-        return
-    _console.print("[green]Schedule removed.[/green]")
+# ---------------------------------------------------------------------------
+# Price check schedule
+# ---------------------------------------------------------------------------
+
+def install_schedule() -> None:
+    """Install the daily (09:00) price-check job for the current OS."""
+    if sys.platform == "darwin":
+        _install_launchd_job(
+            _PLIST_PATH,
+            launchd_plist(_PLIST_LABEL, "check", _CHECK_HOUR, ""),
+            "Schedule", _CHECK_HOUR,
+        )
+    elif sys.platform.startswith("win"):
+        _delete_legacy_schtask()
+        _install_schtask(
+            _WIN_TASK_NAME,
+            schtasks_xml("Price Watcher daily check", "check", _CHECK_HOUR, "PT30M"),
+            "task-scheduler.xml", "Schedule", _CHECK_HOUR,
+        )
+    else:
+        _console.print(
+            "[yellow]Unsupported platform for automatic scheduling. "
+            "Add a cron entry manually:[/yellow]\n"
+            f"  {cron_line('check', _CHECK_HOUR)}"
+        )
+
+
+def uninstall_schedule() -> None:
+    """Remove the daily price-check job."""
+    if sys.platform == "darwin":
+        _uninstall_launchd_job(_PLIST_PATH, "Schedule")
+    elif sys.platform.startswith("win"):
+        _delete_legacy_schtask()
+        _uninstall_schtask(_WIN_TASK_NAME, "Schedule")
+    else:
+        _console.print("[yellow]No automatic schedule to remove on this platform.[/yellow]")
 
 
 # ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 
+def _format_ts(ts_raw: str) -> str:
+    try:
+        return datetime.fromisoformat(ts_raw).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (ValueError, TypeError):
+        return str(ts_raw)
+
+
+def _run_line(data: dict) -> str:
+    if data.get("no_watches"):
+        what = "no active watches"
+    else:
+        what = (
+            f"{data.get('checked', '?')} checked, {data.get('changed', '?')} changed, "
+            f"{data.get('failed', '?')} failed"
+        )
+    if "exit_code" in data:
+        what += f", exit code {data['exit_code']}"
+    return f"{_format_ts(data.get('timestamp', ''))} — {what}"
+
+
 def status() -> None:
     """Print schedule + last-run status."""
-    # --- schedule installed? ---
     if sys.platform == "darwin":
         installed = _launchd_installed()
     elif sys.platform.startswith("win"):
@@ -422,50 +579,54 @@ def status() -> None:
     else:
         _console.print("[bold]Schedule:[/bold] [dim]unknown (unsupported platform)[/dim]")
 
-    # --- last run ---
-    last_run_path = data_dir() / "last-run.json"
-    if not last_run_path.exists():
+    path = last_run_path()
+    if not path.exists():
         _console.print("[bold]Last run:[/bold] No runs yet")
         return
+    data = _read_last_run()
+    if data is None:
+        _console.print(f"[red]Could not parse {path}[/red]")
+        return
 
-    try:
-        data = json.loads(last_run_path.read_text())
-        ts_raw = data.get("timestamp", "")
-        checked = data.get("checked", "?")
-        changed = data.get("changed", "?")
-        failed = data.get("failed", "?")
+    if data.get("dry_run"):
+        _console.print(f"[bold]Last run:[/bold] {_run_line(data)} [yellow](dry run — nothing sent or saved)[/yellow]")
+        real = data.get("previous_real_run")
+        if real:
+            _console.print(f"[bold]Last real run:[/bold] {_run_line(real)}")
+            data = real
+        else:
+            data = None
+    else:
+        _console.print(f"[bold]Last run:[/bold] {_run_line(data)}")
 
-        # Pretty-print the timestamp
-        try:
-            dt = datetime.fromisoformat(ts_raw)
-            ts_display = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        except (ValueError, TypeError):
-            ts_display = ts_raw
-
+    if not data:
+        return
+    if data.get("email_failed"):
         _console.print(
-            f"[bold]Last run:[/bold] {ts_display} — "
-            f"{checked} checked, {changed} changed, {failed} failed"
+            "[bold red]Email:[/bold red] the change email could NOT be sent; the changes "
+            "were held back and will be retried. Run `price-watcher test-email`."
         )
-    except (json.JSONDecodeError, KeyError) as exc:
-        _console.print(f"[red]Could not parse last-run.json:[/red] {exc}")
+    elif data.get("email_sent"):
+        _console.print("[bold]Email:[/bold] [green]sent[/green]")
+    for ev in data.get("events", []):
+        if ev.get("detail"):
+            name = ev.get("name") or ev.get("url") or ev.get("watch_id")
+            _console.print(f"  [red]FAIL[/red] {_rich_escape(str(name))}: {_rich_escape(ev['detail'])}")
+            if ev.get("hint"):
+                _console.print(f"       [dim]{_rich_escape(ev['hint'])}[/dim]")
 
 
 def _launchd_installed() -> bool:
     result = subprocess.run(
-        ["launchctl", "list"],
-        capture_output=True,
-        text=True,
-        check=False,
+        ["launchctl", "list"], capture_output=True, text=True, check=False,
     )
-    return _PLIST_LABEL in result.stdout
+    return _PLIST_LABEL in result.stdout.split()
 
 
 def _schtasks_installed() -> bool:
     result = subprocess.run(
         ["schtasks", "/query", "/tn", _WIN_TASK_NAME, "/v", "/fo", "list"],
-        capture_output=True,
-        text=True,
-        check=False,
+        capture_output=True, text=True, check=False,
     )
     return result.returncode == 0
 
@@ -477,152 +638,30 @@ def _schtasks_installed() -> bool:
 def install_digest_schedule() -> None:
     """Install the daily sales-digest job at 9 AM local time."""
     if sys.platform == "darwin":
-        _install_digest_launchd()
+        _install_launchd_job(
+            _DIGEST_PLIST_PATH,
+            launchd_plist(_DIGEST_PLIST_LABEL, "digest", _DIGEST_HOUR, "digest."),
+            "Digest schedule", _DIGEST_HOUR,
+        )
     elif sys.platform.startswith("win"):
-        _install_digest_schtasks()
+        _install_schtask(
+            _DIGEST_WIN_TASK_NAME,
+            schtasks_xml("Price Watcher daily sales digest", "digest", _DIGEST_HOUR, "PT15M"),
+            "task-scheduler-digest.xml", "Digest schedule", _DIGEST_HOUR,
+        )
     else:
         _console.print(
             "[yellow]Unsupported platform for automatic scheduling. "
             "Add a cron entry manually:[/yellow]\n"
-            f"  0 9 * * * {_venv_python()} -m price_watcher digest"
+            f"  {cron_line('digest', _DIGEST_HOUR)}"
         )
 
 
 def uninstall_digest_schedule() -> None:
     """Remove the daily digest job."""
     if sys.platform == "darwin":
-        _uninstall_digest_launchd()
+        _uninstall_launchd_job(_DIGEST_PLIST_PATH, "Digest schedule")
     elif sys.platform.startswith("win"):
-        _uninstall_digest_schtasks()
+        _uninstall_schtask(_DIGEST_WIN_TASK_NAME, "Digest schedule")
     else:
         _console.print("[yellow]No automatic schedule to remove on this platform.[/yellow]")
-
-
-def _install_digest_launchd() -> None:
-    log_dir().mkdir(parents=True, exist_ok=True)
-
-    plist_data = {
-        "Label": _DIGEST_PLIST_LABEL,
-        "ProgramArguments": [_venv_python(), "-m", "price_watcher", "digest"],
-        "WorkingDirectory": str(_repo_dir()),
-        "StartCalendarInterval": {"Hour": 9, "Minute": 0},
-        "RunAtLoad": False,
-        "StandardOutPath": str(log_dir() / "launchd.digest.out.log"),
-        "StandardErrorPath": str(log_dir() / "launchd.digest.err.log"),
-    }
-
-    if _DIGEST_PLIST_PATH.exists():
-        _bootout_digest_launchd()
-
-    _DIGEST_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _DIGEST_PLIST_PATH.open("wb") as f:
-        plistlib.dump(plist_data, f)
-
-    _console.print(f"Wrote plist to {_DIGEST_PLIST_PATH}")
-
-    uid = os.getuid()
-    result = subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{uid}", str(_DIGEST_PLIST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        result2 = subprocess.run(
-            ["launchctl", "load", "-w", str(_DIGEST_PLIST_PATH)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result2.returncode != 0:
-            _console.print(
-                f"[red]launchctl bootstrap failed:[/red] {result.stderr.strip()}\n"
-                f"[red]launchctl load -w also failed:[/red] {result2.stderr.strip()}"
-            )
-            return
-
-    _console.print("[green]Digest schedule installed (launchd, daily at 09:00).[/green]")
-
-
-def _install_digest_schtasks() -> None:
-    python_path = _venv_python()
-    pythonw = Path(python_path).parent / "pythonw.exe"
-    if pythonw.exists():
-        python_path = str(pythonw)
-
-    xml_content = f"""<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Price Watcher daily sales digest</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <CalendarTrigger>
-      <StartBoundary>2024-01-01T09:00:00</StartBoundary>
-      <Enabled>true</Enabled>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
-    </CalendarTrigger>
-  </Triggers>
-  <Settings>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
-    <Enabled>true</Enabled>
-  </Settings>
-  <Actions>
-    <Exec>
-      <Command>{python_path}</Command>
-      <Arguments>-m price_watcher digest</Arguments>
-      <WorkingDirectory>{_repo_dir()}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>"""
-
-    xml_path = data_dir() / "task-scheduler-digest.xml"
-    xml_path.write_text(xml_content, encoding="utf-16")
-
-    result = subprocess.run(
-        ["schtasks", "/create", "/xml", str(xml_path),
-         "/tn", _DIGEST_WIN_TASK_NAME, "/f"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        _console.print(f"[red]schtasks /create failed:[/red] {result.stderr.strip()}")
-        return
-
-    _console.print("[green]Digest schedule installed (Task Scheduler, daily at 09:00).[/green]")
-
-
-def _bootout_digest_launchd() -> None:
-    uid = os.getuid()
-    result = subprocess.run(
-        ["launchctl", "bootout", f"gui/{uid}", str(_DIGEST_PLIST_PATH)],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        subprocess.run(
-            ["launchctl", "unload", str(_DIGEST_PLIST_PATH)],
-            capture_output=True, text=True, check=False,
-        )
-
-
-def _uninstall_digest_launchd() -> None:
-    if not _DIGEST_PLIST_PATH.exists():
-        _console.print("[yellow]Digest plist not found — not installed.[/yellow]")
-        return
-    _bootout_digest_launchd()
-    _DIGEST_PLIST_PATH.unlink(missing_ok=True)
-    _console.print("[green]Digest schedule removed.[/green]")
-
-
-def _uninstall_digest_schtasks() -> None:
-    result = subprocess.run(
-        ["schtasks", "/delete", "/tn", _DIGEST_WIN_TASK_NAME, "/f"],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        _console.print(f"[red]schtasks /delete failed:[/red] {result.stderr.strip()}")
-        return
-    _console.print("[green]Digest schedule removed.[/green]")

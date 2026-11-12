@@ -29,10 +29,10 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from rich.console import Console
-from rich.table import Table
 
 from price_watcher import logging_setup
 from price_watcher.contracts import PromoInfo
+from price_watcher.http_headers import USER_AGENT
 
 
 log = logging_setup.get(__name__)
@@ -47,14 +47,16 @@ _DISPLAY_OVERRIDES = {
 
 
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "he,en;q=0.8,en-US;q=0.5",
     "Accept-Encoding": "gzip, deflate, br",
 }
+
+
+# Shown (terminal, email text and HTML) for a site that was read fine but has
+# no site-wide offer today.
+NO_PROMO_HE = "לא זוהה מבצע כלל-אתרי"
 
 
 @dataclass
@@ -66,39 +68,59 @@ class SiteDigest:
     promos: list[PromoInfo] = field(default_factory=list)
     error: Optional[str] = None
 
+    @property
+    def failed(self) -> bool:
+        """True only when the homepage could not be read.
+
+        "no_promo" means the page was read fine and simply has no site-wide
+        offer today; it is not an error and must not be rendered as one.
+        """
+        return self.status not in ("ok", "no_promo")
+
 
 # ---------------------------------------------------------------------------
 # Promo extraction (improved)
 # ---------------------------------------------------------------------------
 
-# Patterns that indicate a SITE-WIDE sale rather than per-product.
-# Match an explicit CODE + percentage near each other.
-# Gap is up to 250 chars because Castro's Hebrew banner has the pct and the
-# code in separate <div>s with ~120 chars of markup between them.
-# Percent NEAR an explicit code keyword. "off/OFF/הנחה" immediately after %
-# is optional — Castro's banner says "EXTRA 11% על כל האתר" (no "off" word),
-# but has "קוד קופון: OFF11" later. We filter the span for a promo-context
-# word afterward to reject noise.
+# Patterns that indicate a SITE-WIDE sale rather than per-product: an explicit
+# CODE + percentage near each other (either order). The gap is up to 120 chars
+# because Castro's Hebrew banner has the pct and the code in separate <div>s.
+# "off/OFF/הנחה" right after the % is optional — Castro's banner says
+# "EXTRA 11% על כל האתר" (no "off" word) with "קוד קופון: OFF11" later; the
+# span is checked for a promo-context word afterward to reject noise.
+#
+# Code keyword. Hebrew allows a one-letter prefix ("בקוד", "הקוד", "לקופון")
+# and one qualifier word after "קוד" ("קוד הנחה: VIP20", "קוד הטבה",
+# "קוד מבצע", "קוד קופון"); English allows "code" / "coupon code" /
+# "discount code" / "promo code" (the qualifier precedes "code" there).
+_CODE_KEYWORD = (
+    r"(?:\bcode\b"
+    r"|(?<![\u0590-\u05FF])[בהולמשכ]?(?:קוד|קופון)(?![\u0590-\u05FF])"
+    r"(?:\s+(?:ה?הנחה|ה?הטבה|ה?מבצע|ה?קופון)(?![\u0590-\u05FF]))?)"
+)
+# The code itself: starts with a letter, 3-20 chars, upper-case letters/digits.
+_CODE_VALUE = r"([A-Z][A-Z0-9]{2,19})"
+
 _PCT_CODE_PAT = re.compile(
-    r"(\d{1,2})\s*%\s*(?:off|הנחה|OFF)?"
+    r"(?<!\d)(\d{1,2})\s*%\s*(?:off|הנחה|OFF)?"
     r"[\s\S]{0,120}?"
-    r"\b(?:code|קופון|קוד)\b[^A-Z0-9]{0,20}([A-Z][A-Z0-9]{2,19})",
+    + _CODE_KEYWORD + r"[^A-Z0-9]{0,20}" + _CODE_VALUE,
     re.IGNORECASE | re.UNICODE,
 )
 
 _CODE_PCT_PAT = re.compile(
-    r"\b(?:code|קופון|קוד)\b[^A-Z0-9]{0,20}([A-Z][A-Z0-9]{2,19})"
-    r"[\s\S]{0,120}?"
-    r"(\d{1,2})\s*%\s*(?:off|הנחה|OFF)?",
+    _CODE_KEYWORD + r"[^A-Z0-9]{0,20}" + _CODE_VALUE
+    + r"[\s\S]{0,120}?"
+    r"(?<!\d)(\d{1,2})\s*%\s*(?:off|הנחה|OFF)?",
     re.IGNORECASE | re.UNICODE,
 )
 
 # Site-wide bare-% promo (no code advertised). Must be adjacent to a strong
 # "everything / all items / sitewide" phrase to filter per-product discounts.
 _SITEWIDE_BARE_PAT = re.compile(
-    r"(\d{1,2})\s*%\s*(?:off|הנחה|OFF)"
+    r"(?<!\d)(\d{1,2})\s*%\s*(?:off|הנחה|OFF)"
     r"[^<>\n]{0,40}"
-    r"(?:everything|everything!|all items|site\s*wide|sitewide|הכל|על כל האתר|site|אתר)",
+    r"(?:everything|all items|site\s*wide|sitewide|הכל|על כל האתר|site|אתר)",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -111,21 +133,6 @@ _CONTEXT_KEYWORDS = re.compile(
 def _is_promotional_span(span: str) -> bool:
     """Reject the match if the surrounding text doesn't look promotional."""
     return bool(_CONTEXT_KEYWORDS.search(span))
-
-# Pattern for a bare "N% off" without a visible code (newsletter, first-time, etc.)
-_PCT_BARE_PAT = re.compile(
-    r"(\d{1,2})\s*%\s*(?:off|הנחה)",
-    re.IGNORECASE | re.UNICODE,
-)
-
-# "up to N%" / "עד N%" — tiered, not computable
-_UP_TO_PAT = re.compile(
-    r"(?:up\s+to|עד)\s+(\d{1,2})\s*%",
-    re.IGNORECASE | re.UNICODE,
-)
-
-# Words to use as condition heuristics (after the match, up to a sentence boundary)
-_COND_PAT_AFTER = re.compile(r".{0,120}?(?:[.!?\n\|]|בתוקף|$)", re.UNICODE)
 
 
 def _extract_promos_from_text(text: str, max_len: int = 250) -> list[PromoInfo]:
@@ -190,38 +197,6 @@ def _extract_promos_from_text(text: str, max_len: int = 250) -> list[PromoInfo]:
         )
 
     return list(found.values())
-
-
-def _extract_bare_promos(text: str, with_codes: set[tuple[int, str]]) -> list[PromoInfo]:
-    """Find bare 'N% off' promos that DON'T have a code nearby. Lower-ranked."""
-    if not text:
-        return []
-    results: list[PromoInfo] = []
-    seen_pcts: set[int] = set()
-
-    # Strip "up to N%" fragments first (they're tiered, handled separately)
-    cleaned = _UP_TO_PAT.sub("", text)
-
-    for m in _PCT_BARE_PAT.finditer(cleaned):
-        pct = int(m.group(1))
-        if not (1 <= pct <= 99):
-            continue
-        if pct in seen_pcts:
-            continue
-        # Skip if this same pct was already found paired with a code
-        if any(p == pct for p, _ in with_codes):
-            seen_pcts.add(pct)
-            continue
-        seen_pcts.add(pct)
-        snippet = cleaned[max(0, m.start() - 60):m.end() + 80]
-        snippet = re.sub(r"\s+", " ", snippet).strip()[:200]
-        results.append(PromoInfo(
-            code=None,
-            discount_pct=Decimal(pct),
-            condition=snippet,
-            source_text=snippet,
-        ))
-    return results
 
 
 def _text_sources(html: str, soup: BeautifulSoup) -> list[str]:
@@ -360,11 +335,11 @@ def collect_digest() -> list[SiteDigest]:
 def _print_digests(digests: list[SiteDigest]) -> None:
     for d in digests:
         console.print(f"\n[bold cyan]━━━ {d.display_name}[/bold cyan] [dim]({d.host})[/dim]")
-        if d.status != "ok":
+        if d.failed:
             console.print(f"  [red]{d.status}[/red] {d.error or ''}")
             continue
         if not d.promos:
-            console.print("  [dim]no site-wide promo detected[/dim]")
+            console.print(f"  [dim]{NO_PROMO_HE}[/dim]")
             continue
         for i, p in enumerate(d.promos, 1):
             code_cell = f"[bold green]{p.code}[/bold green]" if p.code else "[dim]no code[/dim]"
