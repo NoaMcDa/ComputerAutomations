@@ -318,9 +318,12 @@ def test_flat_lists_follow_continent_order(monkeypatch):
 
 
 def test_subject_blurb_uses_the_cheapest_deal_not_the_first(monkeypatch):
-    report = _scan(monkeypatch, [_deal("פראג", 5, 900), _deal("בנגקוק", 100, 300)])
+    deals = [_deal("פראג", 5, 900), _deal("בנגקוק", 100, 300)]
+    for d in deals:
+        d.adults = 2  # the subject quotes the package price, which needs the party
+    report = _scan(monkeypatch, deals)
     payload = email_sender.build_deals_payload(report)
-    assert "חבילות מ-$300" in payload.subject
+    assert "חבילות לזוג מ-$600" in payload.subject
 
 
 # ---------------------------------------------------------------- email layout

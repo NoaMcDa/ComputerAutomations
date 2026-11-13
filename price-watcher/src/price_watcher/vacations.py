@@ -51,6 +51,10 @@ Trip rules, for packages and flights alike (owner's request):
   lead time    the first allowed departure is today + PW_DEALS_LEAD_DAYS (2),
                i.e. at least 48 hours from now. Only the near end of each
                window moves; the far end stays today + the window's days.
+  couples      with PW_DEALS_COUPLES_ONLY (on by default) only packages priced
+               for exactly two adults and no children are kept; packages
+               whose party the site doesn't state are left out too. Counted
+               in `VacationReport.dropped_party`. Flights are unaffected.
 
 Undated deals can't be placed in a window and are left out, as are deals
 whose destination can't be placed on a continent (logged and counted).
@@ -184,6 +188,19 @@ def _max_nights() -> int:
     return _env_int("PW_DEALS_MAX_NIGHTS", 5, _min_nights())
 
 
+def _couples_only() -> bool:
+    """PW_DEALS_COUPLES_ONLY (default on): keep only packages for two adults."""
+    return os.environ.get("PW_DEALS_COUPLES_ONLY", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _party_ok(d: "VacationDeal") -> bool:
+    """Flights always pass; packages pass when priced for 2 adults, 0 children
+    (or when the couples-only rule is off). An unstated party doesn't pass."""
+    if d.kind != KIND_PACKAGE or not _couples_only():
+        return True
+    return d.adults == 2 and d.children == 0
+
+
 def _length_ok(d: "VacationDeal") -> bool:
     """True when the trip is MIN..MAX nights long (inclusive). Unknown length -> False."""
     nights = d.nights_or_computed
@@ -303,6 +320,8 @@ class VacationReport:
     # Deals dropped because the trip isn't PW_DEALS_MIN_NIGHTS..MAX_NIGHTS
     # nights long (or its length isn't known).
     dropped_length: int = 0
+    # Packages dropped because they aren't priced for a couple (PW_DEALS_COUPLES_ONLY).
+    dropped_party: int = 0
 
     @property
     def deals(self) -> list[VacationDeal]:
@@ -1189,6 +1208,12 @@ def scan_and_report() -> VacationReport:
                          name, len(live) - len(sized), len(live), _min_nights(), _max_nights())
                 report.dropped_length += len(live) - len(sized)
             live = sized
+            couples = [d for d in live if _party_ok(d)]
+            if len(couples) < len(live):
+                log.info("Vacation scan: %s: dropped %d packages (not priced for 2 adults)",
+                         name, len(live) - len(couples))
+                report.dropped_party += len(live) - len(couples)
+            live = couples
             kept = [d for d in live if _hotel_qualifies(d)]
             if len(kept) < len(live):
                 log.info("Vacation scan: %s: dropped %d of %d packages (hotel not a verified 3–5★)",

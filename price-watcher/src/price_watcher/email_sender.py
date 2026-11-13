@@ -1643,7 +1643,7 @@ def _unmapped_note(vac) -> str:
 # not tinted, so a table with several marks stays calm and readable.
 _BADGE_CHEAPEST = ("הכי זול לאדם", "#065f46", "#d1fae5", "המחיר הנמוך ביותר לאדם")
 _BADGE_VALUE = ("הכי משתלם", "#1e3a8a", "#dbeafe",
-                "המחיר הנמוך ביותר לאדם ללילה מבין החבילות שכוללות כבודה (טרולי או מזוודה)")
+                "המחיר הנמוך ביותר ללילה מבין החבילות שכוללות כבודה (טרולי או מזוודה)")
 _BADGE_PACKAGE = ("החבילה הכי זולה", "#4c1d95", "#ede9fe", "מחיר החבילה הכולל הנמוך ביותר")
 _BADGE_LONGEST = ("הכי ארוך", "#78350f", "#fef3c7", "הכי הרבה לילות")
 _BADGE_SHORTEST = ("הכי קצר", "#134e4a", "#ccfbf1", "הכי מעט לילות")
@@ -1711,9 +1711,10 @@ def _vacation_style_tag() -> str:
 
 
 def _vacation_badge_set(is_packages: bool) -> list[tuple[str, str, str, str]]:
-    """Categories that apply to a table (per-night value and package total need a hotel stay)."""
+    """Categories that apply to a table. Packages are compared by the package
+    price (the per-person price isn't shown for them)."""
     if is_packages:
-        return [_BADGE_CHEAPEST, _BADGE_VALUE, _BADGE_PACKAGE, _BADGE_LONGEST, _BADGE_SHORTEST]
+        return [_BADGE_PACKAGE, _BADGE_VALUE, _BADGE_LONGEST, _BADGE_SHORTEST]
     return [_BADGE_CHEAPEST, _BADGE_LONGEST, _BADGE_SHORTEST]
 
 
@@ -1721,6 +1722,20 @@ def _per_night(d) -> Decimal | None:
     """Price per person per night, or None when the length of stay is unknown."""
     nights = d.nights_or_computed
     return d.price / nights if nights else None
+
+
+def _package_per_night(d) -> Decimal | None:
+    """Whole-package price per night (for a couple: the couple's price per
+    night), or None when the package price or the length isn't known."""
+    nights = d.nights_or_computed
+    total = d.total
+    return total / nights if nights and total is not None else None
+
+
+def _package_night_price(d) -> str:
+    """'$124' — package price per night, rounded to whole units; '' if unknown."""
+    per_night = _package_per_night(d)
+    return f"{_currency_symbol(d.currency)}{per_night:,.0f}" if per_night is not None else ""
 
 
 def _luggage_line(d) -> str:
@@ -1737,7 +1752,13 @@ def _luggage_line(d) -> str:
     return "כבודה: לא צוין באתר"
 
 
-_NO_VALUE_NOTE = 'אין כאן "הכי משתלם": אף חבילה ביבשת הזו לא כוללת כבודה'
+_PRICE_NOTE = (
+    'בחבילות: "מחיר ללילה" הוא מחיר החבילה חלקי מספר הלילות, '
+    'ו"מחיר החבילה" הוא הסכום לכל החופשה (לזוג). '
+    'בטיסות: "מחיר לאדם" הוא לכל הטיסה.'
+)
+
+_NO_VALUE_NOTE ='אין כאן "הכי משתלם": אף חבילה ביבשת הזו לא כוללת כבודה'
 
 
 def _value_badge_given(deals: list) -> bool:
@@ -1767,13 +1788,14 @@ def _deal_badges(deals: list, is_packages: bool) -> dict[int, list[tuple[str, st
         winner = max(scored, key=lambda s: (s[0], -s[1])) if highest else min(scored)
         marks.setdefault(winner[1], []).append(badge)
 
-    _mark(_BADGE_CHEAPEST, _money(lambda d: d.price))
     if is_packages:
+        _mark(_BADGE_PACKAGE, _money(lambda d: d.total))
         # Best value only among rows that include luggage (a carry-on is
         # enough); a row that is cheap because it has no luggage can't win.
         _mark(_BADGE_VALUE, _money(
-            lambda d: _per_night(d) if getattr(d, "has_luggage", False) else None))
-        _mark(_BADGE_PACKAGE, _money(lambda d: d.total))
+            lambda d: _package_per_night(d) if getattr(d, "has_luggage", False) else None))
+    else:
+        _mark(_BADGE_CHEAPEST, _money(lambda d: d.price))
     lengths = {d.nights_or_computed for d in deals if d.nights_or_computed}
     if len(lengths) > 1:  # no "longest"/"shortest" when every row is the same length
         _mark(_BADGE_LONGEST, lambda d: d.nights_or_computed or None, highest=True)
@@ -1789,8 +1811,10 @@ def _vacation_blurb(vac) -> str:
         return min(deals, key=lambda d: (d.currency != "USD", d.price))
 
     parts = []
-    if vac.packages:
-        parts.append(f"חבילות מ-{_deal_price(_cheapest(vac.packages))}")
+    priced = [d for d in vac.packages if d.total is not None]
+    if priced:
+        best = min(priced, key=lambda d: (d.currency != "USD", d.total))
+        parts.append(f"חבילות {_party_he(best) or ''} מ-{_deal_total(best)}".replace("  ", " "))
     if vac.flights:
         parts.append(f"טיסות מ-{_deal_price(_cheapest(vac.flights))}")
     return " · ".join(parts)
@@ -1815,8 +1839,7 @@ def _vacations_section_text(vac) -> list[str]:
     if windows:
         lines.append(f"  לפי יבשת. {windows}.")
     lines.append(
-        f"  נמצאו {vac.total_found} דילים. מחיר לאדם = לכל החופשה (לא ללילה); "
-        f"מחיר החבילה = הסכום לכל הנוסעים שהאתר תמחר."
+        f"  נמצאו {vac.total_found} דילים. {_PRICE_NOTE}"
     )
     unmapped = _unmapped_note(vac)
     if unmapped:
@@ -1841,8 +1864,10 @@ def _vacations_section_text(vac) -> list[str]:
                 nights = d.nights_or_computed
                 when = _deal_dates(d) + (f" ({nights} לילות)" if nights else "")
                 tags = " · ".join(b[0] for b in badges.get(i - 1, []))
+                price = (f"{_package_night_price(d) or '—'} ללילה" if is_packages
+                         else f"{_deal_price(d)} לאדם")
                 lines.append(
-                    f"      {i}. {_deal_price(d)} לאדם · {_deal_where(d)} · {when} · {d.source}"
+                    f"      {i}. {price} · {_deal_where(d)} · {when} · {d.source}"
                     + (f"  [{tags}]" if tags else "")
                 )
                 if d.total is not None:
@@ -1890,9 +1915,7 @@ def _vacations_section_html(vac) -> str:
            f'לפי יבשת. {escape(_windows_summary(vac))}.</div>'
            if _windows_summary(vac) else '')
         + f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
-        f'בכל יבשת מהזול ליקר. "מחיר לאדם" הוא לכל החופשה (לא ללילה), '
-        f'כפי שמופיע באתר. "מחיר החבילה" הוא הסכום לכל הנוסעים שהאתר תמחר. '
-        f'"מה כלול" מציג רק את מה שהאתר מפרט.'
+        f'בכל יבשת מהזול ליקר. {escape(_PRICE_NOTE)} "מה כלול" מציג רק את מה שהאתר מפרט.'
         f'</div>'
         + (f'<div style="font-size:12px;color:{_COLOR_MUTED};margin-top:2px">'
            f'{escape(_unmapped_note(vac))}.</div>' if _unmapped_note(vac) else '')
@@ -1928,8 +1951,8 @@ def _vacations_section_html(vac) -> str:
         else:
             headers = (
                 '<th class="c">#</th><th>יעד</th><th>תאריכים</th>'
-                f'<th>{"מה כלול" if is_packages else "אתר"}</th><th class="l">מחיר לאדם</th>'
-                + ('<th class="l">מחיר החבילה</th>' if is_packages else '')
+                + ('<th>מה כלול</th><th class="l">מחיר ללילה</th><th class="l">מחיר החבילה</th>'
+                   if is_packages else '<th>אתר</th><th class="l">מחיר לאדם</th>')
             )
             body = (
                 '<table class="vt" dir="rtl" cellpadding="6" cellspacing="0" width="100%">'
@@ -1972,7 +1995,6 @@ def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
             f'<div><span class="vk k{_badge_class(b)}">{escape(b[0])}</span></div>'
             for b in row_badges
         )
-        per_night = _per_night(d) if is_packages else None
         deal_link = _deal_link_html(d)
         cells = [
             f'<td class="n">{i + 1}</td>',
@@ -1993,13 +2015,16 @@ def _vacation_rows_html(deals: list, is_packages: bool) -> list[str]:
             )
         else:
             cells.append(f'<td class="s">{deal_link}<small>{escape(_luggage_line(d))}</small></td>')
-        # Price per person
-        cells.append(
-            f'<td class="p">{_ltr(_deal_price(d))}'
-            + (f'<small>{_ltr(f"{_currency_symbol(d.currency)}{per_night:,.0f}")} ללילה</small>'
-               if per_night is not None else '')
-            + '</td>'
-        )
+        if is_packages:  # package price per night (for a couple: the couple's)
+            night_price = _package_night_price(d)
+            cells.append(
+                '<td class="p">'
+                + (f'{_ltr(night_price)}<small>{escape(" ".join(filter(None, ("ללילה", _party_he(d)))))}</small>'
+                   if night_price else "—")
+                + '</td>'
+            )
+        else:  # flights: price per person
+            cells.append(f'<td class="p">{_ltr(_deal_price(d))}</td>')
         if is_packages:  # whole-package price for the party the site priced
             cells.append(
                 '<td class="t">'
