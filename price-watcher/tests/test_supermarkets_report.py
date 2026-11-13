@@ -108,6 +108,7 @@ def test_scan_and_report_lists_failed_and_empty_chains(monkeypatch):
         raise sm.ChainScanError("אין סניפים בערים שנבחרו", failed=False)
 
     monkeypatch.setattr(sm, "scan_shufersal", fake_shufersal)
+    monkeypatch.setattr(sm, "scan_carrefour", lambda: ([], [_store()]))
     monkeypatch.setattr(sm, "scan_publishedprices_chain", fake_pp)
     monkeypatch.setattr(sm, "scan_bina_chain", fake_bina)
     report = sm.scan_and_report()
@@ -120,6 +121,7 @@ def test_scan_and_report_lists_failed_and_empty_chains(monkeypatch):
     }
     assert report.chains_empty["סאלח דבאח"] == "אין סניפים באזורים שנבחרו"
     assert report.chains_empty["רמי לוי"] == "לא נמצאו מוצרי בשר"
+    assert report.chains_empty["קרפור"] == "לא נמצאו מוצרי בשר"
     # Bareket is scanned too, and a chain without a store in the cities is listed, not dropped
     assert report.chains_empty["סופר ברקת"] == "אין סניפים בערים שנבחרו"
     assert "חצי חינם" not in report.chains_failed  # removed: lists no files on that host
@@ -139,11 +141,12 @@ def test_all_chains_failed_still_lists_them(monkeypatch):
         raise sm.ChainScanError("ההתחברות לאתר המחירים נכשלה")
 
     monkeypatch.setattr(sm, "scan_shufersal", boom)
+    monkeypatch.setattr(sm, "scan_carrefour", boom)
     monkeypatch.setattr(sm, "scan_publishedprices_chain", boom)
     monkeypatch.setattr(sm, "scan_bina_chain", boom)
     report = sm.scan_and_report()
     assert report.status == "fetch_failed"
-    assert len(report.chains_failed) == 1 + len(sm._PUBLISHEDPRICES_CHAINS) + len(sm._BINA_CHAINS)
+    assert len(report.chains_failed) == 2 + len(sm._PUBLISHEDPRICES_CHAINS) + len(sm._BINA_CHAINS)
     assert "ההתחברות לאתר המחירים נכשלה" in email_sender._supermarkets_section_html(report)
     assert "רשתות שנכשלו" in "\n".join(email_sender._supermarkets_section_text(report))
 

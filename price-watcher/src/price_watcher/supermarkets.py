@@ -4,9 +4,9 @@ Uses the government-mandated price transparency XML feeds. Each chain
 publishes PriceFull (every item + price) and PromoFull (active promotions)
 files per store, refreshed daily.
 
-Chains: Shufersal, the chains on url.publishedprices.co.il
-(`_PUBLISHEDPRICES_CHAINS`) and the Bina Projects portals (`_BINA_CHAINS`,
-Super Bareket).
+Chains: Shufersal, Carrefour (prices.carrefour.co.il), the chains on
+url.publishedprices.co.il (`_PUBLISHEDPRICES_CHAINS`) and the Bina Projects
+portals (`_BINA_CHAINS`, Super Bareket).
 
 Scope: only stores in the cities switched ON in `_REGIONS` (now Herzliya and
 Ramat HaSharon; the other Sharon cities, Tel Aviv and the Rishon LeZion area
@@ -85,6 +85,8 @@ _PUBLISHEDPRICES_CHAINS: tuple[tuple[str, str], ...] = (
     ("Stop_Market", "סטופ מרקט"),
 )
 _SHUFERSAL_NAME = "שופרסל"
+_CARREFOUR_NAME = "קרפור"
+_CARREFOUR_URL = "https://prices.carrefour.co.il/"
 
 # Chains hosted by Bina Projects, each on its own <subdomain>.binaprojects.com
 # portal (an ASP.NET page whose JSON endpoints list and hand out the files).
@@ -1532,6 +1534,84 @@ def scan_publishedprices_chain(
         return _scan_chain(chain_name, stores, _fetch)
 
 
+# ---- Carrefour (prices.carrefour.co.il) ----
+#
+# The page is a file browser whose script embeds the day's folder and its
+# file list, no login:
+#     const path = '20261113';
+#     const files = [{"name": "PriceFull7290055700007-001-064-20261113-070003.gz", ...}, ...];
+# and each file downloads from <site>/<path>/<name>. The files are gzipped XML
+# in the usual layout, so the shared parsers read them as they are.
+
+def _carrefour_listing(client: httpx.Client, url: str = _CARREFOUR_URL) -> tuple[str, list[str]]:
+    """(day folder, file names) embedded in the Carrefour prices page."""
+    r = client.get(url)
+    r.raise_for_status()
+    path = re.search(r"""const\s+path\s*=\s*['"]([^'"]*)['"]""", r.text)
+    files = re.search(r"const\s+files\s*=\s*(\[.*?\]);", r.text, re.S)
+    if not path or not files:
+        return "", []
+    try:
+        rows = json.loads(files.group(1))
+    except ValueError:
+        return "", []
+    names = [str(row.get("name", "")).strip() for row in rows if isinstance(row, dict)]
+    return path.group(1).strip("/"), [n for n in names if n]
+
+
+def scan_carrefour(
+    *, client: Optional[httpx.Client] = None,
+) -> tuple[list[MeatPromo], list[StoreInfo]]:
+    """Meat promotions from Carrefour stores in the enabled cities.
+
+    Raises ChainScanError when the chain could not be scanned.
+    """
+    log.info("%s: fetching file list", _CARREFOUR_NAME)
+    owned = (
+        httpx.Client(follow_redirects=True, timeout=60, headers=_HEADERS)
+        if client is None else nullcontext(client)
+    )
+    with owned as client:
+        try:
+            folder, names = _carrefour_listing(client)
+        except httpx.HTTPError as exc:
+            log.warning("%s: price site unreachable: %s", _CARREFOUR_NAME, exc)
+            raise ChainScanError("אתר המחירים של הרשת אינו זמין") from exc
+
+        def _download(name: str) -> Optional[bytes]:
+            r = client.get(f"{_CARREFOUR_URL}{folder}/{name}" if folder else _CARREFOUR_URL + name,
+                           timeout=120)
+            return r.content if r.status_code == 200 and _looks_like_feed(r.content) else None
+
+        stores_files = sorted(n for n in names if n.startswith("Stores"))
+        if not stores_files:
+            log.warning("%s: no Stores file listed", _CARREFOUR_NAME)
+            raise ChainScanError("לא נמצאו קבצים באתר המחירים")
+        stores_raw = _download(stores_files[-1])
+        if not stores_raw:
+            log.warning("%s: Stores file download failed", _CARREFOUR_NAME)
+            raise ChainScanError("הורדת קובץ הסניפים נכשלה")
+        stores = _parse_stores(stores_raw)
+
+        promo_names = [n for n in names if n.startswith("PromoFull")]
+        price_names = [n for n in names if n.startswith("PriceFull")]
+        chain_id = _dominant_chain_id(promo_names, price_names)
+        promo_by_store = _latest_by_store(promo_names, chain_id)
+        price_by_store = _latest_by_store(price_names, chain_id)
+        if not promo_by_store or not price_by_store:
+            log.warning("%s: no current PromoFull/PriceFull files listed", _CARREFOUR_NAME)
+            raise ChainScanError("אין קבצי מחירים ומבצעים עדכניים באתר")
+
+        def _fetch(store: StoreInfo):
+            promo = promo_by_store.get(store.store_id)
+            price = price_by_store.get(store.store_id)
+            if not promo or not price:
+                return None
+            return _download(price), _download(promo)
+
+        return _scan_chain(_CARREFOUR_NAME, stores, _fetch)
+
+
 # ---- Bina Projects portals (<chain>.binaprojects.com) ----
 #
 # Main.aspx is a page whose script calls three JSON endpoints (no login):
@@ -1564,6 +1644,8 @@ def _bina_list(client: httpx.Client, base: str, file_type: str, store: int = 0) 
 def _looks_like_feed(body: bytes) -> bool:
     if body[:2] == b"\x1f\x8b" or body[:4] == b"PK\x03\x04":
         return True
+    if body[:2] in (b"\xff\xfe", b"\xfe\xff"):  # UTF-16 XML (Carrefour's Stores file)
+        body = body[:400].decode("utf-16", errors="ignore").encode("utf-8")
     head = body[:200].lstrip(b"\xef\xbb\xbf \r\n\t").lower()
     return head.startswith(b"<?xml") or (
         head.startswith(b"<") and not head.startswith((b"<!doctype", b"<html"))
@@ -1827,7 +1909,10 @@ def _bareket_source() -> Optional[tuple[str, str]]:
 
 def _chain_tasks() -> list[tuple[str, Callable[[], tuple[list[MeatPromo], list[StoreInfo]]]]]:
     """(chain name, scan function) for every chain to scan."""
-    tasks: list[tuple[str, Callable]] = [(_SHUFERSAL_NAME, lambda: scan_shufersal())]
+    tasks: list[tuple[str, Callable]] = [
+        (_SHUFERSAL_NAME, lambda: scan_shufersal()),
+        (_CARREFOUR_NAME, lambda: scan_carrefour()),
+    ]
     for user, name in _PUBLISHEDPRICES_CHAINS:
         tasks.append((name, lambda u=user, n=name: scan_publishedprices_chain(u, n)))
     for sub, name in _BINA_CHAINS:
