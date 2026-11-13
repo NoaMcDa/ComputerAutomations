@@ -287,7 +287,7 @@ def test_bareket_source_config(monkeypatch):
     assert sm._bareket_source() == ("bina", "superbareket")
     names = [n for n, _fn in sm._chain_tasks()]
     assert sm._BAREKET_NAME in names
-    assert len(names) == 1 + len(sm._PUBLISHEDPRICES_CHAINS) + len(sm._BINA_CHAINS)
+    assert len(names) == 2 + len(sm._PUBLISHEDPRICES_CHAINS) + len(sm._BINA_CHAINS)  # + Shufersal, Carrefour
     monkeypatch.setenv("PW_BAREKET_SOURCE", "bina:https://superbareket.binaprojects.com")
     assert sm._bareket_source() == ("bina", "https://superbareket.binaprojects.com")
     monkeypatch.setenv("PW_BAREKET_SOURCE", "publishedprices:Bareket")
@@ -300,6 +300,7 @@ def test_bareket_source_config(monkeypatch):
 def test_bareket_source_is_used_by_the_scan(monkeypatch):
     seen = []
     monkeypatch.setattr(sm, "scan_shufersal", lambda: ([], []))
+    monkeypatch.setattr(sm, "scan_carrefour", lambda: ([], []))
     monkeypatch.setattr(sm, "scan_publishedprices_chain", lambda u, n: seen.append(("pp", u, n)) or ([], []))
     monkeypatch.setattr(sm, "scan_bina_chain", lambda s, n: seen.append(("bina", s, n)) or ([], []))
     monkeypatch.setenv("PW_BAREKET_SOURCE", "publishedprices:Bareket")
