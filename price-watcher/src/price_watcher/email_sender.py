@@ -844,6 +844,23 @@ def _promo_category(p) -> str:
     return _categorize(p)
 
 
+_MEAT_GROUP_SUPERMARKET = "סופרמרקט"
+_MEAT_GROUP_DELIVERY = "משלוח עד הבית"
+
+
+def _meat_group_label(p) -> str:
+    return _MEAT_GROUP_DELIVERY if getattr(p, "is_delivery", False) else _MEAT_GROUP_SUPERMARKET
+
+
+def _meat_groups(items) -> list[tuple[str, list]]:
+    """A category's rows split into supermarket items, then delivery items
+    (each kept in ranking order); empty groups are left out."""
+    supermarket = [p for p in items if not getattr(p, "is_delivery", False)]
+    delivery = [p for p in items if getattr(p, "is_delivery", False)]
+    return [(label, group) for label, group in
+            ((_MEAT_GROUP_SUPERMARKET, supermarket), (_MEAT_GROUP_DELIVERY, delivery)) if group]
+
+
 def _group_meat_by_category(sm):
     """category -> its deals (cheapest first as ranked), categories in `_CATEGORIES` order."""
     from price_watcher.supermarkets import _CATEGORIES
@@ -973,6 +990,7 @@ _MEAT_CSS = (
     ".mt td.h b{font-size:15px}"
     ".mt td.h small{color:#d1d5db}"
     ".mt tr.f{background:#ecfdf5}"
+    f".mt td.g{{background:{_COLOR_BG_SOFT};font-size:12px;font-weight:700;color:{_COLOR_MUTED};padding:4px 10px}}"
     f".mt b.c{{color:{_COLOR_LINK}}}"
     ".mt b.p{font-size:15px}"
     f".mt b.d{{color:{_COLOR_DANGER}}}"
@@ -1053,9 +1071,11 @@ def _stores_word(n: int) -> str:
 
 def _ranking_note(sm) -> str:
     """One sentence explaining how the tables are ranked (both text and HTML)."""
-    from price_watcher.supermarkets import _top_per_category
+    from price_watcher.supermarkets import _top_delivery_per_category, _top_per_category
     note = (
-        f"בכל קטגוריה {_top_per_category()} המוצרים הזולים ביותר לפי מחיר לק״ג, מהזול ליקר: "
+        f"בכל קטגוריה {_top_per_category()} המוצרים הזולים ביותר בסופרמרקטים, "
+        f"ו-{_top_delivery_per_category()} הזולים ביותר בקצביות עם משלוח עד הבית, "
+        "לפי מחיר לק״ג, מהזול ליקר: "
         "מחיר המבצע, או המחיר הרגיל כשמוצר שאינו במבצע זול יותר "
         "(במוצרים ארוזים המחיר מחושב לפי משקל המארז). "
         "מוצגות קטגוריות שיש בהן לפחות מבצע אחד."
@@ -1112,7 +1132,11 @@ def _supermarkets_section_text(sm) -> list[str]:
         shown = f"{len(items)} מתוך {total}" if total > len(items) else f"{len(items)}"
         lines.append("")
         lines.append(f"  ▼ {category}  ({shown} מוצרים)")
-        for i, p in enumerate(items, 1):
+        groups = _meat_groups(items)
+        numbered = [(label, p) for label, group in groups for p in group]
+        for i, (label, p) in enumerate(numbered, 1):
+            if len(groups) > 1 and (i == 1 or label != numbered[i - 2][0]):
+                lines.append(f"   {label}:")
             per_kg = getattr(p, "price_per_kg", None)
             was_kg = getattr(p, "regular_per_kg", None)
             if per_kg is not None:
@@ -1142,6 +1166,37 @@ def _supermarkets_section_text(sm) -> list[str]:
             if regions or where:
                 lines.append("       " + " — ".join(x for x in (regions, where) if x))
     return lines
+
+
+def _meat_row_html(p, first: bool, show_regions: bool) -> str:
+    """One row of a meat category table; the first row of a group is highlighted."""
+    where = _where_label(p)
+    chips = " ".join(_region_chip_html(r) for r in _promo_regions(p)) if show_regions else ""
+    below = "<br>".join(x for x in (chips, escape(where)) if x)
+    desc = (p.promotion_description or "").strip()
+    # Item note: the promotion text and, short, the day the deal ends.
+    until = getattr(p, "end_date_display", "")[:5]
+    note = " · ".join(x for x in (
+        escape(desc[:60]) if desc and desc != p.item_name else "",
+        f"עד {until}" if until else "",
+    ) if x)
+    return (
+        # The cheapest row is highlighted (class f).
+        ('<tr class="f">' if first else '<tr>')
+        # Supermarket / butcher, then its branch(es) with the city (or
+        # "משלוח עד הבית"). One column, so the table still fits a phone screen.
+        + ('<td width="34%">' if first else '<td>')
+        + f'<b class="c">{escape(p.chain)}</b>'
+        + (f'<br><small>{below}</small>' if below else '')
+        + '</td>'
+        # Item
+        f'<td>{escape(p.item_name[:60])}'
+        + (f'<br><small>{note}</small>' if note else '')
+        + '</td>'
+        # Price per kg (now / was), discount, deal
+        f'<td align="left" nowrap>{_price_compact_html(p)}</td>'
+        '</tr>'
+    )
 
 
 def _supermarkets_section_html(sm) -> str:
@@ -1233,34 +1288,11 @@ def _supermarkets_section_html(sm) -> str:
     # muted colour and the cell alignment are the only styles repeated.
     for category, items in grouped.items():
         rows_html = []
-        for i, p in enumerate(items):
-            where = _where_label(p)
-            chips = " ".join(_region_chip_html(r) for r in _promo_regions(p)) if show_regions else ""
-            below = "<br>".join(x for x in (chips, escape(where)) if x)
-            desc = (p.promotion_description or "").strip()
-            # Item note: the promotion text and, short, the day the deal ends.
-            until = getattr(p, "end_date_display", "")[:5]
-            note = " · ".join(x for x in (
-                escape(desc[:60]) if desc and desc != p.item_name else "",
-                f"עד {until}" if until else "",
-            ) if x)
-            rows_html.append(
-                # The cheapest row is highlighted (class f).
-                ('<tr class="f">' if i == 0 else '<tr>')
-                # Supermarket, then its branch(es) with the city. One column,
-                # so the table still fits a phone screen.
-                + ('<td width="34%">' if i == 0 else '<td>')
-                + f'<b class="c">{escape(p.chain)}</b>'
-                + (f'<br><small>{below}</small>' if below else '')
-                + '</td>'
-                # Item
-                f'<td>{escape(p.item_name[:60])}'
-                + (f'<br><small>{note}</small>' if note else '')
-                + '</td>'
-                # Price per kg (now / was), discount, deal
-                f'<td align="left" nowrap>{_price_compact_html(p)}</td>'
-                '</tr>'
-            )
+        groups = _meat_groups(items)
+        for group_label, group in groups:
+            if len(groups) > 1:
+                rows_html.append(f'<tr><td class="g" colspan="3">{escape(group_label)}</td></tr>')
+            rows_html.extend(_meat_row_html(p, i == 0, show_regions) for i, p in enumerate(group))
 
         total = promos_by_category.get(category, len(items))
         if total > len(items):

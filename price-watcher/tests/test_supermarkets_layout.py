@@ -172,7 +172,7 @@ def test_email_has_one_table_per_category_cheapest_first_with_branch(monkeypatch
     # one region only: no region chips
     assert email_sender._region_chip_html(SHARON) not in html
     assert "אנטריקוט" in html and "כנפיים" in html
-    assert "המוצרים הזולים ביותר לפי מחיר לק״ג" in html
+    assert "המוצרים הזולים ביותר בסופרמרקטים" in html and "לפי מחיר לק״ג" in html
 
     text = "\n".join(email_sender._supermarkets_section_text(report))
     assert "▼ אנטריקוט" in text and "▼ כנפיים עוף" in text

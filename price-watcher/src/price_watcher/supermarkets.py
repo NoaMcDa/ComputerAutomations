@@ -242,6 +242,15 @@ def _top_per_category() -> int:
     return _env_int(name, 5) or 5
 
 
+def _top_delivery_per_category() -> int:
+    """How many online-butcher (delivery) items each category shows (PW_TOP_DELIVERY_PER_CATEGORY, 3)."""
+    return _env_int("PW_TOP_DELIVERY_PER_CATEGORY", 3) or 3
+
+
+# Branch label of the online butchers' rows (butchers.DELIVERY).
+DELIVERY_STORE = "משלוח עד הבית"
+
+
 _ALL_CITIES_WORDS = {"הכל", "הכול", "all", "*"}
 
 
@@ -529,7 +538,9 @@ _DUCK_WORDS = ("ברווז", "מגרה")
 _CHICKEN_WORDS = ("עוף", "עופות", "פרגית", "פרגיות", "פטם")
 _BEEF_WORDS = ("בקר", "עגל", "עגלה", "אנגוס", "וואגיו")
 _LAMB_WORDS = ("כבש", "טלה", "כבשים")
-_PORK_WORDS = ("חזיר", "חזירון")
+# "בשר לבן" is the trade name for pork (Tiv Taam: "סינטה לבן טרי מפורק",
+# "בשר לבן טרי טחון"); a name that also names another animal keeps it.
+_PORK_WORDS = ("חזיר", "חזירון", "לבן")
 # Cut words that only poultry has (plus the Machpud poultry brand).
 _POULTRY_CUT_WORDS = (
     "כנפיים", "כנף", "כנפי", "כנפית", "כרעיים", "כרעים", "כרעי", "ירכיים", "ירכי",
@@ -597,7 +608,7 @@ _CATEGORY_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     # --- Beef / veal: specific cuts first ---
     ("טחון בקר",                  "beef",    _GROUND),
     ("מינוט סטייק",               "beef",    ("מינוט סטייק", "סטייק מינוט", "מינוט")),
-    ("פילה מדומה",                "beef",    ("פילה מדומה",)),
+    ("פילה מדומה",                "beef",    ("פילה מדומה", "פילה+מדומה")),  # "פילה עגל מדומה"
     ("פילה מיניון",               "beef",    ("פילה מיניון", "פילה-מיניון")),
     ("פיקניה",                    "beef",    ("פיקניה",)),
     ("אנטריקוט עם עצם",           "beef",    ("אנטריקוט+עם עצם", "אנטריקוט+עם עצ", "אנטריקוט+ע.ע",
@@ -836,7 +847,7 @@ _EXCLUDE_STEMS: tuple[str, ...] = (
     "הליבוט", "פנגסיוס", "בקלה", "הייק", "מרלוז", "טילפי", "לוקוס", "טרית",
     "אנשובי", "שפרוט", "קלמרי", "תמנון", "סרטן", "מולים", "גפילטע", "פיש",
     "סושי", "קוויאר", "מטיאס", "אינטיאס", "ילוטייל", "אלבקור", "טראכון", "בוניטו",
-    "אלתית", "פארידה", "לקרדה", "זהבון", "נסיכת", "אדמונית", "מקרוסקה", "פלמידה",
+    "אלתית", "פארידה", "לקרדה", "זהבון", "נסיכ", "אדמונית", "מקרוסקה", "פלמידה",
     # Pet food
     "חתול", "חתלת", "כלב", "פריסקיז", "פרוסקיז", "רויאל", "פרוקל", "פרופלן",
     "ווסקס", "ויסקס", "ווסקוויק", "סמלט", "פדיגרי", "פורינה", "פנסי", "פיסט",
@@ -1002,6 +1013,11 @@ class MeatPromo:
         if self.unit_kg is not None and self.unit_kg > 0:
             return self.unit_kg
         return Decimal(1) if self.is_weighted else None
+
+    @property
+    def is_delivery(self) -> bool:
+        """True for an online butcher's item (delivered), False for a supermarket's."""
+        return DELIVERY_STORE in self.stores
 
     @property
     def is_promo(self) -> bool:
@@ -1917,6 +1933,11 @@ def _chain_tasks() -> list[tuple[str, Callable[[], tuple[list[MeatPromo], list[S
         (_SHUFERSAL_NAME, lambda: scan_shufersal()),
         (_CARREFOUR_NAME, lambda: scan_carrefour()),
     ]
+    # Online butchers with home delivery (butchers.py): same tables, no branches.
+    from price_watcher import butchers
+    if butchers.enabled():
+        for name, scan in butchers.SCANNERS:
+            tasks.append((name, lambda s=scan: (s(), [])))
     for user, name in _PUBLISHEDPRICES_CHAINS:
         tasks.append((name, lambda u=user, n=name: scan_publishedprices_chain(u, n)))
     for sub, name in _BINA_CHAINS:
@@ -2055,6 +2076,7 @@ def _finalize_report(report: SupermarketReport) -> None:
     labels = [label for label, _kws in _CATEGORIES]
     labels += sorted(c for c in by_category if c not in labels)
     top_n = _top_per_category()
+    top_delivery = _top_delivery_per_category()
     ranked: list[MeatPromo] = []
     for label in labels:
         pool = by_category.get(label)
@@ -2072,7 +2094,10 @@ def _finalize_report(report: SupermarketReport) -> None:
         priced = [p for p in pool if p.price_per_kg is not None]
         if any(p.is_promo for p in priced):
             report.promos_by_category[label] = len(priced)
-            ranked.extend(sorted(priced, key=_price_rank_key)[:top_n])
+            # Two lists per category: the cheapest supermarket items, then
+            # the cheapest online-butcher (delivery) items.
+            ranked.extend(sorted((p for p in priced if not p.is_delivery), key=_price_rank_key)[:top_n])
+            ranked.extend(sorted((p for p in priced if p.is_delivery), key=_price_rank_key)[:top_delivery])
     report.promos = ranked
 
 

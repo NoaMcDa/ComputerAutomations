@@ -41,6 +41,9 @@ def _isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PW_SMTP_PASSWORD", "not-a-real-password")
     monkeypatch.setenv("PW_EMAIL_FROM", "from@example.invalid")
     monkeypatch.setenv("PW_EMAIL_TO", "to@example.invalid")
+    # The online butchers are read over the network; their own tests
+    # (test_butchers.py) turn them back on with a mocked site.
+    monkeypatch.setenv("PW_BUTCHERS", "0")
     # Most vacation fixtures don't state a party; the couples-only rule has
     # its own tests (test_vacations_couples.py), which turn it back on.
     monkeypatch.setenv("PW_DEALS_COUPLES_ONLY", "0")
