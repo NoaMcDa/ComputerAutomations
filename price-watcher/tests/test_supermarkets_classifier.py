@@ -226,3 +226,16 @@ def test_bones_and_marrow_are_meat():
     # Soup, broth and pet bones are not
     for name in ("מרק עצמות 500 גרם", "ציר עצמות בקר", "עצמות לכלב"):
         assert not sm._is_meat_product(name), name
+
+
+def test_white_meat_is_pork_and_nile_perch_is_fish():
+    # "לבן" = pork at Tiv Taam: its own catch-all group, never ranked as beef
+    assert sm._categorize(_promo("סינטה לבן טרי מפורק", "")) == "חזיר"
+    assert sm._categorize(_promo("בשר לבן טרי טחון", "")) == "חזיר"
+    assert sm._categorize(_promo("סטייק צוואר לבן טרי", "")) == "חזיר"
+    assert sm._categorize(_promo("חזה עוף לבן", "")) == "חזה / פילה עוף"  # names an animal
+    # "פילה נסיכה" is Nile perch
+    assert not sm._is_meat_product("נתחי פילה נסיכה 100%")
+    assert not sm._is_meat_product("פילה נסיכת הנילוס קפוא")
+    # mock fillet is not beef fillet
+    assert sm._categorize(_promo("פילה עגל מדומה טרי", "")) == "פילה מדומה"
