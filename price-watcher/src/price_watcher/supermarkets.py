@@ -1917,6 +1917,11 @@ def _chain_tasks() -> list[tuple[str, Callable[[], tuple[list[MeatPromo], list[S
         (_SHUFERSAL_NAME, lambda: scan_shufersal()),
         (_CARREFOUR_NAME, lambda: scan_carrefour()),
     ]
+    # Online butchers with home delivery (butchers.py): same tables, no branches.
+    from price_watcher import butchers
+    if butchers.enabled():
+        for name, scan in butchers.SCANNERS:
+            tasks.append((name, lambda s=scan: (s(), [])))
     for user, name in _PUBLISHEDPRICES_CHAINS:
         tasks.append((name, lambda u=user, n=name: scan_publishedprices_chain(u, n)))
     for sub, name in _BINA_CHAINS:
