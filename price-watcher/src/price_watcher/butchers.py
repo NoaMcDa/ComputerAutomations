@@ -41,7 +41,7 @@ from price_watcher.http_headers import USER_AGENT
 log = logging_setup.get(__name__)
 
 _HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "he-IL,he;q=0.9"}
-DELIVERY = "משלוח עד הבית"
+DELIVERY = "משלוח עד הבית"  # == supermarkets.DELIVERY_STORE
 _SALE_NOTE = "מבצע באתר"
 
 AHARON = ("האחים אהרון", "https://aharonbros.co.il")

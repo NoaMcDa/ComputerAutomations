@@ -242,6 +242,15 @@ def _top_per_category() -> int:
     return _env_int(name, 5) or 5
 
 
+def _top_delivery_per_category() -> int:
+    """How many online-butcher (delivery) items each category shows (PW_TOP_DELIVERY_PER_CATEGORY, 3)."""
+    return _env_int("PW_TOP_DELIVERY_PER_CATEGORY", 3) or 3
+
+
+# Branch label of the online butchers' rows (butchers.DELIVERY).
+DELIVERY_STORE = "משלוח עד הבית"
+
+
 _ALL_CITIES_WORDS = {"הכל", "הכול", "all", "*"}
 
 
@@ -1002,6 +1011,11 @@ class MeatPromo:
         if self.unit_kg is not None and self.unit_kg > 0:
             return self.unit_kg
         return Decimal(1) if self.is_weighted else None
+
+    @property
+    def is_delivery(self) -> bool:
+        """True for an online butcher's item (delivered), False for a supermarket's."""
+        return DELIVERY_STORE in self.stores
 
     @property
     def is_promo(self) -> bool:
@@ -2060,6 +2074,7 @@ def _finalize_report(report: SupermarketReport) -> None:
     labels = [label for label, _kws in _CATEGORIES]
     labels += sorted(c for c in by_category if c not in labels)
     top_n = _top_per_category()
+    top_delivery = _top_delivery_per_category()
     ranked: list[MeatPromo] = []
     for label in labels:
         pool = by_category.get(label)
@@ -2077,7 +2092,10 @@ def _finalize_report(report: SupermarketReport) -> None:
         priced = [p for p in pool if p.price_per_kg is not None]
         if any(p.is_promo for p in priced):
             report.promos_by_category[label] = len(priced)
-            ranked.extend(sorted(priced, key=_price_rank_key)[:top_n])
+            # Two lists per category: the cheapest supermarket items, then
+            # the cheapest online-butcher (delivery) items.
+            ranked.extend(sorted((p for p in priced if not p.is_delivery), key=_price_rank_key)[:top_n])
+            ranked.extend(sorted((p for p in priced if p.is_delivery), key=_price_rank_key)[:top_delivery])
     report.promos = ranked
 
 

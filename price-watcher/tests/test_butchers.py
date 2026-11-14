@@ -145,5 +145,42 @@ def test_butcher_deal_competes_in_the_category_table(monkeypatch):
     monkeypatch.setattr(sm, "_chain_tasks", lambda: [("שופרסל", supermarket), ("מיטמן", lambda: ([butcher], []))])
     report = sm.scan_and_report()
     wings = [p for p in report.promos if p.category == "כנפיים עוף"]
-    assert [p.chain for p in wings] == ["מיטמן", "שופרסל"]  # ₪19.50/kg beats ₪24.90/kg
+    # Supermarkets first, then delivery (each group ranked on its own)
+    assert [p.chain for p in wings] == ["שופרסל", "מיטמן"]
     assert "מיטמן" in report.chains_scanned
+
+
+def test_each_category_has_5_supermarket_and_3_delivery_rows(monkeypatch):
+    from price_watcher import email_sender as E
+    from price_watcher.supermarkets import MeatPromo
+
+    def wing(chain, price, store, promo=True):
+        return MeatPromo(chain=chain, store_id=chain, item_code=f"{chain}{price}", item_name="כנפיים עוף טרי",
+                         regular_price=Decimal(price + 10), discounted_price=Decimal(price) if promo else None,
+                         discount_rate=None, promotion_description=f"מבצע {chain}" if promo else "",
+                         is_weighted=True, unit_kg=Decimal("1"), stores=[store])
+
+    shops = [wing(f"סופר{i}", 20 + i, "הרצליה") for i in range(7)]
+    butchers = [wing(f"קצב{i}", 10 + i, B.DELIVERY, promo=i == 0) for i in range(5)]
+    monkeypatch.setattr(sm, "_chain_tasks", lambda: [("all", lambda: (shops + butchers, []))])
+    report = sm.scan_and_report()
+    rows = [p for p in report.promos if p.category == "כנפיים עוף"]
+    assert [p.chain for p in rows] == [f"סופר{i}" for i in range(5)] + [f"קצב{i}" for i in range(3)]
+    assert B.DELIVERY == sm.DELIVERY_STORE and rows[-1].is_delivery and not rows[0].is_delivery
+
+    html = E._supermarkets_section_html(report)
+    sup, dlv = html.index(">סופרמרקט</td>"), html.index(">משלוח עד הבית</td>")
+    assert sup < html.index("סופר4") < dlv < html.index("קצב0")
+    text = "\n".join(E._supermarkets_section_text(report))
+    assert text.index("   סופרמרקט:") < text.index("   משלוח עד הבית:")
+
+
+def test_no_group_labels_without_delivery_rows():
+    from price_watcher import email_sender as E
+    from price_watcher.supermarkets import MeatPromo
+    p = MeatPromo(chain="שופרסל", store_id="1", item_code="1", item_name="כנפיים עוף טרי",
+                  regular_price=Decimal("30"), discounted_price=Decimal("25"), discount_rate=None,
+                  promotion_description="", is_weighted=True, unit_kg=Decimal("1"),
+                  stores=["סוקולוב הרצליה"], category="כנפיים עוף")
+    report = sm.SupermarketReport(status="ok", chains_scanned=["שופרסל"], promos=[p])
+    assert 'class="g"' not in E._supermarkets_section_html(report)
