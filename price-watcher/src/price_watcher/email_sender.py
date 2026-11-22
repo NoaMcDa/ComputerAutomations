@@ -2113,6 +2113,10 @@ def build_daily_payload(report) -> EmailPayload | None:
                 f"הקריאטין {word} ל-{_currency_symbol(cur.currency)}{cur.price_per_100g} ל-100 גרם"
             )
 
+    from price_watcher import vanilla as _vanilla
+    vanilla_report = getattr(report, "vanilla", None)
+    vanilla_blurb = _vanilla.headline(vanilla_report)
+
     sm = getattr(report, "supermarkets", None)
     meat_blurb = ""
     if sm is not None and sm.status == "ok" and sm.promos:
@@ -2138,6 +2142,8 @@ def build_daily_payload(report) -> EmailPayload | None:
         failed.append("אתרים")
     if report.creatine is not None and report.creatine.status != "ok":
         failed.append("קריאטין")
+    if vanilla_report is not None and vanilla_report.status != "ok":
+        failed.append("וניל")
     if sims4_report is not None and sims4_report.status != "ok":
         failed.append("סימס 4")
     if sm is not None and sm.status != "ok":
@@ -2151,6 +2157,8 @@ def build_daily_payload(report) -> EmailPayload | None:
         )
     if creatine_blurb:
         headline.append(creatine_blurb)
+    if vanilla_blurb:
+        headline.append(vanilla_blurb)
     if sims_blurb:
         headline.append(sims_blurb)
     if meat_blurb:
@@ -2195,6 +2203,9 @@ def build_daily_payload(report) -> EmailPayload | None:
         text_lines.append("")
     text_lines.extend(_creatine_section_text(report.creatine))
     text_lines.append("")
+    if vanilla_report is not None:
+        text_lines.extend(_vanilla.section_text(vanilla_report))
+        text_lines.append("")
     text_lines.extend(_sims4_section_text(getattr(report, "sims4", None)))
     text_lines.append("")
     text_lines.extend(_supermarkets_section_text(sm))
@@ -2224,7 +2235,7 @@ def build_daily_payload(report) -> EmailPayload | None:
         f'<tr><td style="padding:24px 24px 8px;text-align:right">',
         f'<div style="font-size:22px;font-weight:700;color:{_COLOR_TEXT};'
         f'margin-bottom:4px">דוח יומי</div>',
-        f'<div style="font-size:13px;color:{_COLOR_MUTED}">מבצעים באתרים · קריאטין · הסימס 4 · בשר בסופרמרקטים · חופשות</div>',
+        f'<div style="font-size:13px;color:{_COLOR_MUTED}">מבצעים באתרים · קריאטין · וניל · הסימס 4 · בשר בסופרמרקטים · חופשות</div>',
         f'</td></tr>',
         f'<tr><td style="padding:16px 24px;text-align:right">',
         _section_heading_html("מבצעים כלל-אתריים", first=True),
@@ -2274,6 +2285,10 @@ def build_daily_payload(report) -> EmailPayload | None:
 
     html_parts.append(_section_heading_html("קריאטין"))
     html_parts.append(_creatine_section_html(report.creatine))
+
+    if vanilla_report is not None:
+        html_parts.append(_section_heading_html(_vanilla.SECTION_TITLE))
+        html_parts.append(_vanilla.section_html(vanilla_report))
 
     html_parts.append(_section_heading_html("הסימס 4"))
     html_parts.append(_sims4_section_html(getattr(report, "sims4", None)))

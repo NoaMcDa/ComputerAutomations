@@ -54,6 +54,9 @@ class CreatineProduct:
     unit: str  # "100g" / "count"
     on_sale: bool
     seller: str
+    # Price per 100 of `unit` for any unit (100g / 100ml / count); price_per_100g
+    # only holds the gram one. Not saved in the creatine state.
+    per_unit: Optional[Decimal] = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +179,10 @@ _BROWSER_UA = USER_AGENT
 _fetch_diag: dict[str, str] = {}
 
 
-def _fetch_html_httpx() -> Optional[str]:
+def _fetch_html_httpx(url: Optional[str] = None) -> Optional[str]:
     try:
         with httpx.Client(follow_redirects=True, timeout=25, headers=_HEADERS) as client:
-            resp = client.get(_IHERB_SEARCH)
+            resp = client.get(url or _IHERB_SEARCH)
     except httpx.HTTPError as exc:
         log.warning("iHerb creatine scan: %s", type(exc).__name__)
         _fetch_diag["httpx"] = f"network:{type(exc).__name__}"
@@ -191,7 +194,7 @@ def _fetch_html_httpx() -> Optional[str]:
     return resp.text
 
 
-def _fetch_html_browser() -> Optional[str]:
+def _fetch_html_browser(url: Optional[str] = None) -> Optional[str]:
     """Load the search page in headless Chromium.
 
     iHerb's Cloudflare front answers plain HTTP clients with a 403 challenge
@@ -216,7 +219,7 @@ def _fetch_html_browser() -> Optional[str]:
                     locale="he-IL",
                     viewport={"width": 1366, "height": 900},
                 ).new_page()
-                resp = page.goto(_IHERB_SEARCH, wait_until="domcontentloaded", timeout=45_000)
+                resp = page.goto(url or _IHERB_SEARCH, wait_until="domcontentloaded", timeout=45_000)
                 try:
                     page.wait_for_selector(".product-cell", timeout=25_000)
                 except Exception:
@@ -323,6 +326,7 @@ def _parse_cells(html: str) -> tuple[list[CreatineProduct], int]:
             unit=unit,
             on_sale=on_sale,
             seller="iHerb",
+            per_unit=per_unit,
         ))
     return products, len(cells) - duplicates
 
@@ -398,6 +402,7 @@ def pick_cheapest(products: list[CreatineProduct]) -> Optional[CreatineProduct]:
 
 def _product_to_dict(p: CreatineProduct) -> dict:
     d = asdict(p)
+    d.pop("per_unit", None)
     d["price"] = str(p.price)
     d["price_per_100g"] = str(p.price_per_100g) if p.price_per_100g is not None else None
     return d

@@ -463,6 +463,7 @@ class DailyReport:
     """Everything the daily email contains. One section per 'daily feature'."""
     site_digests: list[SiteDigest] = field(default_factory=list)
     creatine: Optional["object"] = None     # CreatineReport
+    vanilla: Optional["object"] = None      # VanillaReport
     sims4: Optional["object"] = None        # Sims4Report
     supermarkets: Optional["object"] = None # SupermarketReport
     vacations: Optional["object"] = None    # VacationReport
@@ -481,6 +482,11 @@ def collect_daily_report() -> DailyReport:
         report.creatine = _creatine.scan_and_report()
     except Exception as exc:
         log.error("Creatine stage failed: %s: %s", type(exc).__name__, exc)
+    try:
+        from price_watcher import vanilla as _vanilla
+        report.vanilla = _vanilla.scan_and_report()
+    except Exception as exc:
+        log.error("Vanilla stage failed: %s: %s", type(exc).__name__, exc)
     try:
         from price_watcher import sims4 as _sims4
         report.sims4 = _sims4.scan_and_report()
@@ -518,6 +524,9 @@ def _print_daily_report(report: DailyReport) -> None:
         console.print("\n[bold underline]Creatine (iHerb)[/bold underline]")
         from price_watcher import creatine as _creatine
         _creatine.print_report(report.creatine)
+    if getattr(report, "vanilla", None) is not None:
+        from price_watcher import vanilla as _vanilla
+        _vanilla.print_report(report.vanilla)
     if report.sims4 is not None:
         console.print("\n[bold underline]The Sims 4 (EA)[/bold underline]")
         from price_watcher import sims4 as _sims4
@@ -578,6 +587,9 @@ def run_digest(dry_run: bool = False, test: bool = False) -> int:
         if report.creatine is not None:
             from price_watcher import creatine as _creatine
             _creatine.persist(report.creatine)
+        if getattr(report, "vanilla", None) is not None:
+            from price_watcher import vanilla as _vanilla
+            _vanilla.persist(report.vanilla)
         if report.sims4 is not None:
             from price_watcher import sims4 as _sims4
             _sims4.persist(report.sims4)
