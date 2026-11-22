@@ -1,0 +1,27 @@
+{
+  "_comment": "Synthetic fixture modelled on the assumed Ontopo searchAvailability response (unverified live).",
+  "availability_id": "test-availability-1",
+  "method": "seat",
+  "areas": [
+    {
+      "id": "inside",
+      "name": "Inside",
+      "options": [
+        {"time": "1800", "method": "seat", "text": "18:00"},
+        {"time": "1930", "method": "seat", "text": "19:30"},
+        {"time": "2000", "method": "standby", "text": "20:00"},
+        {"time": "2130", "method": "disabled", "text": "21:30"}
+      ]
+    },
+    {
+      "id": "bar",
+      "name": "Bar",
+      "options": [
+        {"time": "2045", "method": "seat", "text": "20:45"},
+        {"time": "bad", "method": "seat"}
+      ]
+    },
+    "garbage-entry"
+  ],
+  "recommended": [{"time": "1930", "method": "seat"}]
+}

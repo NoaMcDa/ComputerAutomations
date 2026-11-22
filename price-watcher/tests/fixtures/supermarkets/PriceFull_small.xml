@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Trimmed from real PriceFull files captured 2026-11-11 (Shufersal, Osher Ad, Rami Levy, Salah Dabah rows). -->
+<Root>
+  <ChainID>7290000000001</ChainID>
+  <SubChainID>001</SubChainID>
+  <StoreID>001</StoreID>
+  <Items>
+    <!-- weighted, "2 ב-20" sold per kg: MinQty 1.50, DiscountedPrice 15.00 -->
+    <Item><ItemCode>1001</ItemCode><ItemName>כנפיים עוף טרי ארוז</ItemName><ManufactureName>עוף עוז</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>1קילוגרם</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>13.90</ItemPrice><UnitOfMeasurePrice>13.90</UnitOfMeasurePrice></Item>
+    <!-- weighted, "2 ב-100": MinQty 1.850, DiscountedPrice 92.50 -->
+    <Item><ItemCode>1002</ItemCode><ItemName>כתף עגל טרי עטרה</ItemName><ManufactureName>עטרה</ManufactureName><UnitQty>יחידה</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>יחידה</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>89.90</ItemPrice><UnitOfMeasurePrice>89.90</UnitOfMeasurePrice></Item>
+    <!-- packaged, "3 ק"ג ב-40" = MinQty 3 -->
+    <Item><ItemCode>1003</ItemCode><ItemName>כרעיים עוף</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>יחידות</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>יחידות</UnitOfMeasure><bIsWeighted>0</bIsWeighted><ItemPrice>24.90</ItemPrice><UnitOfMeasurePrice>24.90</UnitOfMeasurePrice></Item>
+    <!-- regular price per kg, promo price per 100 g -->
+    <Item><ItemCode>1004</ItemCode><ItemName>פלמי טופ כבד אווז</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>קילוגרם</UnitOfMeasure><bIsWeighted>0</bIsWeighted><ItemPrice>490.00</ItemPrice><UnitOfMeasurePrice>490.00</UnitOfMeasurePrice></Item>
+    <Item><ItemCode>1005</ItemCode><ItemName>בשר בקר מס 8 מוכשר ק</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>קילוגרם</UnitOfMeasure><bIsWeighted>0</bIsWeighted><ItemPrice>52.90</ItemPrice><UnitOfMeasurePrice>52.90</UnitOfMeasurePrice></Item>
+    <Item><ItemCode>1006</ItemCode><ItemName>חזה עוף טרי ארוז שלי</ItemName><ManufactureName>עוף עוז</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>1קילוגרם</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>39.90</ItemPrice><UnitOfMeasurePrice>39.90</UnitOfMeasurePrice></Item>
+    <Item><ItemCode>1007</ItemCode><ItemName>פרמיו דליקט עוף 56גר</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>גרם</UnitQty><Quantity>56.00</Quantity><UnitOfMeasure>100 גרם</UnitOfMeasure><bIsWeighted>0</bIsWeighted><ItemPrice>11.90</ItemPrice><UnitOfMeasurePrice>21.25</UnitOfMeasurePrice></Item>
+    <Item><ItemCode>1008</ItemCode><ItemName>פילה ברמונדי 7-9 בוו</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>קילוגרם</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>59.90</ItemPrice><UnitOfMeasurePrice>59.90</UnitOfMeasurePrice></Item>
+    <!-- "2 ב-45" that is no cheaper than the regular per-kg price -->
+    <Item><ItemCode>1009</ItemCode><ItemName>ירכיים עוף טרי עוף ה</ItemName><ManufactureName>עוף הכפר</ManufactureName><UnitQty>יחידה</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>יחידה</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>22.50</ItemPrice><UnitOfMeasurePrice>22.50</UnitOfMeasurePrice></Item>
+    <Item><ItemCode>1010</ItemCode><ItemName>נודלס בקר 70גר רמי ל</ItemName><ManufactureName>רמי לוי</ManufactureName><UnitQty>גרם</UnitQty><Quantity>70.00</Quantity><UnitOfMeasure>100 גרם</UnitOfMeasure><bIsWeighted>0</bIsWeighted><ItemPrice>4.90</ItemPrice><UnitOfMeasurePrice>7.00</UnitOfMeasurePrice></Item>
+    <!-- club-only promotion -->
+    <Item><ItemCode>1011</ItemCode><ItemName>כבד עוף טרי</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>1קילוגרם</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>19.90</ItemPrice><UnitOfMeasurePrice>19.90</UnitOfMeasurePrice></Item>
+    <!-- plain per-unit price cut -->
+    <Item><ItemCode>1012</ItemCode><ItemName>לשון בקר קפוא חלק</ItemName><ManufactureName>פרימורפיקו בלן</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>1קילוגרם</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>55.90</ItemPrice><UnitOfMeasurePrice>55.90</UnitOfMeasurePrice></Item>
+    <!-- Stop Market store whose numbers contradict its own "2 קג ב 60" -->
+    <Item><ItemCode>1013</ItemCode><ItemName>חזה עוף טרי שלם</ItemName><ManufactureName>לא ידוע</ManufactureName><UnitQty>קילוגרם</UnitQty><Quantity>1.00</Quantity><UnitOfMeasure>קילוגרם</UnitOfMeasure><bIsWeighted>1</bIsWeighted><ItemPrice>39.90</ItemPrice><UnitOfMeasurePrice>39.90</UnitOfMeasurePrice></Item>
+  </Items>
+</Root>

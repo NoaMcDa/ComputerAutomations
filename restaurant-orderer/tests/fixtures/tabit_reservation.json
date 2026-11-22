@@ -1,0 +1,9 @@
+{
+  "_comment": "Synthetic fixture: exact slot available, returned as a temporary hold (unverified live).",
+  "reservation": {
+    "_id": "tmp-hold-123",
+    "reserved_from": "2026-11-13T17:30:00.000Z",
+    "preference": "outside",
+    "seats_count": 2
+  }
+}

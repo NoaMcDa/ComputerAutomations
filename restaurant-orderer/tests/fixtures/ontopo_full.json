@@ -1,0 +1,10 @@
+{
+  "_comment": "Synthetic fixture: fully booked evening (only wait-list / disabled options).",
+  "areas": [
+    {"id": "inside", "name": "Inside", "options": [
+      {"time": "1930", "method": "standby"},
+      {"time": "2100", "method": "disabled"}
+    ]}
+  ],
+  "recommended": []
+}
